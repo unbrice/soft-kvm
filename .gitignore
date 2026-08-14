@@ -1,0 +1,16 @@
+.direnv
+
+scratch-*
+
+# Binaries & build artifacts
+soft-kvm
+/bin/
+/dist/
+/target/
+
+# Optimize LLM usage.
+.rtk/
+.aider*
+.antigravitycli/
+.claude/
+.zcode/
