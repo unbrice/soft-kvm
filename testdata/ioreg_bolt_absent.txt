@@ -1,0 +1,18 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 16>
+  | {
+  |   "IOClass" = "IORegistryEntry"
+  | }
+  | 
+  +-o USB3.0 Hub@...  <class IOUSBHostDevice, id 0x12345678, registered, matched, active, busy 0 (0 ms), retain 14>
+    | {
+    |   "idVendor" = 1133
+    |   "idProduct" = 999
+    |   "bcdDevice" = 256
+    | }
+    | 
+  +-o Decoy Vendor@...  <class IOUSBHostDevice, id 0xbadcafe, registered, matched, active, busy 0 (0 ms), retain 14>
+    | {
+    |   "idVendor" = 11330
+    |   "idProduct" = 50504
+    |   "bcdDevice" = 256
+    | }

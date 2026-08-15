@@ -171,7 +171,7 @@ already has: a switch that worked makes `--check-cmd` start *failing*, because
 this host's input is no longer active. The falling edge is the receipt.
 
 1. Run the switch command.
-2. Poll `--check-cmd` for `--confirm 4s`. It goes non-zero ⇒ done.
+2. Poll `--check-cmd` every 500 ms for `--confirm 4s`. It goes non-zero ⇒ done.
 3. Still succeeding ⇒ the monitor did not move. Retry the switch, up to
    `--switch-retries 3`, 1 s apart.
 4. Still succeeding after the last retry ⇒ run `--notify-cmd` and stop. The user
@@ -266,36 +266,42 @@ The host agent: detector, claimer, watcher, and the switch command, in one
 long-running process. Everything has a per-OS default; with discovery there are
 no required arguments.
 
-| Flag / arg              | Default (Linux)                                              | Default (macOS)                                                                                    | Meaning                                                                          |
-| ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `--id ID`               | `linux`                                                      | `mac`                                                                                              | Claimed identity (from `GOOS`; override for testing)                             |
-| `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `betterdisplaycli set -productNameLike=LG -feature=ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent |
-| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | `betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect`                           | Veto before the switch, receipt after it (§4.3)                                  |
-| `--usb VID:PID`         | `046d:c548`                                                  | `046d:c548`                                                                                        | Bolt receiver filter for the primary detector                                    |
-| `--settle 2s`           | 2s                                                           | 2s                                                                                                 | Attach must persist this long before claiming                                    |
-| `--confirm 4s`          | 4s                                                           | 4s                                                                                                 | How long `--check-cmd` may keep succeeding before the switch counts as failed    |
-| `--switch-retries 3`    | 3                                                            | 3                                                                                                  | Re-runs of the switch command, 1 s apart, before giving up                       |
-| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'`        | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`           | Run when the switch cannot be confirmed after the last retry                     |
-| `--bt-mac AA:BB…`       | off                                                          | n/a                                                                                                | Bluetooth fallback detector, Linux only (§6.3)                                   |
-| `--no-guards`           | implicit                                                     | —                                                                                                  | macOS guards: AC power + dock present (§6.2)                                     |
-| `SOFTKVM_TOKEN`         | required                                                     | required                                                                                           | Shared secret                                                                    |
+| Flag / arg              | Default (Linux)                                              | Default (macOS)                                                                                    | Meaning                                                                                 |
+| ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `--id ID`               | `linux`                                                      | `mac`                                                                                              | Claimed identity (from `GOOS`; override for testing)                                    |
+| `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `betterdisplaycli set -productNameLike=LG -feature=ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent        |
+| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | `betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect`                           | Veto before the switch, receipt after it (§4.3)                                         |
+| `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3) |
+| `--usb VID:PID`         | `046d:c548`                                                  | `046d:c548`                                                                                        | Bolt receiver filter for the primary detector                                           |
+| `--settle 2s`           | 2s                                                           | 2s                                                                                                 | Attach must persist this long before claiming                                           |
+| `--confirm 4s`          | 4s                                                           | 4s                                                                                                 | How long `--check-cmd` may keep succeeding before the switch counts as failed           |
+| `--switch-retries 3`    | 3                                                            | 3                                                                                                  | Re-runs of the switch command, 1 s apart, before giving up                              |
+| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'`        | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`           | Run when the switch cannot be confirmed after the last retry                            |
+| `--bt-mac AA:BB…`       | off                                                          | n/a                                                                                                | Bluetooth fallback detector, Linux only (§6.3)                                          |
+| `--no-guards`           | implicit                                                     | —                                                                                                  | macOS guards: AC power + dock present (§6.2)                                            |
+| `SOFTKVM_TOKEN`         | required                                                     | required                                                                                           | Shared secret                                                                           |
 
 `-productNameLike=LG` (or the LG's actual name substring) avoids hardcoding
-display IDs. Input codes follow the VCP `0x60` values — DP=15, DP2=16, HDMI=17,
-HDMI2=18, USB-C/TB≈25 — but the LG's real per-port codes are whatever §10
-records, and vendors deviate.[^5^]
+display IDs. The two switch commands take codes from different namespaces.
+BetterDisplay writes the standard VCP `0x60` and uses its values — DP=15,
+DP2=16, HDMI=17, HDMI2=18, USB-C/TB≈25 — but the LG's real per-port codes are
+whatever §10 records, and vendors deviate.[^5^] `ddcutil` writes the LG-specific
+VCP `0xF4`, whose codes come from this monitor's firmware: DisplayPort `0xD0`
+(fallback `0x06`), TB/USB-C `0xD1`, HDMI 1 `0x90`, HDMI 2 `0x91`. `--noverify`
+is load-bearing, not a shortcut: read-back verification fails on this firmware,
+so a verifying write reports failure after succeeding.
 
 **Behavior:**
 
 1. On start: read `last_owner`, `GET /state`, reconcile per §4.3. First run
    after a state-file loss never switches.
 2. Detector sees receiver attach → `--settle` stable → guards pass →
-   `POST /claim/<id>` (3 retries, exponential backoff to 30 s; failure logged,
-   never fatal).
+   `POST /claim/<id>` (3 retries, each attempt bounded to 5 s, exponential
+   backoff with full jitter to 30 s; failure logged, never fatal).
 3. Watcher: `GET /wait?epoch=N&id=<me>` (client timeout 60 s) → on wake,
    reconcile as in (1). A connection error is a reconcile trigger, not a fatal.
-4. Guards re-evaluated every cycle; off-guard ⇒ fully dormant, zero traffic
-   (macOS).
+4. Guards re-evaluated every cycle; off-guard ⇒ fully dormant, zero traffic,
+   re-checking the guards every 15 s (macOS).
 5. **Sleep detection:** compare `time.Now()` drift against a monotonic deadline
    each cycle. A wall-clock jump greater than 2× the poll interval means the
    machine slept: reconcile immediately rather than waiting out the dead
@@ -337,6 +343,7 @@ records, and vendors deviate.[^5^]
 ```nix
 hardware.i2c.enable = true;              # i2c-dev + i2c group + udev rules
 users.users.brice.extraGroups = [ "i2c" ];
+users.users.brice.linger = true;         # user units die at logout otherwise
 environment.systemPackages = [ pkgs.ddcutil ];
 ```
 
@@ -362,6 +369,10 @@ monitor hotplug and across reboots**. Do not pin `--bus`; pin `--model` or
   Mac is docked but not active — and the guard would make the Mac permanently
   unable to claim. Deep Sleep off (finding 11) fixes it; belt and braces, treat
   the LG as present for 10 minutes after it was last seen.
+- **Guards down means receiver absent.** The detector's attach-edge state resets
+  whenever the guards fail, so a Mac that slept through the dock sees a fresh
+  attach edge when the guards pass again, and claims — even though the USB
+  attach itself happened while the agent was suspended.
 - **`system_profiler SPDisplaysDataType` costs 1–3 s** and wakes the discrete
   GPU path. Do not call it on a 2 s cadence. Use
   `betterdisplaycli get -identifiers` — it is already a dependency and returns
@@ -419,7 +430,9 @@ nothing.
 - Token comparison via `crypto/subtle.ConstantTimeCompare`.
 - **Atomic state writes:** temp file in the same directory, `fsync`, `rename`. A
   truncated `state.json` after a power cut must not crash-loop the service — on
-  parse failure, log and start from `owner=""`, `epoch=0`.
+  parse failure, log and start from `owner=""`, `epoch=0`. A fresh server with
+  no state file starts the same way; the §4.3 first-reconcile rule makes the
+  empty owner safe.
 - Claims serialized under one lock; last claim wins.
 - No Home Assistant dependency.
 
@@ -453,10 +466,11 @@ is scoped by construction: it can read/flip one display bit and nothing else.
 | Simultaneous claims                                               | Serialized; last wins; both agents reconcile                                                                                                                                                                                                                                                                                                               |
 | Loser asleep/off at claim                                         | Nobody switches; loser self-heals at resume, but only if it was the owner (§4.3)                                                                                                                                                                                                                                                                           |
 | Agent starts with no local `last_owner`                           | Adopts the server's owner, switches nothing                                                                                                                                                                                                                                                                                                                |
-| Coordinator unreachable                                           | Claims logged-and-lost; agents back off to 30 s; OSD fallback                                                                                                                                                                                                                                                                                              |
+| Coordinator unreachable                                           | Claims logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the two agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                                                        |
 | Mac away / on battery / undocked                                  | Guards suppress everything; bit may change without the Mac — harmless, because the loser also requires the winner to be live                                                                                                                                                                                                                               |
 | Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                                                |
 | Monitor already on claimant's input                               | Loser's `--check-cmd` fails → no-op, `last_owner` resynced                                                                                                                                                                                                                                                                                                 |
+| Token mismatch after rotation                                     | Claims and waits fail 401 with a distinct log line; nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                                            |
 | Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                            |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable |
 | Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                               |
@@ -468,8 +482,10 @@ is scoped by construction: it can read/flip one display bit and nothing else.
 
 ## 9. Security notes
 
-- Token blast radius: read/flip one display bit. Rotating = editing one env
-  file. The token never appears in `ps` or shell history.
+- Token blast radius: read/flip one display bit. Rotating = editing the env
+  files and restarting the server and both agents — the token is read at process
+  start, and everything 401s until they agree (§8). The token never appears in
+  `ps` or shell history.
 - No Home Assistant credentials anywhere in the system.
 - Corp device surface: one binary, outbound HTTP to one LAN host, no listeners,
   no credentials of value, no installs. mDNS adds outbound multicast on UDP 5353
@@ -505,6 +521,10 @@ binary that does not exist yet.
 - [ ] Fifty switches back and forth: count how many needed a retry. If retries
       are common rather than rare, `--confirm` and `--switch-retries` need
       different numbers than the guessed 4 s and 3
+- [ ] Re-claim the current owner fifty times: the epoch never moves and no agent
+      wakes (idempotent claims, §7)
+- [ ] Claim-to-pixels latency on the end-to-end pass: ≤ 10 s — settle and
+      long-poll wake dominate
 - [ ] LG OSD: Deep Sleep Off on both ports; confirm the losing host keeps the
       display connected after a switch (no Hyprland workspace collapse)
 - [ ] Netlink uevent filter fires once per attach, not once per interface, and
