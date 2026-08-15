@@ -24,7 +24,7 @@ func newClientTestServer(t *testing.T) (*Server, *httptest.Server) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	s := NewServer(statePath, clientTestToken)
 	s.waitTimeout = 300 * time.Millisecond
-	return s, httptest.NewServer(s.Handler())
+	return s, startTLSTestServer(t, s)
 }
 
 func baseFromURL(t *testing.T, raw string) string {
@@ -40,7 +40,7 @@ func TestClientClaimForce(t *testing.T) {
 	_, srv := newClientTestServer(t)
 	defer srv.Close()
 
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 	changed, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", true)
 	if err != nil {
 		t.Fatalf("claim force: %v", err)
@@ -62,7 +62,7 @@ func TestClientClaimNoLiveAgent(t *testing.T) {
 	_, srv := newClientTestServer(t)
 	defer srv.Close()
 
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false)
 	if !errors.Is(err, ErrNoLiveAgent) {
 		t.Fatalf("expected ErrNoLiveAgent, got %v", err)
@@ -74,7 +74,7 @@ func TestClientWaitWakesOnClaim(t *testing.T) {
 	defer srv.Close()
 
 	base := baseFromURL(t, srv.URL)
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 
 	wokeCh := make(chan bool, 1)
 	errCh := make(chan error, 1)
@@ -124,7 +124,7 @@ func TestClientWaitTimeout(t *testing.T) {
 	_, srv := newClientTestServer(t)
 	defer srv.Close()
 
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 	woke, err := c.Wait(context.Background(), baseFromURL(t, srv.URL), 0, "mac")
 	if err != nil {
 		t.Fatalf("wait: %v", err)
@@ -138,7 +138,7 @@ func TestClientState(t *testing.T) {
 	_, srv := newClientTestServer(t)
 	defer srv.Close()
 
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 	state, err := c.State(context.Background(), baseFromURL(t, srv.URL))
 	if err != nil {
 		t.Fatalf("state: %v", err)
@@ -151,41 +151,56 @@ func TestClientState(t *testing.T) {
 	}
 }
 
-func TestClientUnauthorized(t *testing.T) {
+func TestClientWrongSecret(t *testing.T) {
 	_, srv := newClientTestServer(t)
 	defer srv.Close()
 
 	base := baseFromURL(t, srv.URL)
-	c := NewClient("wrong-token")
+	// A client holding a different secret derives a different trust root, so
+	// the TLS handshake fails before any request reaches the token check
+	// (SPEC §9).
+	c := newTestClient(t, "wrong-token")
 
-	if _, err := c.Claim(context.Background(), base, "mac", true); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("claim: expected ErrUnauthorized, got %v", err)
+	if _, err := c.Claim(context.Background(), base, "mac", true); err == nil {
+		t.Fatal("claim: expected TLS failure")
+	} else if !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("claim: expected certificate error, got %v", err)
 	}
-	if _, err := c.State(context.Background(), base); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("state: expected ErrUnauthorized, got %v", err)
+	if _, err := c.State(context.Background(), base); err == nil {
+		t.Fatal("state: expected TLS failure")
+	} else if !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("state: expected certificate error, got %v", err)
 	}
-	if _, err := c.Wait(context.Background(), base, 0, "mac"); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("wait: expected ErrUnauthorized, got %v", err)
+	if _, err := c.Wait(context.Background(), base, 0, "mac"); err == nil {
+		t.Fatal("wait: expected TLS failure")
+	} else if !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("wait: expected certificate error, got %v", err)
 	}
 }
 
 func TestClientConnectionRefused(t *testing.T) {
-	c := NewClient(clientTestToken)
+	c := newTestClient(t, clientTestToken)
 	if _, err := c.State(context.Background(), "127.0.0.1:1"); err == nil {
 		t.Fatal("expected error for connection refused")
 	}
 }
 
 func TestClientMalformedResponse(t *testing.T) {
-	malformed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	malformed := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("not json"))
 	}))
+	var err error
+	malformed.TLS, err = serverTLSConfig(clientTestToken)
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+	malformed.StartTLS()
 	defer malformed.Close()
 
-	c := NewClient(clientTestToken)
-	_, err := c.State(context.Background(), baseFromURL(t, malformed.URL))
+	c := newTestClient(t, clientTestToken)
+	_, err = c.State(context.Background(), baseFromURL(t, malformed.URL))
 	if err == nil {
 		t.Fatal("expected error for malformed JSON")
 	}
@@ -195,14 +210,20 @@ func TestClientMalformedResponse(t *testing.T) {
 }
 
 func TestClientNonJSONErrorBody(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = fmt.Fprint(w, "plain text error")
 	}))
+	var err error
+	server.TLS, err = serverTLSConfig(clientTestToken)
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+	server.StartTLS()
 	defer server.Close()
 
-	c := NewClient(clientTestToken)
-	_, err := c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false)
+	c := newTestClient(t, clientTestToken)
+	_, err = c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false)
 	if err == nil {
 		t.Fatal("expected error")
 	}

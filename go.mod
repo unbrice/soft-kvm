@@ -1,6 +1,6 @@
 module github.com/unbrice/soft-kvm
 
-go 1.22
+go 1.24.0
 
 require (
 	github.com/grandcat/zeroconf v1.0.0

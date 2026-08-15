@@ -35,7 +35,7 @@ func newAgentTestServer(t *testing.T) (*Server, *httptest.Server) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	s := NewServer(statePath, testToken)
 	s.waitTimeout = 200 * time.Millisecond
-	return s, httptest.NewServer(s.Handler())
+	return s, startTLSTestServer(t, s)
 }
 
 // fakeDetector lets tests inject attach edges. Run is not started until the
@@ -124,13 +124,14 @@ func agentMachineConfig(id string) *MachineConfig {
 	}
 }
 
-func agentTestConfig(base, statePath string, s *Server, det Detector, guard Guard, runner Runner) agentConfig {
+func agentTestConfig(t *testing.T, base, statePath string, s *Server, det Detector, guard Guard, runner Runner) agentConfig {
+	t.Helper()
 	return agentConfig{
 		id:             "linux",
 		explicitServer: base,
 		detector:       det,
 		guard:          guard,
-		client:         NewClient(testToken),
+		client:         newTestClient(t, testToken),
 		runner:         runner,
 		machine:        agentMachineConfig("linux"),
 		agentStatePath: statePath,
@@ -167,7 +168,7 @@ func TestAgentAttachClaims(t *testing.T) {
 	runner := &recordingRunner{}
 	guard := &fakeGuard{ok: true}
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	cfg := agentTestConfig(base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +178,7 @@ func TestAgentAttachClaims(t *testing.T) {
 	waitForLive(t, s, "linux")
 	det.attach()
 
-	client := NewClient(testToken)
+	client := newTestClient(t, testToken)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		state, err := client.State(ctx, base)
@@ -198,7 +199,7 @@ func TestAgentSwitchPath(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
-	client := NewClient(testToken)
+	client := newTestClient(t, testToken)
 
 	// Seed the server so the agent starts with last_owner == me.
 	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
@@ -219,7 +220,7 @@ func TestAgentSwitchPath(t *testing.T) {
 	// Probe succeeds (veto passed), switch succeeds, confirm probe fails (landed).
 	runner := &recordingRunner{errs: []error{nil, nil, errors.New("input inactive")}}
 	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -268,7 +269,7 @@ func TestAgentVetoPath(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
-	client := NewClient(testToken)
+	client := newTestClient(t, testToken)
 
 	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
 		t.Fatalf("seed claim: %v", err)
@@ -287,7 +288,7 @@ func TestAgentVetoPath(t *testing.T) {
 	// First probe fails the veto, so no switch runs.
 	runner := &recordingRunner{errs: []error{errors.New("input inactive")}}
 	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -336,7 +337,7 @@ func TestAgentGuardsDown(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
-	client := NewClient(testToken)
+	client := newTestClient(t, testToken)
 
 	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
 		t.Fatalf("seed claim other: %v", err)
@@ -350,7 +351,7 @@ func TestAgentGuardsDown(t *testing.T) {
 	det := newFakeDetector()
 	runner := &recordingRunner{}
 	guard := &fakeGuard{ok: false}
-	cfg := agentTestConfig(base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

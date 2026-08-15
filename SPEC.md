@@ -10,17 +10,17 @@ work; §10 is the integration pass, run at the end.
 
 ## 1. Context
 
-| Item                  | Facts                                                                                                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                |
-| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                         |
-| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                              |
-| Input-switch commands | Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` · macOS: BetterDisplay CLI (`betterdisplaycli set -feature=ddc -vcp=inputSelect -value=<code>`) — both are defaults baked into the binary, overridable via CLI args                                              |
-| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire             |
-| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                        |
-| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                  |
-| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                    |
-| Implementation        | One Go binary, `soft-kvm`, three subcommands (`serve` / `activate` / `connect`). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.22, stdlib + `golang.org/x/sys/unix` + `grandcat/zeroconf` (mDNS discovery, §5.1) |
+| Item                  | Facts                                                                                                                                                                                                                                                                                                                                    |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                    |
+| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                             |
+| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                  |
+| Input-switch commands | Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` · macOS: BetterDisplay CLI (`betterdisplaycli set -feature=ddc -vcp=inputSelect -value=<code>`) — both are defaults baked into the binary, overridable via CLI args                                                                                                  |
+| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                 |
+| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                            |
+| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                      |
+| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                        |
+| Implementation        | One Go binary, `soft-kvm`, three subcommands (`serve` / `activate` / `connect`). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.24, stdlib + `golang.org/x/sys/unix` + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) |
 
 ## 2. Goals / non-goals
 
@@ -219,16 +219,12 @@ Sharp edges, in the order they will bite:
 - **macOS 15 gates local network access per-binary.** Sequoia prompts on the
   first connection to a LAN address — multicast *and* unicast — and a denial is
   silent: connections simply never complete. A launchd agent may get no prompt
-  at all, and MDM can deny it outright. This applies to the plain HTTP long-poll
-  too, not only to mDNS, so it must be cleared before anything else on the Mac
-  (§10).
-- **Any LAN host can advertise the same service** and harvest the token from
-  whichever agent browses first. Under the stated threat model this changes
-  little — the token already crosses the LAN in cleartext over plain HTTP — but
-  it lowers impersonation from "spoof ARP" to "publish a record". The fix, if
-  the threat model tightens: `GET /hello?nonce=N` returning
-  `HMAC-SHA256(token, N)`, checked before the agent sends the token. Not
-  planned.
+  at all, and MDM can deny it outright. This applies to the HTTPS long-poll too,
+  not only to mDNS, so it must be cleared before anything else on the Mac (§10).
+- **Any LAN host can advertise the same service** and point agents at an
+  impostor — but the impostor cannot complete the TLS handshake, because the
+  certificate is derived from the secret it does not hold (§9). The agent
+  re-browses on the failure (§8) and never reveals the token.
 - `grandcat/zeroconf` is thinly maintained; `github.com/libp2p/zeroconf/v2` is
   the live fork with the same API. Switch if the browse loop misbehaves.
 
@@ -419,8 +415,9 @@ nothing.
   library sets `SO_REUSEADDR`/`SO_REUSEPORT` and coexists; where it does not,
   register through Avahi with a static `/etc/avahi/services/soft-kvm.service`
   and pass `--no-advertise`.
-- `net/http` with Go ≥ 1.22 `ServeMux` patterns (`POST /claim/{id}`) — method
-  and wildcard matching without a router dependency.
+- `net/http` with Go ≥ 1.24 `ServeMux` patterns (`POST /claim/{id}`) — method
+  and wildcard matching without a router dependency. The TLS identity comes from
+  `crypto/hkdf` (stdlib since Go 1.24), which is what sets the floor.
 - `/wait` uses a **broadcast channel**: state holds a `chan struct{}` that is
   closed on every epoch change and replaced under the same lock. Waiters
   `select` on it, `time.After(50s)`, and `r.Context().Done()`. Not `sync.Cond`,
@@ -438,9 +435,11 @@ nothing.
 
 ## 7. Service API spec
 
-**Base:** `http://<coordinator>:8700` · **Auth:** header
-`X-Display-Token: <SOFTKVM_TOKEN>` on all endpoints except `/health`. The secret
-is scoped by construction: it can read/flip one display bit and nothing else.
+**Base:** `https://<coordinator>:8700` · **Auth:** TLS proves both peers hold
+`SOFTKVM_TOKEN` (the identity is derived from it, §9); the header
+`X-Display-Token: <SOFTKVM_TOKEN>` rides on top of that on all endpoints except
+`/health`. The secret is scoped by construction: it can read/flip one display
+bit and nothing else.
 
 | Endpoint                    | Behavior                                                                                                                                           |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -456,7 +455,7 @@ is scoped by construction: it can read/flip one display bit and nothing else.
   compare numerically. A restored-from-backup or reset `state.json` moves the
   epoch backwards, and a client that only waits for `epoch > N` spins at line
   rate.
-- LAN bind, plain HTTP. Accepted risk: low-value secret on trusted LAN.
+- LAN bind, HTTPS only. TLS 1.3, identity derived from the shared secret (§9).
 
 ## 8. Edge cases
 
@@ -470,24 +469,38 @@ is scoped by construction: it can read/flip one display bit and nothing else.
 | Mac away / on battery / undocked                                  | Guards suppress everything; bit may change without the Mac — harmless, because the loser also requires the winner to be live                                                                                                                                                                                                                               |
 | Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                                                |
 | Monitor already on claimant's input                               | Loser's `--check-cmd` fails → no-op, `last_owner` resynced                                                                                                                                                                                                                                                                                                 |
-| Token mismatch after rotation                                     | Claims and waits fail 401 with a distinct log line; nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                                            |
+| Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                    |
 | Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                            |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable |
 | Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                               |
 | Switch fails while the monitor is in standby                      | Same path, and the retries usually cover it — a monitor waking from standby answers DDC a second or two late                                                                                                                                                                                                                                               |
 | Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the losing host: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                                                  |
 | mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                                          |
-| mDNS returns a stale or rogue record                              | Connection fails on the token check, or succeeds against an impostor (§5.1). Agents re-browse on any connection error rather than pinning the first answer                                                                                                                                                                                                 |
+| mDNS returns a stale or rogue record                              | Connection fails TLS verification — a rogue record points at a host that does not hold the secret and cannot present the derived certificate (§5.1, §9). Agents re-browse on any connection error rather than pinning the first answer                                                                                                                     |
 | Server moves host                                                 | Nothing is reconfigured; the new instance advertises, caches expire on first failure                                                                                                                                                                                                                                                                       |
 
 ## 9. Security notes
 
+- **TLS identity is derived from the shared secret.** Every instance runs
+  `HKDF-SHA256(SOFTKVM_TOKEN, info="soft-kvm tls v1")` into an Ed25519 seed and
+  self-signs a fixed-template CA certificate. The template is constant and
+  Ed25519 signing is deterministic, so all holders of the secret generate
+  byte-identical certificates. The server presents it; clients trust exactly it
+  (the derived certificate is their only root, `ServerName` pinned to its SAN).
+  No fingerprint comparison, no PKI, no config beyond the token. Rotating the
+  token rotates the identity for free.
+- The certificate is publicly derivable from the secret, so anyone who has seen
+  a handshake can test candidate secrets **offline** against the observed
+  certificate. `SOFTKVM_TOKEN` must be a generated high-entropy string, never
+  something memorizable.
 - Token blast radius: read/flip one display bit. Rotating = editing the env
   files and restarting the server and both agents — the token is read at process
-  start, and everything 401s until they agree (§8). The token never appears in
-  `ps` or shell history.
+  start, and handshakes fail until they agree (§8). The token never appears in
+  `ps` or shell history. The `X-Display-Token` header stays as an
+  application-layer check on top of TLS; it is unreachable by anyone without the
+  secret.
 - No Home Assistant credentials anywhere in the system.
-- Corp device surface: one binary, outbound HTTP to one LAN host, no listeners,
+- Corp device surface: one binary, outbound HTTPS to one LAN host, no listeners,
   no credentials of value, no installs. mDNS adds outbound multicast on UDP 5353
   and an inbound multicast socket — a listener in the kernel sense, and a point
   worth checking against the corp policy before it is discovered by someone
@@ -541,8 +554,8 @@ binary that does not exist yet.
 - [ ] LG OSD: Auto Input Switch **Off** on all ports; confirm the monitor stays
       on a dead input rather than scanning away from it
 - [ ] **macOS local network access granted** to the binary under the corp MDM
-      profile, for both the mDNS browse and the plain HTTP long-poll — a denial
-      is silent and looks exactly like a network outage (§5.1)
+      profile, for both the mDNS browse and the HTTPS long-poll — a denial is
+      silent and looks exactly like a network outage (§5.1)
 - [ ] mDNS browse from the Mac **over WiFi** resolves the server in < 3 s,
       repeatedly, including after the AP roams. If not, set `SOFTKVM_SERVER` on
       the Mac and treat discovery as a Linux-only convenience
@@ -592,9 +605,13 @@ struct field. Three blocking things do not respect it by default:
   request context is a child of the process context: one cancel returns every
   waiter immediately, and `Shutdown` then completes in milliseconds.
 
-Supervision is a `sync.WaitGroup` over three goroutines and a
-`context.WithCancel` — not `errgroup`, because with three goroutines and no
-error to propagate upward it would be a module for fifteen lines.
+Supervision is `errgroup` (`golang.org/x/sync`): one group per worker generation
+— the detector and watcher loops, cancelled together and waited before the next
+generation starts — plus a second group with `SetLimit(1)` holding claims, so a
+redundant claim trigger coalesces instead of overlapping an in-flight retry. The
+loops never return an error (they retry with backoff and exit on cancel), so
+first-error cancellation never fires; the group is used as a `WaitGroup` with
+`Go`.
 
 ### 11.2 What is an interface, and what is not
 
@@ -682,11 +699,12 @@ happened", not "it switched to a host that is not there".
 ## 12. Build & packaging
 
 - Module: `github.com/<user>/soft-kvm`; layout in §11.
-- Deps: stdlib, `golang.org/x/sys/unix`, `github.com/grandcat/zeroconf` (which
-  pulls `miekg/dns` and `golang.org/x/net`). All pure Go; `CGO_ENABLED=0`,
-  `-trimpath`, `-ldflags="-s -w"` still hold. Discovery costs three modules
-  where the rest of the binary costs one — that is the price of not editing an
-  IP address in three places.
+- Deps: stdlib, `golang.org/x/sys/unix`, `golang.org/x/sync`,
+  `github.com/grandcat/zeroconf` (which pulls `miekg/dns` and
+  `golang.org/x/net`). All pure Go; `CGO_ENABLED=0`, `-trimpath`,
+  `-ldflags="-s -w"` still hold. Discovery costs three modules where the rest of
+  the binary costs two — that is the price of not editing an IP address in three
+  places.
 - Targets: `linux/amd64` (desktop), `darwin/arm64` (laptop), and `linux/arm64`
   or `linux/arm` for a Pi — check `uname -m`, since `armv7l` means `linux/arm`
   `GOARM=7` even under a 64-bit kernel.

@@ -31,12 +31,17 @@ type Client struct {
 	client *http.Client
 }
 
-// NewClient returns a client that authenticates with token.
-func NewClient(token string) *Client {
+// NewClient returns a client that authenticates with token and trusts exactly
+// the TLS identity derived from it (SPEC §9).
+func NewClient(token string) (*Client, error) {
+	tlsCfg, err := clientTLSConfig(token)
+	if err != nil {
+		return nil, fmt.Errorf("derive TLS identity: %w", err)
+	}
 	return &Client{
 		token:  token,
-		client: &http.Client{},
-	}
+		client: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}},
+	}, nil
 }
 
 // Claim POSTs /claim/<id> (?force=true when force). It returns whether the
@@ -44,7 +49,7 @@ func NewClient(token string) *Client {
 // no live agent becomes ErrNoLiveAgent (SPEC §5.3: activate needs --force).
 // Any other non-2xx returns an error that includes the response body.
 func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, error) {
-	url := "http://" + base + "/claim/" + id
+	url := "https://" + base + "/claim/" + id
 	if force {
 		url += "?force=true"
 	}
@@ -76,7 +81,7 @@ func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, 
 
 // State GETs /state and returns the current server state.
 func (c *Client) State(ctx context.Context, base string) (*ServerState, error) {
-	url := "http://" + base + "/state"
+	url := "https://" + base + "/state"
 	status, body, err := c.request(ctx, http.MethodGet, url, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -99,7 +104,7 @@ func (c *Client) State(ctx context.Context, base string) (*ServerState, error) {
 // woke=false on a 204 timeout. The caller supplies ctx; the internal timeout is
 // 60 s to match the long-poll (the server times out at 50 s).
 func (c *Client) Wait(ctx context.Context, base string, epoch int64, id string) (bool, error) {
-	u := fmt.Sprintf("http://%s/wait?epoch=%d&id=%s", base, epoch, url.QueryEscape(id))
+	u := fmt.Sprintf("https://%s/wait?epoch=%d&id=%s", base, epoch, url.QueryEscape(id))
 	status, body, err := c.request(ctx, http.MethodGet, u, 60*time.Second)
 	if err != nil {
 		return false, err

@@ -169,7 +169,10 @@ func activateCmd(ctx context.Context) error {
 		return err
 	}
 
-	client := NewClient(token)
+	client, err := NewClient(token)
+	if err != nil {
+		return err
+	}
 	changed, err := client.Claim(ctx, base, id, *force)
 	if err != nil {
 		if errors.Is(err, ErrNoLiveAgent) && !*force {
@@ -244,6 +247,11 @@ func connectCmd(ctx context.Context) error {
 		switchArgv = defaultSwitchCmd
 	}
 
+	client, err := NewClient(token)
+	if err != nil {
+		return err
+	}
+
 	machineCfg := MachineConfig{
 		ID:             *id,
 		Settle:         *settle,
@@ -261,7 +269,7 @@ func connectCmd(ctx context.Context) error {
 		explicitServer: *serverFlag,
 		detector:       detector,
 		guard:          guard,
-		client:         NewClient(token),
+		client:         client,
 		runner:         run,
 		machine:        &machineCfg,
 		agentStatePath: filepath.Join(stateDir(), "agent.json"),

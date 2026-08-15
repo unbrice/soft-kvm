@@ -278,14 +278,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-// Run serves on addr ("[IP:]PORT") until ctx is cancelled, then shuts down
-// gracefully. BaseContext derives every request context from ctx so one cancel
+// Run serves HTTPS on addr ("[IP:]PORT") until ctx is cancelled, then shuts
+// down gracefully. The TLS identity is derived from the shared secret (SPEC
+// §9). BaseContext derives every request context from ctx so one cancel
 // releases all /wait long-polls and Shutdown returns in ms (SPEC §11.1).
 // Returns nil on ctx cancellation.
 func (s *Server) Run(ctx context.Context, addr string) error {
+	tlsCfg, err := serverTLSConfig(s.token)
+	if err != nil {
+		return fmt.Errorf("derive TLS identity: %w", err)
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.Handler(),
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      0,
 		BaseContext: func(net.Listener) context.Context {
@@ -295,7 +301,7 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- srv.ListenAndServe()
+		errCh <- srv.ListenAndServeTLS("", "")
 	}()
 
 	select {

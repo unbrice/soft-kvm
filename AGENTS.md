@@ -8,7 +8,9 @@ macOS laptop.
 it fixes the package layout, the cancellation rules and the state machine, and
 §4.3 fixes what may authorise a switch.
 
-- **Stack.** Go ≥ 1.22, `CGO_ENABLED=0`, stdlib + `golang.org/x/sys/unix` +
+- **Stack.** Go ≥ 1.24 (`crypto/hkdf` derives the TLS identity from
+  `SOFTKVM_TOKEN`, SPEC §9), `CGO_ENABLED=0`, stdlib + `golang.org/x/sys/unix` +
+  `golang.org/x/sync` (errgroup supervision, SPEC §11.1) +
   `github.com/grandcat/zeroconf`. No CLI framework: stdlib `flag`, one `FlagSet`
   per subcommand, because pflag's interspersed parsing eats the trailing
   `-- SWITCH-CMD ARGS...` (SPEC §11).
@@ -25,7 +27,7 @@ direnv allow            # or: nix develop ./nix/dev
 ```
 
 It carries go 1.26, gopls, golangci-lint, just, dprint, reuse, and — on Linux —
-ddcutil. The `go 1.22` in `go.mod` is the language floor, not the toolchain.
+ddcutil. The `go 1.24` in `go.mod` is the language floor, not the toolchain.
 
 ## Commands
 
