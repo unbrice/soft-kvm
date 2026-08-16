@@ -225,8 +225,26 @@ Sharp edges, in the order they will bite:
   impostor — but the impostor cannot complete the TLS handshake, because the
   certificate is derived from the secret it does not hold (§9). The agent
   re-browses on the failure (§8) and never reveals the token.
-- `grandcat/zeroconf` is thinly maintained; `github.com/libp2p/zeroconf/v2` is
-  the live fork with the same API. Switch if the browse loop misbehaves.
+- `grandcat/zeroconf` is unmaintained (pinned v1.0.0, 2021; upstream's last
+  commit was 2023). The known bugs and the shapes they force:
+
+  - Reusing a resolver or entries channel across `Browse` calls races into
+    close-of-closed-channel panics (issues #118, #113). Every browse round
+    builds both fresh, and the channel is buffered because the mainloop sends
+    without selecting on ctx.
+  - An entry whose first response carries no A/AAAA record is dropped (#124);
+    the 3 s retry loop absorbs it.
+  - A multi-homed server advertises every interface, junk included (#43; the
+    fix, PR #125, was never merged). The client ranks addresses — routable over
+    link-local — instead of trusting the first record, and §8's re-browse is the
+    backstop for an unroutable private address that ranking cannot recognise.
+
+  `github.com/libp2p/zeroconf/v2` is the live fork — but barely (last release
+  2022, kept alive for go-libp2p's own discovery), and not a drop-in: `Browse`
+  is a blocking package function with no `Resolver` type, and `ServiceEntry.TTL`
+  became `Expiry`. It fixes the channel-reuse panics this code already avoids,
+  and leaves #124 and #43 unfixed — so switching is API churn, not reliability.
+  Re-evaluate only if the browse loop misbehaves in the field.
 
 ### 5.2 `soft-kvm serve [IP:]PORT`
 

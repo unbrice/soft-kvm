@@ -108,6 +108,57 @@ func TestMDNSRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPickAddrRanking(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry zeroconf.ServiceEntry
+		want  string
+	}{
+		{
+			name:  "prefers IPv4 over IPv6",
+			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("192.168.1.2")}, AddrIPv6: []net.IP{net.ParseIP("fd00::2")}},
+			want:  "192.168.1.2",
+		},
+		{
+			name:  "prefers routable over link-local",
+			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("169.254.3.4"), net.ParseIP("192.168.1.2")}},
+			want:  "192.168.1.2",
+		},
+		{
+			name:  "skips loopback",
+			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("10.0.0.2")}},
+			want:  "10.0.0.2",
+		},
+		{
+			name:  "falls back to IPv6",
+			entry: zeroconf.ServiceEntry{AddrIPv6: []net.IP{net.ParseIP("fd00::2")}},
+			want:  "fd00::2",
+		},
+		{
+			name:  "falls back to link-local as last resort",
+			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("169.254.3.4")}, AddrIPv6: []net.IP{net.ParseIP("fe80::1")}},
+			want:  "169.254.3.4",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pickAddr(&tc.entry)
+			if err != nil {
+				t.Fatalf("pickAddr: %v", err)
+			}
+			if got.String() != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPickAddrEmpty(t *testing.T) {
+	if _, err := pickAddr(&zeroconf.ServiceEntry{}); err == nil {
+		t.Fatal("expected error for entry with no addresses")
+	}
+}
+
 func TestResolveServerExplicit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

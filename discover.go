@@ -35,8 +35,15 @@ func advertise(instance string, port int) (stop func(), err error) {
 }
 
 // browse returns the first advertised address as "host:port" (net.JoinHostPort
-// on the entry's IP — prefer IPv4 — and Port). The caller supplies the timeout
-// via ctx (SPEC §5.1 uses 3 s).
+// on the entry's best-ranked IP, per pickAddr, and Port). The caller supplies
+// the timeout via ctx (SPEC §5.1 uses 3 s).
+//
+// grandcat/zeroconf is unmaintained (v1.0.0, 2021; last commit 2023) and two
+// of its known bugs shape this function: reusing a resolver or entries
+// channel across Browse calls races into close-of-closed-channel panics
+// (#118, #113), so every round builds both fresh; and the mainloop drops an
+// entry whose first response carries no A/AAAA record (#124), which the 3 s
+// retry loop in resolveServer absorbs.
 func browse(ctx context.Context) (string, error) {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
@@ -56,18 +63,36 @@ func browse(ctx context.Context) (string, error) {
 		if entry == nil {
 			return "", ctx.Err()
 		}
-		var ip net.IP
-		if len(entry.AddrIPv4) > 0 {
-			ip = entry.AddrIPv4[0]
-		} else if len(entry.AddrIPv6) > 0 {
-			ip = entry.AddrIPv6[0]
-		} else {
-			return "", errors.New("mDNS entry has no address")
+		ip, err := pickAddr(entry)
+		if err != nil {
+			return "", err
 		}
 		return net.JoinHostPort(ip.String(), strconv.Itoa(entry.Port)), nil
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// pickAddr ranks an entry's addresses for dialling: IPv4 over IPv6, and
+// globally routable over link-local within each family. A multi-homed server
+// advertises every interface it has — Docker bridges, VPN tunnels,
+// self-assigned 169.254/16 — and zeroconf does not filter them
+// (grandcat/zeroconf#43, fixed only by the unmerged PR #125), so the first
+// record is not necessarily the reachable one. This ranking cannot recognise
+// an unroutable *private* address (a bridge IP looks like a LAN IP); §8's
+// re-browse on connection failure is the backstop for that.
+func pickAddr(entry *zeroconf.ServiceEntry) (net.IP, error) {
+	for _, linkLocal := range []bool{false, true} {
+		for _, addrs := range [][]net.IP{entry.AddrIPv4, entry.AddrIPv6} {
+			for _, ip := range addrs {
+				if ip.IsLoopback() || ip.IsLinkLocalUnicast() != linkLocal {
+					continue
+				}
+				return ip, nil
+			}
+		}
+	}
+	return nil, errors.New("mDNS entry has no address")
 }
 
 // resolveServer implements the SPEC §5.1 resolution order: explicit
