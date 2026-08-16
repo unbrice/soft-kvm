@@ -66,6 +66,7 @@ func (g alwaysOK) OK(context.Context) (bool, string) { return true, g.reason }
 type agentConfig struct {
 	id             string
 	explicitServer string
+	keyFP          string
 	detector       Detector
 	guard          Guard
 	client         *Client
@@ -299,30 +300,12 @@ func (a *agent) watcherLoop(ctx context.Context, stateCh chan<- *ServerState) er
 	b := newBackoff()
 
 	for {
-		base, err := resolveServer(ctx, a.cfg.explicitServer)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
+		base, state, ok := a.connectServer(ctx)
+		if !ok {
+			if ctx.Err() != nil {
 				return nil
 			}
-			slog.Error("watcher: resolve server failed", "error", err)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(b.next()):
-			}
-			continue
-		}
-
-		state, err := a.clientState(ctx, base)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			if errors.Is(err, ErrUnauthorized) {
-				slog.Error("watcher: token rejected")
-			} else {
-				slog.Error("watcher: state failed", "error", err)
-			}
+			slog.Error("watcher: no server candidate answered")
 			select {
 			case <-ctx.Done():
 				return nil
@@ -399,6 +382,28 @@ func (a *agent) watcherLoop(ctx context.Context, stateCh chan<- *ServerState) er
 	}
 }
 
+// connectServer ranges over resolveServer's candidates and returns the base
+// and state of the first whose /state answers. ok is false when the sequence
+// ended without a working candidate — for explicit/env sources after one
+// candidate, for mDNS only when ctx is done (SPEC §5.1, §8).
+func (a *agent) connectServer(ctx context.Context) (base string, state *ServerState, ok bool) {
+	for base := range resolveServer(ctx, a.cfg.explicitServer, a.cfg.keyFP) {
+		state, err := a.clientState(ctx, base)
+		if err == nil {
+			return base, state, true
+		}
+		if errors.Is(err, context.Canceled) {
+			return "", nil, false
+		}
+		if errors.Is(err, ErrUnauthorized) {
+			slog.Error("watcher: token rejected")
+		} else {
+			slog.Debug("watcher: candidate failed", "base", base, "error", err)
+		}
+	}
+	return "", nil, false
+}
+
 func (a *agent) clientState(ctx context.Context, base string) (*ServerState, error) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -421,8 +426,9 @@ func (a *agent) sendState(ctx context.Context, stateCh chan<- *ServerState, stat
 }
 
 // claim posts /claim/<id> with force=false, retrying up to four times with
-// exponential backoff capped at 30 s. Errors are logged; success caches the
-// server address (SPEC §5.4.2, §8).
+// exponential backoff capped at 30 s. Each attempt ranges the server
+// candidates under one 5 s context and claims against the first that answers.
+// Errors are logged; success caches the server address (SPEC §5.4.2, §8).
 func (a *agent) claim(ctx context.Context, id string) {
 	b := newBackoff()
 	for attempt := 0; attempt < 4; attempt++ {
@@ -435,28 +441,30 @@ func (a *agent) claim(ctx context.Context, id string) {
 		}
 
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		base, err := resolveServer(cctx, a.cfg.explicitServer)
-		cancel()
-		if err != nil {
-			slog.Error("claim: resolve server failed", "attempt", attempt+1, "error", err)
-			continue
-		}
-
-		cctx, cancel = context.WithTimeout(ctx, 5*time.Second)
-		changed, err := a.cfg.client.Claim(cctx, base, id, false)
-		cancel()
-		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
-				slog.Error("claim: token rejected", "attempt", attempt+1)
-			} else {
-				slog.Error("claim: failed", "attempt", attempt+1, "error", err)
+		claimed := false
+		for base := range resolveServer(cctx, a.cfg.explicitServer, a.cfg.keyFP) {
+			changed, err := a.cfg.client.Claim(cctx, base, id, false)
+			if err != nil {
+				if errors.Is(err, ErrUnauthorized) {
+					slog.Error("claim: token rejected", "attempt", attempt+1)
+				} else {
+					slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
+				}
+				continue
 			}
-			continue
+			if changed {
+				saveCachedServer(base)
+			}
+			slog.Info("claim: success", "id", id, "changed", changed)
+			claimed = true
+			break
 		}
-		if changed {
-			saveCachedServer(base)
+		cancel()
+		if claimed {
+			return
 		}
-		slog.Info("claim: success", "id", id, "changed", changed)
-		return
+		if ctx.Err() == nil {
+			slog.Error("claim: no candidate answered", "attempt", attempt+1)
+		}
 	}
 }

@@ -6,11 +6,12 @@ package main
 
 import (
 	"context"
-	"errors"
+	"iter"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +54,8 @@ func TestMDNSRoundTrip(t *testing.T) {
 	_ = ln.Close()
 
 	const instance = "test-instance"
-	stop, err := advertise(instance, port)
+	const token = "round-trip-token"
+	stop, err := advertise(instance, port, keyFingerprint(token))
 	if err != nil {
 		t.Fatalf("advertise: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestMDNSRoundTrip(t *testing.T) {
 		if entry.Port != port {
 			t.Errorf("port %d, want %d", entry.Port, port)
 		}
-		wantTXT := []string{"proto=1", "id=" + instance}
+		wantTXT := []string{"proto=1", "id=" + instance, "kh=" + keyFingerprint(token)}
 		for _, w := range wantTXT {
 			found := false
 			for _, txt := range entry.Text {
@@ -99,7 +101,7 @@ func TestMDNSRoundTrip(t *testing.T) {
 			}
 		}
 		for _, txt := range entry.Text {
-			if strings.Contains(txt, "token") {
+			if strings.Contains(txt, token) {
 				t.Errorf("TXT record leaks token: %q", txt)
 			}
 		}
@@ -108,67 +110,113 @@ func TestMDNSRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPickAddrRanking(t *testing.T) {
+func TestRankAddrsOrdering(t *testing.T) {
 	tests := []struct {
 		name  string
 		entry zeroconf.ServiceEntry
-		want  string
+		want  []string
 	}{
 		{
 			name:  "prefers IPv4 over IPv6",
 			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("192.168.1.2")}, AddrIPv6: []net.IP{net.ParseIP("fd00::2")}},
-			want:  "192.168.1.2",
+			want:  []string{"192.168.1.2", "fd00::2"},
 		},
 		{
 			name:  "prefers routable over link-local",
 			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("169.254.3.4"), net.ParseIP("192.168.1.2")}},
-			want:  "192.168.1.2",
+			want:  []string{"192.168.1.2", "169.254.3.4"},
 		},
 		{
 			name:  "skips loopback",
 			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("10.0.0.2")}},
-			want:  "10.0.0.2",
+			want:  []string{"10.0.0.2"},
 		},
 		{
 			name:  "falls back to IPv6",
 			entry: zeroconf.ServiceEntry{AddrIPv6: []net.IP{net.ParseIP("fd00::2")}},
-			want:  "fd00::2",
+			want:  []string{"fd00::2"},
 		},
 		{
 			name:  "falls back to link-local as last resort",
 			entry: zeroconf.ServiceEntry{AddrIPv4: []net.IP{net.ParseIP("169.254.3.4")}, AddrIPv6: []net.IP{net.ParseIP("fe80::1")}},
-			want:  "169.254.3.4",
+			want:  []string{"169.254.3.4", "fe80::1"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := pickAddr(&tc.entry)
-			if err != nil {
-				t.Fatalf("pickAddr: %v", err)
+			var got []string
+			for _, ip := range rankAddrs(&tc.entry) {
+				got = append(got, ip.String())
 			}
-			if got.String() != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestPickAddrEmpty(t *testing.T) {
-	if _, err := pickAddr(&zeroconf.ServiceEntry{}); err == nil {
-		t.Fatal("expected error for entry with no addresses")
+func TestRankAddrsEmpty(t *testing.T) {
+	if got := rankAddrs(&zeroconf.ServiceEntry{}); len(got) != 0 {
+		t.Fatalf("expected no addresses, got %v", got)
 	}
+}
+
+func TestBrowseSkipsForeignToken(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	stop, err := advertise("test-instance", port, keyFingerprint("token-a"))
+	if err != nil {
+		t.Fatalf("advertise: %v", err)
+	}
+	defer stop()
+	time.Sleep(100 * time.Millisecond)
+
+	// Control: the matching fingerprint must find the server. If even it finds
+	// nothing, multicast loopback is unavailable and the test proves nothing.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	found := false
+	_ = browseRound(ctx, keyFingerprint("token-a"), func(string) bool {
+		found = true
+		return false
+	})
+	cancel()
+	if !found {
+		t.Skip("mDNS browse returned no entries (multicast loopback unavailable)")
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	found = false
+	_ = browseRound(ctx, keyFingerprint("token-b"), func(string) bool {
+		found = true
+		return false
+	})
+	if found {
+		t.Error("browseRound yielded a candidate for a foreign fingerprint")
+	}
+}
+
+// collect ranges seq until it ends, returning everything it yielded.
+func collect(seq iter.Seq[string]) []string {
+	var out []string
+	for v := range seq {
+		out = append(out, v)
+	}
+	return out
 }
 
 func TestResolveServerExplicit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	got, err := resolveServer(ctx, "explicit.example:1234")
-	if err != nil {
-		t.Fatalf("resolveServer: %v", err)
-	}
-	if got != "explicit.example:1234" {
-		t.Fatalf("got %q, want explicit.example:1234", got)
+	got := collect(resolveServer(ctx, "explicit.example:1234", ""))
+	if len(got) != 1 || got[0] != "explicit.example:1234" {
+		t.Fatalf("got %v, want [explicit.example:1234]", got)
 	}
 }
 
@@ -177,16 +225,13 @@ func TestResolveServerEnv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	got, err := resolveServer(ctx, "")
-	if err != nil {
-		t.Fatalf("resolveServer: %v", err)
-	}
-	if got != "env.example:5678" {
-		t.Fatalf("got %q, want env.example:5678", got)
+	got := collect(resolveServer(ctx, "", ""))
+	if len(got) != 1 || got[0] != "env.example:5678" {
+		t.Fatalf("got %v, want [env.example:5678]", got)
 	}
 }
 
-func TestResolveServerCache(t *testing.T) {
+func TestResolveServerCacheFallsThrough(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("stateDir env override is only verified on Linux")
 	}
@@ -195,15 +240,20 @@ func TestResolveServerCache(t *testing.T) {
 	const cached = "cached.example:9999"
 	saveCachedServer(cached)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
 	defer cancel()
 
-	got, err := resolveServer(ctx, "")
-	if err != nil {
-		t.Fatalf("resolveServer: %v", err)
+	start := time.Now()
+	// A fingerprint nothing on the LAN advertises, so the mDNS phase yields
+	// nothing: the cached candidate comes first, then the sequence only ends
+	// with ctx — proving the cache fell through to mDNS instead of returning.
+	got := collect(resolveServer(ctx, "", keyFingerprint("no-such-token")))
+	elapsed := time.Since(start)
+	if len(got) != 1 || got[0] != cached {
+		t.Fatalf("got %v, want [%s]", got, cached)
 	}
-	if got != cached {
-		t.Fatalf("got %q, want %q", got, cached)
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("sequence ended too quickly — no fall-through to mDNS: %v", elapsed)
 	}
 }
 
@@ -221,10 +271,10 @@ func TestResolveServerBrowseUntilCancelled(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := resolveServer(ctx, "")
+	got := collect(resolveServer(ctx, "", keyFingerprint("no-such-token")))
 	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context deadline exceeded, got %v", err)
+	if len(got) != 0 {
+		t.Fatalf("expected no candidates, got %v", got)
 	}
 	if elapsed < 900*time.Millisecond {
 		t.Fatalf("cancelled too quickly: %v", elapsed)

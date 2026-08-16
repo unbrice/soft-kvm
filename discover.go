@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"iter"
 	"log/slog"
 	"net"
 	"os"
@@ -22,11 +23,11 @@ import (
 )
 
 // advertise registers the server under _soft-kvm._tcp.local. with instance
-// name `instance` on `port`. The TXT record carries the protocol version and
-// the instance id — NEVER the token, it is broadcast to the whole LAN (SPEC
-// §5.1). The returned func deregisters.
-func advertise(instance string, port int) (stop func(), err error) {
-	txt := []string{"proto=1", "id=" + instance}
+// name `instance` on `port`. The TXT record carries the protocol version, the
+// instance id and the key fingerprint — NEVER the token, it is broadcast to
+// the whole LAN (SPEC §5.1). The returned func deregisters.
+func advertise(instance string, port int, fp string) (stop func(), err error) {
+	txt := []string{"proto=1", "id=" + instance, "kh=" + fp}
 	srv, err := zeroconf.Register(instance, "_soft-kvm._tcp", "local.", port, txt, nil)
 	if err != nil {
 		return nil, err
@@ -34,105 +35,155 @@ func advertise(instance string, port int) (stop func(), err error) {
 	return func() { srv.Shutdown() }, nil
 }
 
-// browse returns the first advertised address as "host:port" (net.JoinHostPort
-// on the entry's best-ranked IP, per pickAddr, and Port). The caller supplies
-// the timeout via ctx (SPEC §5.1 uses 3 s).
+// browseRound runs one mDNS browse round (the caller supplies the timeout via
+// ctx, SPEC §5.1 uses 3 s) and yields every address of every matching entry as
+// "host:port", ranked per rankAddrs. Entries whose kh= fingerprint is missing
+// or differs from wantFP are warned about once per distinct fingerprint and
+// skipped; an empty wantFP disables the check. Iteration stops when yield
+// returns false, ctx ends, or an entry error occurs.
 //
 // grandcat/zeroconf is unmaintained (v1.0.0, 2021; last commit 2023) and two
 // of its known bugs shape this function: reusing a resolver or entries
 // channel across Browse calls races into close-of-closed-channel panics
 // (#118, #113), so every round builds both fresh; and the mainloop drops an
-// entry whose first response carries no A/AAAA record (#124), which the 3 s
-// retry loop in resolveServer absorbs.
-func browse(ctx context.Context) (string, error) {
+// entry whose first response carries no A/AAAA record (#124), which the retry
+// loop in resolveServer absorbs.
+func browseRound(ctx context.Context, wantFP string, yield func(string) bool) error {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	// Buffered: browse returns after the first entry and zeroconf's mainloop
-	// sends with no ctx select, so an unbuffered channel would strand that
-	// goroutine on a send racing the timeout (SPEC §5.1).
+	// Buffered: zeroconf's mainloop sends with no ctx select, so an
+	// unbuffered channel would strand that goroutine on a send racing the
+	// round's timeout (SPEC §5.1).
 	entries := make(chan *zeroconf.ServiceEntry, 1)
 	if err := resolver.Browse(ctx, "_soft-kvm._tcp", "local.", entries); err != nil {
-		return "", err
+		return err
 	}
 
-	select {
-	case entry := <-entries:
-		if entry == nil {
-			return "", ctx.Err()
+	warned := make(map[string]bool) // fingerprints already warned about
+	for {
+		select {
+		case entry := <-entries:
+			if entry == nil {
+				continue
+			}
+			if wantFP != "" {
+				fp := entryFingerprint(entry)
+				if fp != wantFP {
+					if !warned[fp] {
+						warned[fp] = true
+						slog.Warn("ignoring soft-kvm server advertising a different token",
+							"instance", entry.Instance, "fingerprint", fp)
+					}
+					continue
+				}
+			}
+			for _, ip := range rankAddrs(entry) {
+				if !yield(net.JoinHostPort(ip.String(), strconv.Itoa(entry.Port))) {
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		ip, err := pickAddr(entry)
-		if err != nil {
-			return "", err
-		}
-		return net.JoinHostPort(ip.String(), strconv.Itoa(entry.Port)), nil
-	case <-ctx.Done():
-		return "", ctx.Err()
 	}
 }
 
-// pickAddr ranks an entry's addresses for dialling: IPv4 over IPv6, and
-// globally routable over link-local within each family. A multi-homed server
-// advertises every interface it has — Docker bridges, VPN tunnels,
-// self-assigned 169.254/16 — and zeroconf does not filter them
-// (grandcat/zeroconf#43, fixed only by the unmerged PR #125), so the first
-// record is not necessarily the reachable one. This ranking cannot recognise
-// an unroutable *private* address (a bridge IP looks like a LAN IP); §8's
-// re-browse on connection failure is the backstop for that.
-func pickAddr(entry *zeroconf.ServiceEntry) (net.IP, error) {
+// entryFingerprint extracts the kh= value from an entry's TXT record, or "".
+func entryFingerprint(entry *zeroconf.ServiceEntry) string {
+	for _, kv := range entry.Text {
+		if fp, ok := strings.CutPrefix(kv, "kh="); ok {
+			return fp
+		}
+	}
+	return ""
+}
+
+// rankAddrs returns the entry's addresses ordered for dialling: routable IPv4,
+// routable IPv6, link-local IPv4, link-local IPv6; loopback is excluded. A
+// multi-homed server advertises every interface it has — Docker bridges, VPN
+// tunnels, self-assigned 169.254/16 — and zeroconf does not filter them
+// (grandcat/zeroconf#43, fixed only by the unmerged PR #125), so any single
+// record may be unreachable. The ranking only orders the *attempts*; it
+// cannot recognise an unroutable *private* address (a bridge IP looks like a
+// LAN IP), so reachability is proven by the caller's real request.
+func rankAddrs(entry *zeroconf.ServiceEntry) []net.IP {
+	var ranked []net.IP
 	for _, linkLocal := range []bool{false, true} {
 		for _, addrs := range [][]net.IP{entry.AddrIPv4, entry.AddrIPv6} {
 			for _, ip := range addrs {
 				if ip.IsLoopback() || ip.IsLinkLocalUnicast() != linkLocal {
 					continue
 				}
-				return ip, nil
+				ranked = append(ranked, ip)
 			}
 		}
 	}
-	return nil, errors.New("mDNS entry has no address")
+	return ranked
 }
 
 // resolveServer implements the SPEC §5.1 resolution order: explicit
-// (--server flag) → SOFTKVM_SERVER env → cached address → mDNS browse. The
-// browse retries with exponential backoff capped at 60 s until ctx is
-// cancelled; the other sources are tried once each.
-func resolveServer(ctx context.Context, explicit string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
-	}
-	if addr := os.Getenv("SOFTKVM_SERVER"); addr != "" {
-		return addr, nil
-	}
-	if addr := loadCachedServer(); addr != "" {
-		return addr, nil
-	}
+// (--server flag) → SOFTKVM_SERVER env → cached address → mDNS browse. It
+// streams "host:port" candidates instead of resolving to one: the caller
+// tries each with the real TLS-verified request until one connects. Explicit
+// and env yield once; the cached address yields first, then resolution falls
+// through to mDNS so a stale entry is no longer terminal. The browse yields
+// every ranked address of every fingerprint-matching entry, re-browsing in 3 s
+// rounds with exponential backoff capped at 60 s, until ctx is cancelled.
+// wantFP filters mDNS entries by their kh= fingerprint; empty disables the
+// check.
+func resolveServer(ctx context.Context, explicit, wantFP string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if explicit != "" {
+			yield(explicit)
+			return
+		}
+		if addr := os.Getenv("SOFTKVM_SERVER"); addr != "" {
+			yield(addr)
+			return
+		}
+		if addr := loadCachedServer(); addr != "" {
+			if !yield(addr) {
+				return
+			}
+			// Fall through to mDNS: the cached address may be stale.
+		}
 
-	backoff := time.Second
-	for {
-		// 3 s per browse round (SPEC §5.1): re-browsing retransmits the query,
-		// which is what survives a dropped multicast on WiFi.
-		bctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		addr, err := browse(bctx)
-		cancel()
-		if err == nil {
-			return addr, nil
-		}
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		slog.Debug("browse failed, retrying", "error", err, "backoff", backoff)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-		if backoff < 60*time.Second {
-			backoff *= 2
-			if backoff > 60*time.Second {
-				backoff = 60 * time.Second
+		backoff := time.Second
+		for ctx.Err() == nil {
+			// 3 s per browse round (SPEC §5.1): re-browsing retransmits the
+			// query, which is what survives a dropped multicast on WiFi.
+			bctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			yielded, stopped := false, false
+			err := browseRound(bctx, wantFP, func(addr string) bool {
+				yielded = true
+				if !yield(addr) {
+					stopped = true
+					return false
+				}
+				return true
+			})
+			cancel()
+			if stopped || ctx.Err() != nil {
+				return
+			}
+			if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				slog.Debug("browse failed, retrying", "error", err, "backoff", backoff)
+			} else if !yielded {
+				slog.Debug("browse round found no server, retrying", "backoff", backoff)
+			}
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			if backoff < 60*time.Second {
+				backoff *= 2
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
 			}
 		}
 	}

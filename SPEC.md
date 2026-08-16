@@ -201,13 +201,21 @@ holds another host's address, so the bit moves between hosts by moving one flag.
 
 **Resolution order, every time a connection is needed:** `--server` →
 `SOFTKVM_SERVER` → cached address from the last successful connection → mDNS
-browse (3 s timeout, then retry with backoff to 60 s). The cache
-(`$XDG_STATE_HOME/soft-kvm/server`) is what makes a boot survive a flaky browse,
-and it is tried before mDNS because a working address beats a discovery round
-trip.
+browse (3 s rounds, retried with backoff to 60 s). Resolution streams candidate
+addresses rather than returning one: each source's candidates are tried in turn
+with the real TLS-verified request until one connects. The cache
+(`$XDG_STATE_HOME/soft-kvm/server`) is what makes a boot survive a flaky browse;
+it is tried first because a working address beats a discovery round trip, and a
+stale entry only costs one failed request — resolution falls through to mDNS
+afterwards. A browse round yields every ranked address of every matching entry
+as it arrives.
 
-**The TXT record carries the instance id and protocol version. Never the
-token.** It is broadcast to every device on the LAN, guests included.
+**The TXT record carries the instance id, the protocol version, and `kh=`, a
+truncated, domain-separated fingerprint of the token (§9). Never the token
+itself.** It is broadcast to every device on the LAN, guests included. A
+matching fingerprint proves nothing — a rogue can copy a broadcast value, and
+TLS still decides (§9). It exists so a client holding the wrong token can say so
+and skip the server instead of failing the TLS handshake against it.
 
 Sharp edges, in the order they will bite:
 
@@ -235,9 +243,10 @@ Sharp edges, in the order they will bite:
   - An entry whose first response carries no A/AAAA record is dropped (#124);
     the 3 s retry loop absorbs it.
   - A multi-homed server advertises every interface, junk included (#43; the
-    fix, PR #125, was never merged). The client ranks addresses — routable over
-    link-local — instead of trusting the first record, and §8's re-browse is the
-    backstop for an unroutable private address that ranking cannot recognise.
+    fix, PR #125, was never merged). Ranking — routable over link-local — only
+    orders the attempts; it cannot recognise an unroutable private address (a
+    bridge IP looks like a LAN IP). The client tries each advertised address
+    with the real TLS-verified request until one connects.
 
   `github.com/libp2p/zeroconf/v2` is the live fork — but barely (last release
   2022, kept alive for go-libp2p's own discovery), and not a drop-in: `Browse`
@@ -509,8 +518,12 @@ bit and nothing else.
   token rotates the identity for free.
 - The certificate is publicly derivable from the secret, so anyone who has seen
   a handshake can test candidate secrets **offline** against the observed
-  certificate. `SOFTKVM_TOKEN` must be a generated high-entropy string, never
-  something memorizable.
+  certificate. Neither derivation carries a salt — they cannot: client and
+  server derive the same material from the token alone, so any salt would have
+  to be broadcast, where the attacker sees it too. Entropy is the only defence,
+  and it is enforced at the edges: the binary refuses tokens under 16 characters
+  and warns under 32. `SOFTKVM_TOKEN` must be a generated high-entropy string,
+  never something memorizable.
 - Token blast radius: read/flip one display bit. Rotating = editing the env
   files and restarting the server and both agents — the token is read at process
   start, and handshakes fail until they agree (§8). The token never appears in
@@ -524,7 +537,11 @@ bit and nothing else.
   worth checking against the corp policy before it is discovered by someone
   else.
 - The service is advertised to the whole LAN. What leaks is "a soft-kvm server
-  exists here", never the token (§5.1).
+  exists here", never the token (§5.1). The `kh=` TXT value broadcasts only a
+  truncated fingerprint — 8 bytes of
+  `HKDF-SHA256(SOFTKVM_TOKEN, info="soft-kvm key fingerprint v1")`, hex — safe
+  because it is truncated, domain-separated from the TLS identity, and the token
+  is high-entropy.
 - The agent executes `SWITCH-CMD` as given. It is an argv slice, never a shell
   string — no `sh -c`, no interpolation of anything received from the server.
   The server can flip a bit; it can never choose what runs.

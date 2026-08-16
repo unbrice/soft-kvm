@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"math/big"
 	"time"
 )
@@ -21,6 +22,22 @@ import (
 // tlsServerName is the SAN every derived certificate carries. Clients pin it
 // as ServerName, so verification succeeds regardless of the dial address.
 const tlsServerName = "soft-kvm"
+
+// keyFingerprint derives the short identifier the mDNS TXT record broadcasts
+// as kh= (SPEC §5.1) so a client holding a different token can recognise the
+// mismatch before dialling. It is a filter, not authentication: a match proves
+// nothing (a rogue can copy a broadcast value), a mismatch proves "not ours".
+// The HKDF domain differs from the TLS identity's, so the broadcast value
+// reveals nothing about the certificate seed; truncation to 8 bytes plus the
+// token's high entropy (SPEC §9) make it safe to broadcast.
+func keyFingerprint(secret string) string {
+	// 8 bytes is far inside HKDF-SHA256's length limit, so this cannot fail.
+	fp, err := hkdf.Key(sha256.New, []byte(secret), nil, "soft-kvm key fingerprint v1", 8)
+	if err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(fp)
+}
 
 // tlsIdentity derives the Ed25519 key and self-signed CA certificate that
 // every instance sharing secret generates. The template is fixed and Ed25519

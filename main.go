@@ -26,7 +26,7 @@ import (
 // error and its defaults, so main only sets the exit code.
 var errUsage = errors.New("usage")
 
-// errToken marks the missing-SOFTKVM_TOKEN configuration error.
+// errToken marks the missing-or-weak-SOFTKVM_TOKEN configuration error.
 var errToken = errors.New("SOFTKVM_TOKEN is required")
 
 func main() {
@@ -77,12 +77,27 @@ SOFTKVM_SERVER overrides server discovery (SPEC §5).`)
 }
 
 // requireToken reads the shared secret from the environment — never a flag
-// (SPEC §5).
+// (SPEC §5). The TLS identity and the mDNS kh= fingerprint are both
+// deterministic, salt-free functions of the token, so a weak token is one
+// offline dictionary pass away from compromise (SPEC §9): refuse clearly
+// weak ones, warn on short ones.
+const (
+	tokenMinLen  = 16
+	tokenGoodLen = 32
+)
+
 func requireToken() (string, error) {
-	if token := os.Getenv("SOFTKVM_TOKEN"); token != "" {
-		return token, nil
+	token := os.Getenv("SOFTKVM_TOKEN")
+	if token == "" {
+		return "", errToken
 	}
-	return "", errToken
+	if len(token) < tokenMinLen {
+		return "", fmt.Errorf("%w: %d chars is too short, need %d+ (generate one, e.g. `openssl rand -hex 32`)", errToken, len(token), tokenMinLen)
+	}
+	if len(token) < tokenGoodLen {
+		slog.Warn("SOFTKVM_TOKEN is short; prefer a generated token of 32+ chars (SPEC §9)", "length", len(token))
+	}
+	return token, nil
 }
 
 func serveCmd(ctx context.Context) error {
@@ -131,7 +146,7 @@ func serveCmd(ctx context.Context) error {
 
 	srv := NewServer(*statePath, token)
 	if !*noAdvertise {
-		stopAdv, err := advertise(*instance, port)
+		stopAdv, err := advertise(*instance, port, keyFingerprint(token))
 		if err != nil {
 			// e.g. Avahi owning UDP 5353 despite SO_REUSEPORT (SPEC §6.4).
 			slog.Warn("mDNS advertisement failed, continuing without it", "error", err)
@@ -164,26 +179,41 @@ func activateCmd(ctx context.Context) error {
 		return errUsage
 	}
 
-	base, err := resolveServer(ctx, *serverFlag)
-	if err != nil {
-		return err
-	}
-
 	client, err := NewClient(token)
 	if err != nil {
 		return err
 	}
-	changed, err := client.Claim(ctx, base, id, *force)
-	if err != nil {
-		if errors.Is(err, ErrNoLiveAgent) && !*force {
-			return fmt.Errorf("no live agent for %q; re-run with --force to claim anyway", id)
+
+	// Try each candidate until one answers: a stale cache entry or an
+	// unroutable advertised address should not end the attempt (SPEC §5.1).
+	var base string
+	var changed bool
+	var lastErr error
+	for candidate := range resolveServer(ctx, *serverFlag, keyFingerprint(token)) {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ch, err := client.Claim(cctx, candidate, id, *force)
+		cancel()
+		if err != nil {
+			if errors.Is(err, ErrNoLiveAgent) && !*force {
+				return fmt.Errorf("no live agent for %q; re-run with --force to claim anyway", id)
+			}
+			if errors.Is(err, ErrUnauthorized) {
+				return errors.New("token rejected")
+			}
+			slog.Debug("activate: candidate failed", "base", candidate, "error", err)
+			lastErr = err
+			continue
 		}
-		if errors.Is(err, ErrUnauthorized) {
-			return errors.New("token rejected")
-		}
-		return err
+		base, changed = candidate, ch
+		saveCachedServer(base) // the connection worked — cache the address (SPEC §5.1)
+		break
 	}
-	saveCachedServer(base) // the connection worked — cache the address (SPEC §5.1)
+	if base == "" {
+		if lastErr != nil {
+			return lastErr
+		}
+		return ctx.Err()
+	}
 
 	state, err := client.State(ctx, base)
 	if err != nil {
@@ -267,6 +297,7 @@ func connectCmd(ctx context.Context) error {
 	cfg := agentConfig{
 		id:             *id,
 		explicitServer: *serverFlag,
+		keyFP:          keyFingerprint(token),
 		detector:       detector,
 		guard:          guard,
 		client:         client,
