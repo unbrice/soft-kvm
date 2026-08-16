@@ -2,10 +2,10 @@ default:
     @just --list
 
 build:
-    CGO_ENABLED=0 go build -o bin/soft-kvm .
+    CGO_ENABLED=0 go build -o soft-kvm .
 
 release:
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/soft-kvm .
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o soft-kvm .
 
 test: test-unit
 
@@ -51,4 +51,4 @@ sync:
     jj rebase -d 'trunk()' --skip-emptied
 
 clean:
-    rm -rf bin/
+    rm -f soft-kvm

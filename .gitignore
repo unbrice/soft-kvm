@@ -4,7 +4,6 @@ scratch-*
 
 # Binaries & build artifacts
 soft-kvm
-/bin/
 /dist/
 /target/
 

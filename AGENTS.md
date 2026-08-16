@@ -40,7 +40,7 @@ ddcutil. The `go 1.24` in `go.mod` is the language floor, not the toolchain.
 | `just lint`                   | `golangci-lint run ./...`, `reuse lint` |
 | `just fmt`                    | `go fmt ./...`, `dprint fmt`            |
 | `just fmt-check`              | `gofmt -l`, `dprint check`              |
-| `just build` / `just release` | `CGO_ENABLED=0 go build` into `bin/`    |
+| `just build` / `just release` | `CGO_ENABLED=0 go build`                |
 
 Three of those surprise people:
 
