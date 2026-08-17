@@ -168,12 +168,19 @@ manual OSD press, not a loop.
 **Confirming it landed, and what happens when it does not.** The write is
 fire-and-forget (finding 10), so the loser confirms locally, using the probe it
 already has: a switch that worked makes `--check-cmd` start *failing*, because
-this host's input is no longer active. The falling edge is the receipt.
+this host's input is no longer active. The falling edge is the receipt. The
+switch command is bounded twice: glue-side by `--switch-timeout` (default 30 s,
+SIGTERM then SIGKILL after `WaitDelay`), and machine-side by a 60 s watchdog.
+Either failure feeds the same retry/notify path and counts toward the circuit
+breaker like any other failure. Results are accepted only while their effect is
+outstanding — a late `SwitchExit` or `ProbeExit` is ignored and logged — and a
+confirm window with a probe still in flight waits for it instead of closing on
+absent evidence.
 
 1. Run the switch command.
 2. Poll `--check-cmd` every 500 ms for `--confirm 4s`. It goes non-zero ⇒ done.
-3. Still succeeding ⇒ the monitor did not move. Retry the switch, up to
-   `--switch-retries 3`, 1 s apart.
+3. Still succeeding, or the command died or never reported ⇒ the monitor did not
+   move. Retry the switch, up to `--switch-retries 3`, 1 s apart.
 4. Still succeeding after the last retry ⇒ run `--notify-cmd` and stop. The user
    presses the OSD Input button, which is one press and always available (§2),
    and §13 makes the keyboard follow that press.
@@ -295,6 +302,7 @@ no required arguments.
 | `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `betterdisplaycli set -productNameLike=LG -feature=ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent                                                                             |
 | `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | `betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect`                           | Veto before the switch, receipt after it (§4.3)                                                                                                              |
 | `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3)                                                                      |
+| `--switch-timeout 30s`  | 30s                                                          | 30s                                                                                                | Bound on one `SWITCH-CMD` run — a hung I²C write must not freeze the agent (§4.3)                                                                            |
 | `--trigger LIST`        | required                                                     | required                                                                                           | Comma-separated VID:PID filters for the trigger detector — the USB receiver, plus optionally a Bluetooth keyboard (§6.3); `soft-kvm detect` lists candidates |
 | `--settle 2s`           | 2s                                                           | 2s                                                                                                 | Attach must persist this long before claiming                                                                                                                |
 | `--confirm 4s`          | 4s                                                           | 4s                                                                                                 | How long `--check-cmd` may keep succeeding before the switch counts as failed                                                                                |
@@ -324,10 +332,11 @@ so a verifying write reports failure after succeeding.
    reconcile as in (1). A connection error is a reconcile trigger, not a fatal.
 4. Guards re-evaluated every cycle; off-guard ⇒ fully dormant, zero traffic,
    re-checking the guards every 15 s (macOS).
-5. **Sleep detection:** compare `time.Now()` drift against a monotonic deadline
-   each cycle. A wall-clock jump greater than 2× the poll interval means the
-   machine slept: reconcile immediately rather than waiting out the dead
-   long-poll socket, which can hang for minutes after a lid-open.
+5. **Sleep detection:** after each `/wait` long-poll, compare wall-clock
+   progress against monotonic elapsed time. A wall-clock jump greater than twice
+   the client's internal `/wait` timeout means the machine slept through the
+   poll: reconcile immediately rather than waiting out the dead socket, which
+   can hang for minutes after a lid-open.
 
 ## 6. Host components
 
@@ -489,6 +498,8 @@ bit and nothing else.
 | Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                            |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable |
 | Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                               |
+| Switch command hangs / `SwitchExit` is lost                       | `--switch-timeout` SIGTERMs the child; if the result still never arrives, the 60 s machine watchdog counts the attempt as failed, retries, then notifies and logs "no SwitchExit within …" (§4.3)                                                                                                                                                          |
+| Effect result arrives after its sequence ended                    | Ignored and logged as "ignoring late SwitchExit/ProbeExit"; the machine only accepts results while the matching effect is outstanding (§4.3)                                                                                                                                                                                                               |
 | Switch fails while the monitor is in standby                      | Same path, and the retries usually cover it — a monitor waking from standby answers DDC a second or two late                                                                                                                                                                                                                                               |
 | Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the losing host: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                                                  |
 | mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                                          |
@@ -594,11 +605,13 @@ off. Stdlib `flag` stops at the first non-flag argument and hands the rest to
 `Args()` — which *is* the `-- SWITCH-CMD ARGS...` convention, for free.
 
 **One package.** Everything in `main`, one file per concern: `main.go`
-(dispatch, flag sets), `machine.go` + `machine_test.go` (§11.3), `agent.go` (the
-loop that feeds it), `server.go`, `state.go` (atomic JSON), `discover.go` (mDNS
-advertise, browse, address cache), `run.go` (the argv runner and the per-OS
-defaults), `detect_hid.go` (the agent's attach detector), `detect.go` (the
-`detect` subcommand: enumeration and `--trigger` suggestions),
+(dispatch, flag sets), `machine.go` + `machine_test.go` (§11.3), `agent.go`
+(supervisor, generations, decision loop, claims; the `Detector` and `Guard`
+interfaces), `watcher.go` (resolve, backoff, and one-session `/wait` poll),
+`actions.go` (the action worker), `server.go`, `state.go` (atomic JSON),
+`discover.go` (mDNS advertise, browse, address cache), `run.go` (the argv runner
+and the per-OS defaults), `detect_hid.go` (the agent's attach detector),
+`detect.go` (the `detect` subcommand: enumeration and `--trigger` suggestions),
 `guard_darwin.go`. Build tags in filenames, not in `//go:build` lines, wherever
 the split is per-OS. Around 2000 lines total does not need `internal/`.
 
@@ -627,13 +640,15 @@ struct field. Three blocking things do not respect it by default:
   request context is a child of the process context: one cancel returns every
   waiter immediately, and `Shutdown` then completes in milliseconds.
 
-Supervision is `errgroup` (`golang.org/x/sync`): one group per worker generation
-— the detector and watcher loops, cancelled together and waited before the next
-generation starts — plus a second group with `SetLimit(1)` holding claims, so a
-redundant claim trigger coalesces instead of overlapping an in-flight retry. The
-loops never return an error (they retry with backoff and exit on cancel), so
-first-error cancellation never fires; the group is used as a `WaitGroup` with
-`Go`.
+Supervision is `errgroup` (`golang.org/x/sync`): one group per guards-up
+generation — the detector, watcher, guard watcher, and decision loop — whose
+first error, the `errGuardsDown` sentinel or `ctx.Err()`, cancels the rest, so a
+guard flap tears down and rebuilds the generation. Two more groups are
+run-level, cancelled only by process shutdown: the action worker (so a switch
+that started guards-up finishes guards-up — a guard flap must not SIGTERM a
+switch mid-I2C) and a `SetLimit(1)` group holding claims, so a redundant claim
+trigger coalesces instead of overlapping an in-flight retry. The guard poll no
+longer blocks the decision loop.
 
 ### 11.2 What is an interface, and what is not
 
@@ -687,16 +702,22 @@ type Action struct {
     Switch    bool          // run SWITCH-CMD
     Probe     bool          // run --check-cmd
     Notify    bool          // run --notify-cmd
-    WakeAt    time.Time     // when to deliver the next timer event
+    WakeAt    time.Time     // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it
+    SaveOwner *string       // non-nil: persist this as last_owner
+    Log       string        // non-empty: glue logs at Info
 }
 
 func (m *Machine) Step(e Event) []Action
 ```
 
-`agent.go` is then dumb glue: read from the detector channel, the long-poll, and
-a timer; call `Step`; execute whatever comes back; feed the results in as the
-next events. It contains no policy, so a bug in it looks like "nothing
-happened", not "it switched to a host that is not there".
+`agent.go` is the supervisor: it waits for guards up, runs one generation, and
+recycles on `errGuardsDown`. The decision loop stamps `Now` at processing time
+for every event, dispatches the `Action`s to a run-level worker in `actions.go`,
+and posts results back as ordinary events. Effects are no longer executed
+inline: one action worker runs Switch/Probe/Notify one at a time and posts
+`SwitchExit`/`ProbeExit` to the loop. Channels are scoped by freshness —
+`attachCh` and `stateCh` are created per generation, while `results` and the
+action worker are run-level. It contains no policy.
 
 ### 11.4 Tests
 

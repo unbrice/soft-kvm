@@ -100,12 +100,16 @@ func (c *Client) State(ctx context.Context, base string) (*ServerState, error) {
 	return &state, nil
 }
 
+// waitClientTimeout is the internal timeout for GET /wait. It must be larger
+// than the server's long-poll timeout so the server fires first.
+const waitClientTimeout = 60 * time.Second
+
 // Wait GETs /wait?epoch=N&id=me. It returns woke=true on a 200 wake and
 // woke=false on a 204 timeout. The caller supplies ctx; the internal timeout is
-// 60 s to match the long-poll (the server times out at 50 s).
+// waitClientTimeout so the server fires first.
 func (c *Client) Wait(ctx context.Context, base string, epoch int64, id string) (bool, error) {
 	u := fmt.Sprintf("https://%s/wait?epoch=%d&id=%s", base, epoch, url.QueryEscape(id))
-	status, body, err := c.request(ctx, http.MethodGet, u, 60*time.Second)
+	status, body, err := c.request(ctx, http.MethodGet, u, waitClientTimeout)
 	if err != nil {
 		return false, err
 	}

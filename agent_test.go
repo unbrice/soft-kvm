@@ -139,6 +139,9 @@ func agentTestConfig(t *testing.T, base, statePath string, s *Server, det Detect
 		checkArgv:      []string{"check", "cmd"},
 		notifyArgv:     []string{"notify", "cmd"},
 		checkTimeout:   1 * time.Second,
+		switchTimeout:  1 * time.Second,
+		guardPoll:      20 * time.Millisecond,
+		backoffBase:    10 * time.Millisecond,
 	}
 }
 
@@ -358,10 +361,11 @@ func TestAgentGuardsDown(t *testing.T) {
 	ag := &agent{cfg: cfg}
 	runAgent(ctx, t, ag)
 
-	// Give the agent time to start and (not) react.
-	time.Sleep(200 * time.Millisecond)
+	// This asserts an absence (no decisions while dormant); it cannot be
+	// event-driven. Sleep a small multiple of the injected guard poll.
+	time.Sleep(5 * cfg.guardPoll)
 	det.attach()
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(5 * cfg.guardPoll)
 
 	if det.runCalled.Load() {
 		t.Error("detector started while guards were down")
@@ -375,21 +379,150 @@ func TestAgentGuardsDown(t *testing.T) {
 	}
 }
 
+func TestAgentSwitchTimeout(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+
+	// Seed the server so the agent starts with last_owner == me.
+	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	if err := saveJSON(statePath, agentState{LastOwner: "linux"}); err != nil {
+		t.Fatalf("save agent state: %v", err)
+	}
+
+	// Make "other" appear live so the agent will try to switch to it.
+	s.mu.Lock()
+	s.waiters["other"] = 1
+	s.mu.Unlock()
+
+	det := newFakeDetector()
+	runner := newHungSwitchRunner()
+	guard := &fakeGuard{ok: true}
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.switchTimeout = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ag := &agent{cfg: cfg}
+	runAgent(ctx, t, ag)
+
+	waitForLive(t, s, "linux")
+
+	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+		t.Fatalf("force claim other: %v", err)
+	}
+
+	// Wait for the first switch to be attempted.
+	select {
+	case <-runner.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("switch runner not called")
+	}
+
+	// The agent must stay responsive: the timeout produces a SwitchExit and the
+	// machine retries (SwitchRetries=1), so a second switch call arrives.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n := runner.SwitchCalls()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 2 switch calls, got %d", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !runner.firstCtxCanceled() {
+		t.Error("first switch context was not canceled by timeout")
+	}
+}
+
+func TestTimingOrdering(t *testing.T) {
+	if defaultWaitTimeout >= waitClientTimeout || waitClientTimeout >= waitTimeout {
+		t.Fatalf("wait timeouts out of order: server=%v client=%v agent=%v",
+			defaultWaitTimeout, waitClientTimeout, waitTimeout)
+	}
+	if defaultSwitchTimeout >= switchDeadline {
+		t.Fatalf("switch timeout %v must be below switch deadline %v",
+			defaultSwitchTimeout, switchDeadline)
+	}
+}
+
 func TestBackoff(t *testing.T) {
 	b := newBackoff()
 	for i := 0; i < 100; i++ {
-		if d := b.next(); d < 0 || d > 30*time.Second {
-			t.Fatalf("next() = %v, out of [0, 30s]", d)
+		if d := b.next(); d < 0 || d > backoffCap {
+			t.Fatalf("next() = %v, out of [0, %v]", d, backoffCap)
 		}
 	}
-	if b.cur != 30*time.Second {
-		t.Fatalf("cur = %v, want the 30s cap", b.cur)
+	if b.cur != backoffCap {
+		t.Fatalf("cur = %v, want the %v cap", b.cur, backoffCap)
 	}
 	b.reset()
-	if b.cur != time.Second {
-		t.Fatalf("after reset cur = %v, want 1s", b.cur)
+	if b.cur != backoffBase {
+		t.Fatalf("after reset cur = %v, want %v", b.cur, backoffBase)
 	}
-	if d := b.next(); d > time.Second {
-		t.Fatalf("next() after reset = %v, want <= 1s", d)
+	if d := b.next(); d > backoffBase {
+		t.Fatalf("next() after reset = %v, want <= %v", d, backoffBase)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := b.wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait on cancelled ctx = %v, want context.Canceled", err)
+	}
+}
+
+// hungSwitchRunner blocks on switch commands until their context is canceled,
+// recording whether the first such context was canceled.
+type hungSwitchRunner struct {
+	mu                sync.Mutex
+	called            chan struct{}
+	switchCalls       int
+	firstCtxCanceled_ bool
+}
+
+func newHungSwitchRunner() *hungSwitchRunner {
+	return &hungSwitchRunner{called: make(chan struct{})}
+}
+
+func (r *hungSwitchRunner) run(ctx context.Context, argv []string) error {
+	if len(argv) == 0 || argv[0] != "switch" {
+		return nil
+	}
+
+	r.mu.Lock()
+	r.switchCalls++
+	calls := r.switchCalls
+	r.mu.Unlock()
+	if calls == 1 {
+		close(r.called)
+	}
+
+	<-ctx.Done()
+
+	r.mu.Lock()
+	if calls == 1 {
+		r.firstCtxCanceled_ = true
+	}
+	r.mu.Unlock()
+	return ctx.Err()
+}
+
+func (r *hungSwitchRunner) SwitchCalls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.switchCalls
+}
+
+func (r *hungSwitchRunner) firstCtxCanceled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.firstCtxCanceled_
 }

@@ -85,15 +85,15 @@ func (d *hidDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 	// present interface paths so one physical attach yields exactly one edge.
 	present := map[string]bool{}
 
-	emit := func(info *hid.DeviceInfo) bool {
+	// Non-blocking and coalescing: an edge already queued makes this one
+	// redundant — attach edges are idempotent triggers (agent.go invariant 3).
+	emit := func(info *hid.DeviceInfo) {
+		slog.Info("hid target attached",
+			"vid", fmt.Sprintf("%04x", info.VendorID),
+			"pid", fmt.Sprintf("%04x", info.ProductID))
 		select {
 		case attach <- struct{}{}:
-			slog.Info("hid target attached",
-				"vid", fmt.Sprintf("%04x", info.VendorID),
-				"pid", fmt.Sprintf("%04x", info.ProductID))
-			return true
-		case <-ctx.Done():
-			return false
+		default:
 		}
 	}
 
@@ -107,8 +107,8 @@ func (d *hidDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 			}
 		}
 	}
-	if first != nil && !emit(first) {
-		return nil
+	if first != nil {
+		emit(first)
 	}
 
 	for {
@@ -126,8 +126,8 @@ func (d *hidDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 			case hid.DeviceEventConnected:
 				if d.matches(ev.DeviceInfo) {
 					present[ev.DeviceInfo.Path] = true
-					if len(present) == 1 && !emit(ev.DeviceInfo) {
-						return nil
+					if len(present) == 1 {
+						emit(ev.DeviceInfo)
 					}
 				}
 			case hid.DeviceEventDisconnected:

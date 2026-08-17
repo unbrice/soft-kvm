@@ -120,14 +120,17 @@ func TestMachine(t *testing.T) {
 		}
 
 		acts = m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
-		requireActionCount(t, acts, 1)
-		if !acts[0].Switch {
-			t.Fatalf("wanted switch, got %+v", acts[0])
-		}
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "attempt 1"},
+			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+		})
 
 		confirmUntil := t0.Add(1 * time.Second).Add(cfg.Confirm)
 		acts = m.Step(Event{Now: t0.Add(1 * time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{Probe: true, WakeAt: confirmUntil, Log: "switch"}})
+		checkActions(t, acts, []Action{
+			{Probe: true, Log: "switch"},
+			{WakeAt: confirmUntil},
+		})
 
 		// A successful probe inside the window does not re-probe immediately:
 		// it schedules the next poll one probeInterval out.
@@ -136,7 +139,10 @@ func TestMachine(t *testing.T) {
 
 		// The probe timer fires the next --check-cmd run.
 		acts = m.Step(Event{Now: t0.Add(2500 * time.Millisecond)})
-		checkActions(t, acts, []Action{{Probe: true, WakeAt: confirmUntil}})
+		checkActions(t, acts, []Action{
+			{Probe: true},
+			{WakeAt: confirmUntil},
+		})
 
 		end := t0.Add(3 * time.Second)
 		acts = m.Step(Event{Now: end, ProbeExit: exit(errInactive)})
@@ -198,18 +204,18 @@ func TestMachine(t *testing.T) {
 
 		// Confirm window elapses; retry immediately because retry spacing has passed.
 		acts := m.Step(Event{Now: t0.Add(6 * time.Second), ProbeExit: exit(nil)})
-		requireActionCount(t, acts, 1)
-		if !acts[0].Switch {
-			t.Fatalf("wanted retry switch, got %+v", acts[0])
-		}
-		if !strings.Contains(acts[0].Log, "attempt 2") {
-			t.Fatalf("expected attempt 2 log, got %q", acts[0].Log)
-		}
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "attempt 2"},
+			{WakeAt: t0.Add(6*time.Second + switchDeadline)},
+		})
 
 		// Second attempt lands.
 		confirmUntil := t0.Add(7 * time.Second).Add(cfg.Confirm)
 		acts = m.Step(Event{Now: t0.Add(7 * time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{Probe: true, WakeAt: confirmUntil}})
+		checkActions(t, acts, []Action{
+			{Probe: true},
+			{WakeAt: confirmUntil},
+		})
 
 		acts = m.Step(Event{Now: t0.Add(8 * time.Second), ProbeExit: exit(errInactive)})
 		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "confirmed"}})
@@ -267,7 +273,10 @@ func TestMachine(t *testing.T) {
 		// A new transition inside the cooldown is deferred.
 		cooldownEnd := t0.Add(3 * time.Second).Add(cfg.Cooldown)
 		acts := m.Step(Event{Now: t0.Add(4 * time.Second), State: mkstate("win2", 3, map[string]bool{"win2": true})})
-		checkActions(t, acts, []Action{{WakeAt: cooldownEnd, Log: "deferring"}})
+		checkActions(t, acts, []Action{
+			{Log: "deferring"},
+			{WakeAt: cooldownEnd},
+		})
 
 		// After the cooldown, the bare timer re-runs the reconcile and probes.
 		acts = m.Step(Event{Now: cooldownEnd})
@@ -304,7 +313,10 @@ func TestMachine(t *testing.T) {
 		// The breaker opened at the last success, which was one cooldown ago.
 		breakerEnd := base.Add(-cfg.Cooldown).Add(cfg.BreakerOpenFor)
 		acts := m.Step(Event{Now: base, State: mkstate(owners[3], 3, map[string]bool{owners[3]: true})})
-		checkActions(t, acts, []Action{{WakeAt: breakerEnd, Log: "breaker"}})
+		checkActions(t, acts, []Action{
+			{Log: "breaker"},
+			{WakeAt: breakerEnd},
+		})
 
 		// Once the breaker closes, the deferred reconcile proceeds.
 		acts = m.Step(Event{Now: breakerEnd})
@@ -348,15 +360,15 @@ func TestMachine(t *testing.T) {
 
 		// A state arrives mid-settle and starts a reconcile; the veto fails.
 		acts := m.Step(Event{Now: t0.Add(1 * time.Second), State: mkstate("mac", 1, map[string]bool{"mac": true})})
-		requireActionCount(t, acts, 1)
-		if !acts[0].Probe {
-			t.Fatalf("wanted probe, got %+v", acts[0])
-		}
+		checkActions(t, acts, []Action{
+			{Probe: true, Log: "probing"},
+			{WakeAt: t0.Add(cfg.Settle)},
+		})
 		acts = m.Step(Event{Now: t0.Add(1500 * time.Millisecond), ProbeExit: exit(errInactive)})
-		requireActionCount(t, acts, 1)
-		if acts[0].SaveOwner == nil || *acts[0].SaveOwner != "mac" {
-			t.Fatalf("expected veto resync to mac, got %+v", acts[0])
-		}
+		checkActions(t, acts, []Action{
+			{SaveOwner: ptr("mac"), Log: "veto"},
+			{WakeAt: t0.Add(cfg.Settle)},
+		})
 
 		// The interrupted settle still fires the claim (SPEC §5.4: attach→claim
 		// is an independent trigger).
@@ -383,10 +395,10 @@ func TestMachine(t *testing.T) {
 		// Confirm succeeds; pending attach should start settle.
 		end := t0.Add(3500 * time.Millisecond)
 		acts = m.Step(Event{Now: end, ProbeExit: exit(errInactive)})
-		requireActionCount(t, acts, 1)
-		if acts[0].SaveOwner == nil || *acts[0].SaveOwner != "mac" {
-			t.Fatalf("expected save owner mac, got %+v", acts[0])
-		}
+		checkActions(t, acts, []Action{
+			{SaveOwner: ptr("mac"), Log: "confirmed"},
+			{WakeAt: end.Add(cfg.Settle)},
+		})
 
 		acts = m.Step(Event{Now: end.Add(cfg.Settle)})
 		checkActions(t, acts, []Action{{Claim: "linux"}})
@@ -431,6 +443,204 @@ func TestMachine(t *testing.T) {
 			t.Fatalf("expected probe for lower-epoch win2, got %+v", acts[0])
 		}
 	})
+
+	t.Run("switch watchdog fires and retries", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+
+		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		acts := m.Step(Event{Now: watchdogTime})
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "no SwitchExit within 1m0s (lost event or hung child)"},
+			{WakeAt: watchdogTime.Add(switchDeadline)},
+		})
+		if !strings.Contains(acts[0].Log, "attempt 1") {
+			t.Fatalf("expected attempt 1 in log, got %q", acts[0].Log)
+		}
+		if !strings.Contains(acts[0].Log, "retry switch to \"mac\" attempt 2") {
+			t.Fatalf("expected retry attempt 2 log, got %q", acts[0].Log)
+		}
+	})
+
+	t.Run("switch watchdog waits for retry spacing", func(t *testing.T) {
+		cfg := testConfig("linux")
+		cfg.RetrySpacing = 70 * time.Second
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+
+		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		acts := m.Step(Event{Now: watchdogTime})
+		requireActionCount(t, acts, 2)
+		if acts[0].Switch {
+			t.Fatalf("expected no switch while waiting retry spacing, got %+v", acts[0])
+		}
+		if !strings.Contains(acts[0].Log, "no SwitchExit within 1m0s (lost event or hung child)") {
+			t.Fatalf("expected watchdog log, got %q", acts[0].Log)
+		}
+		if !acts[1].WakeAt.Equal(t0.Add(1 * time.Second).Add(cfg.RetrySpacing)) {
+			t.Fatalf("expected wake at retry spacing, got %v", acts[1].WakeAt)
+		}
+	})
+
+	t.Run("watchdog exhausts retries and trips breaker", func(t *testing.T) {
+		cfg := testConfig("linux")
+		cfg.SwitchRetries = 0
+		// Watchdog failures are spaced by switchDeadline, so widen the breaker
+		// window enough to keep all three failures in the count.
+		cfg.BreakerWindow = 300 * time.Second
+		m := NewMachine(cfg, "linux", true)
+
+		owners := []string{"mac", "win2", "win3", "win4"}
+		base := t0
+		var lastFail time.Time
+		for i := 0; i < 3; i++ {
+			m.Step(Event{Now: base, State: mkstate(owners[i], int64(i), map[string]bool{owners[i]: true})})
+			switchAt := base.Add(1 * time.Second)
+			m.Step(Event{Now: switchAt, ProbeExit: exit(nil)})
+
+			lastFail = switchAt.Add(switchDeadline)
+			acts := m.Step(Event{Now: lastFail})
+			checkActions(t, acts, []Action{{Notify: true, SaveOwner: ptr(owners[i]), Log: "failed"}})
+			if !strings.Contains(acts[0].Log, "no SwitchExit within 1m0s (lost event or hung child)") {
+				t.Fatalf("attempt %d: expected watchdog log, got %q", i+1, acts[0].Log)
+			}
+
+			// Resync back to linux so the next transition is away from us.
+			m.Step(Event{Now: lastFail.Add(1 * time.Second), State: mkstate("linux", int64(i)+10, map[string]bool{"linux": true})})
+			base = lastFail.Add(1*time.Second + cfg.Cooldown + 1*time.Second)
+		}
+
+		// Resync once more after the third failure.
+		m.Step(Event{Now: base, State: mkstate("linux", 20, map[string]bool{"linux": true})})
+
+		// The fourth transition is refused while the breaker is open.
+		breakerEnd := lastFail.Add(cfg.BreakerOpenFor)
+		acts := m.Step(Event{Now: base, State: mkstate(owners[3], 3, map[string]bool{owners[3]: true})})
+		checkActions(t, acts, []Action{
+			{Log: "breaker"},
+			{WakeAt: breakerEnd},
+		})
+	})
+
+	t.Run("late SwitchExit ignored", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+		m.Step(Event{Now: t0.Add(2 * time.Second), SwitchExit: exit(nil)})
+
+		acts := m.Step(Event{Now: t0.Add(3 * time.Second), SwitchExit: exit(nil)})
+		confirmUntil := t0.Add(2 * time.Second).Add(cfg.Confirm)
+		checkActions(t, acts, []Action{
+			{Log: "ignoring late SwitchExit"},
+			{WakeAt: confirmUntil},
+		})
+		if acts[0].Switch || acts[0].Probe || acts[0].Notify || acts[0].SaveOwner != nil {
+			t.Fatalf("expected only log action, got %+v", acts[0])
+		}
+	})
+
+	t.Run("late ProbeExit ignored", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+
+		acts := m.Step(Event{Now: t0.Add(2 * time.Second), ProbeExit: exit(nil)})
+		checkActions(t, acts, []Action{
+			{Log: "ignoring late ProbeExit"},
+			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+		})
+		if acts[0].Switch || acts[0].Probe || acts[0].Notify || acts[0].SaveOwner != nil {
+			t.Fatalf("expected only log action, got %+v", acts[0])
+		}
+	})
+
+	t.Run("confirm deadline defers while probe outstanding", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+		m.Step(Event{Now: t0.Add(2 * time.Second), SwitchExit: exit(nil)})
+
+		confirmDeadline := t0.Add(2 * time.Second).Add(cfg.Confirm)
+		acts := m.Step(Event{Now: confirmDeadline})
+		requireActionCount(t, acts, 0)
+
+		acts = m.Step(Event{Now: confirmDeadline, ProbeExit: exit(nil)})
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "confirm elapsed; retry switch to \"mac\" attempt 2"},
+			{WakeAt: confirmDeadline.Add(switchDeadline)},
+		})
+	})
+
+	t.Run("state event during switching is stashed", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+
+		acts := m.Step(Event{Now: t0.Add(2 * time.Second), State: mkstate("win2", 2, map[string]bool{"win2": true})})
+		checkActions(t, acts, []Action{
+			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+		})
+		if m.latestState == nil || m.latestState.Owner != "win2" {
+			t.Fatalf("expected latestState stashed to win2, got %+v", m.latestState)
+		}
+	})
+
+	t.Run("WakeAt is a standalone tail action", func(t *testing.T) {
+		cfg := testConfig("linux")
+		m := NewMachine(cfg, "linux", true)
+
+		// Reconcile emits a probe but no WakeAt: there is no pending deadline yet.
+		acts := m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
+		requireActionCount(t, acts, 1)
+		if !acts[0].Probe {
+			t.Fatalf("expected probe, got %+v", acts[0])
+		}
+		for _, a := range acts {
+			if !a.WakeAt.IsZero() {
+				t.Fatalf("expected no WakeAt in reconcile batch, got %+v", a)
+			}
+		}
+
+		// The probe result triggers a switch; the batch ends with a WakeAt-only action.
+		acts = m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
+		requireActionCount(t, acts, 2)
+		if !acts[0].Switch {
+			t.Fatalf("expected switch, got %+v", acts[0])
+		}
+		wake := acts[1]
+		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(t0.Add(1*time.Second+switchDeadline)) {
+			t.Fatalf("expected wake at switch deadline, got %+v", wake)
+		}
+		if wake.Claim != "" || wake.Switch || wake.Probe || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
+			t.Fatalf("expected WakeAt-only action, got %+v", wake)
+		}
+
+		// A bare timer at the switch deadline fires the watchdog; the batch again
+		// ends with a standalone WakeAt.
+		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		acts = m.Step(Event{Now: watchdogTime})
+		requireActionCount(t, acts, 2)
+		wake = acts[1]
+		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(watchdogTime.Add(switchDeadline)) {
+			t.Fatalf("expected wake at next switch deadline, got %+v", wake)
+		}
+		if wake.Claim != "" || wake.Switch || wake.Probe || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
+			t.Fatalf("expected WakeAt-only action, got %+v", wake)
+		}
+	})
 }
 
 func TestMachineDeadlineOrder(t *testing.T) {
@@ -458,10 +668,10 @@ func TestMachineDeadlineOrder(t *testing.T) {
 	// only then does the queued attach start settle.
 	end := t0.Add(2 * time.Second).Add(cfg.Confirm)
 	acts = m.Step(Event{Now: end, ProbeExit: exit(errInactive)})
-	requireActionCount(t, acts, 1)
-	if acts[0].SaveOwner == nil || *acts[0].SaveOwner != "mac" {
-		t.Fatalf("expected save owner mac, got %+v", acts[0])
-	}
+	checkActions(t, acts, []Action{
+		{SaveOwner: ptr("mac"), Log: "confirmed"},
+		{WakeAt: end.Add(cfg.Settle)},
+	})
 
 	// The next timer at end+Settle should emit the claim.
 	acts = m.Step(Event{Now: end.Add(cfg.Settle)})
@@ -481,13 +691,10 @@ func TestMachineSequenceEndLastOwner(t *testing.T) {
 	afterEnd := func(t *testing.T, m *Machine, cfg MachineConfig, end time.Time) {
 		t.Helper()
 		acts := m.Step(Event{Now: end.Add(500 * time.Millisecond), State: mkstate("mac", 9, map[string]bool{"mac": true})})
-		requireActionCount(t, acts, 1)
-		if acts[0].Probe {
-			t.Fatalf("state for confirmed owner re-reconciled: %+v", acts[0])
-		}
-		if !strings.Contains(acts[0].Log, "not me") {
-			t.Fatalf("expected last_owner gate log, got %q", acts[0].Log)
-		}
+		checkActions(t, acts, []Action{
+			{Log: "not me"},
+			{WakeAt: end.Add(cfg.Settle)},
+		})
 		acts = m.Step(Event{Now: end.Add(cfg.Settle)})
 		checkActions(t, acts, []Action{{Claim: "linux"}})
 	}
@@ -503,7 +710,10 @@ func TestMachineSequenceEndLastOwner(t *testing.T) {
 
 		end := t0.Add(4 * time.Second)
 		acts := m.Step(Event{Now: end, ProbeExit: exit(errInactive)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "confirmed"}})
+		checkActions(t, acts, []Action{
+			{SaveOwner: ptr("mac"), Log: "confirmed"},
+			{WakeAt: end.Add(cfg.Settle)},
+		})
 		afterEnd(t, m, cfg, end)
 	})
 
@@ -520,7 +730,10 @@ func TestMachineSequenceEndLastOwner(t *testing.T) {
 		// Confirm window closes with all probes succeeding: no retries left.
 		end := t0.Add(2 * time.Second).Add(cfg.Confirm)
 		acts := m.Step(Event{Now: end, ProbeExit: exit(nil)})
-		checkActions(t, acts, []Action{{Notify: true, SaveOwner: ptr("mac"), Log: "failed"}})
+		checkActions(t, acts, []Action{
+			{Notify: true, SaveOwner: ptr("mac"), Log: "failed"},
+			{WakeAt: end.Add(cfg.Settle)},
+		})
 		afterEnd(t, m, cfg, end)
 	})
 
@@ -533,7 +746,10 @@ func TestMachineSequenceEndLastOwner(t *testing.T) {
 
 		end := t0.Add(2 * time.Second)
 		acts := m.Step(Event{Now: end, ProbeExit: exit(errInactive)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "veto"}})
+		checkActions(t, acts, []Action{
+			{SaveOwner: ptr("mac"), Log: "veto"},
+			{WakeAt: end.Add(cfg.Settle)},
+		})
 		afterEnd(t, m, cfg, end)
 	})
 }

@@ -29,10 +29,10 @@ every host, four subcommands:
   defaults to 8700, state to `--state /var/lib/soft-kvm/state.json`, and it
   advertises itself over mDNS unless `--no-advertise` (SPEC §6.4, §7).
 - `connect [flags] [-- SWITCH-CMD ARGS...]` — the per-host agent. An HID attach
-  detector feeds the pure state machine that decides when to claim ownership and
-  run the switch command (`ddcutil` on Linux, `betterdisplaycli` on macOS).
-  `--trigger VID:PID[,…]` is required; macOS also gets `--no-guards` and
-  `--display-match` (SPEC §5.4, §6).
+  detector feeds the pure state machine that decides when to claim ownership; a
+  run-level action worker runs the switch command (`ddcutil` on Linux,
+  `betterdisplaycli` on macOS) on the losing host. `--trigger VID:PID[,…]` is
+  required; macOS also gets `--no-guards` and `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
   with a pointer to `--force` when the target has no live agent.
 - `detect` — prints attached HID devices and suggested `--trigger` values (SPEC
@@ -52,19 +52,21 @@ Per-host state lives under `stateDir()` — `$XDG_STATE_HOME/soft-kvm` on Linux,
 One package `main`, one file per concern (SPEC §11). Per-OS splits use filename
 build tags (`*_linux.go`, `*_darwin.go`), never `//go:build` lines.
 
-| File                                      | Concern                                                                                               |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `main.go`                                 | CLI dispatch, one `flag.FlagSet` per subcommand, token checks                                         |
-| `machine.go`                              | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                    |
-| `agent.go`                                | dumb glue feeding the Machine; the `Detector` and `Guard` interfaces; no policy                       |
-| `server.go`, `client.go`                  | the coordinator HTTP service and its client                                                           |
-| `state.go`                                | the `/state` wire type and atomic JSON persistence                                                    |
-| `discover.go`                             | mDNS advertise/browse, address resolution, address cache                                              |
-| `tls.go`                                  | TLS identity and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                          |
-| `run.go`                                  | the `Runner` argv runner and the §11.1 child-process conventions                                      |
-| `detect.go`, `detect_hid.go`              | HID enumeration for the subcommand; the attach detector both OSes share                               |
-| `guard_darwin.go`                         | macOS AC-power and display guards                                                                     |
-| `defaults_linux.go`, `defaults_darwin.go` | per-OS `defaultID`, `defaultSwitchCmd`, `defaultCheckCmd`, `defaultNotifyCmd`, `stateDir`, `newGuard` |
+| File                                      | Concern                                                                                                                     |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `main.go`                                 | CLI dispatch, one `flag.FlagSet` per subcommand, token checks                                                               |
+| `machine.go`                              | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                          |
+| `agent.go`                                | supervisor, generations, decision loop, claims; the `Detector` and `Guard` interfaces; no policy; invariants at top of file |
+| `watcher.go`                              | resolve/poll/backoff watcher: `/state` + `/wait`                                                                            |
+| `actions.go`                              | the action worker: runs Switch/Probe/Notify one at a time, posts results as Events                                          |
+| `server.go`, `client.go`                  | the coordinator HTTP service and its client                                                                                 |
+| `state.go`                                | the `/state` wire type and atomic JSON persistence                                                                          |
+| `discover.go`                             | mDNS advertise/browse, address resolution, address cache                                                                    |
+| `tls.go`                                  | TLS identity and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                |
+| `run.go`                                  | the `Runner` argv runner and the §11.1 child-process conventions                                                            |
+| `detect.go`, `detect_hid.go`              | HID enumeration for the subcommand; the attach detector both OSes share                                                     |
+| `guard_darwin.go`                         | macOS AC-power and display guards                                                                                           |
+| `defaults_linux.go`, `defaults_darwin.go` | per-OS `defaultID`, `defaultSwitchCmd`, `defaultCheckCmd`, `defaultNotifyCmd`, `stateDir`, `newGuard`                       |
 
 `newGuard` lives with the defaults on Linux, where it returns `alwaysOK` — the
 always-on desktop has no guards.

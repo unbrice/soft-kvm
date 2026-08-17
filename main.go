@@ -227,6 +227,10 @@ func activateCmd(ctx context.Context) error {
 	return nil
 }
 
+// defaultSwitchTimeout bounds one SWITCH-CMD run. A hung I²C write must not
+// freeze the agent (§4.3).
+const defaultSwitchTimeout = 30 * time.Second
+
 func connectCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	id := fs.String("id", defaultID, "claimed identity")
@@ -236,6 +240,7 @@ func connectCmd(ctx context.Context) error {
 	confirm := fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed")
 	switchRetries := fs.Int("switch-retries", 3, "re-runs of the switch command before giving up")
 	checkTimeout := fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run")
+	switchTimeout := fs.Duration("switch-timeout", defaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)")
 	checkCmd := fs.String("check-cmd", defaultCheckCmd, "veto before the switch, receipt after it")
 	notifyCmd := fs.String("notify-cmd", defaultNotifyCmd, "command run when the switch cannot be confirmed")
 
@@ -311,6 +316,7 @@ func connectCmd(ctx context.Context) error {
 		checkArgv:      shellArgv(*checkCmd),
 		notifyArgv:     shellArgv(*notifyCmd),
 		checkTimeout:   *checkTimeout,
+		switchTimeout:  *switchTimeout,
 	}
 
 	ag := &agent{cfg: cfg}

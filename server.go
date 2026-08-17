@@ -25,6 +25,10 @@ import (
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
+// defaultWaitTimeout is how long /wait blocks before returning 204. It must be
+// smaller than the client's internal /wait timeout.
+const defaultWaitTimeout = 50 * time.Second
+
 // Server carries the display bit and serves the /claim /state /wait API.
 type Server struct {
 	mu          sync.Mutex
@@ -58,7 +62,7 @@ func NewServer(statePath, token string) *Server {
 		serverID:    newUUID(),
 		waiters:     make(map[string]int),
 		broadcast:   make(chan struct{}),
-		waitTimeout: 50 * time.Second,
+		waitTimeout: defaultWaitTimeout,
 	}
 	return s
 }
@@ -234,7 +238,7 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	timeout := s.waitTimeout
 	if timeout <= 0 {
-		timeout = 50 * time.Second
+		timeout = defaultWaitTimeout
 	}
 
 	select {
