@@ -48,6 +48,8 @@ func main() {
 		err = activateCmd(ctx)
 	case "connect":
 		err = connectCmd(ctx)
+	case "detect":
+		err = detectCmd(ctx)
 	default:
 		usage()
 		os.Exit(2)
@@ -71,9 +73,11 @@ func usage() {
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
   connect [flags] [-- SWITCH-CMD ARGS...]
+  detect
 
-Flags precede positional arguments. SOFTKVM_TOKEN (env) is always required;
-SOFTKVM_SERVER overrides server discovery (SPEC §5).`)
+Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
+serve, activate and connect; detect needs no token. SOFTKVM_SERVER overrides
+server discovery (SPEC §5).`)
 }
 
 // requireToken reads the shared secret from the environment — never a flag
@@ -227,18 +231,13 @@ func connectCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
 	id := fs.String("id", defaultID, "claimed identity")
 	serverFlag := fs.String("server", "", "server address HOST:PORT")
-	usb := fs.String("usb", "046d:c548", "USB VID:PID filter for the primary detector")
+	trigger := fs.String("trigger", "", "comma-separated VID:PID filters for the trigger detector (USB receiver, optional Bluetooth keyboard); required — run `soft-kvm detect` to list VID:PIDs")
 	settle := fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming")
 	confirm := fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed")
 	switchRetries := fs.Int("switch-retries", 3, "re-runs of the switch command before giving up")
 	checkTimeout := fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run")
 	checkCmd := fs.String("check-cmd", defaultCheckCmd, "veto before the switch, receipt after it")
 	notifyCmd := fs.String("notify-cmd", defaultNotifyCmd, "command run when the switch cannot be confirmed")
-
-	var btMac string
-	if btFallbackOK {
-		fs.StringVar(&btMac, "bt-mac", "", "Bluetooth fallback detector MAC (Linux only)")
-	}
 
 	var noGuards bool
 	var displayMatch string
@@ -254,12 +253,16 @@ func connectCmd(ctx context.Context) error {
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return errUsage
 	}
+	if *trigger == "" {
+		fmt.Fprintln(os.Stderr, "connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
+		return errUsage
+	}
 	token, err := requireToken()
 	if err != nil {
 		return err
 	}
 
-	detector, err := pickDetector(btMac, *usb)
+	detector, err := newHIDDetector(*trigger)
 	if err != nil {
 		return err
 	}

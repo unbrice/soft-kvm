@@ -15,10 +15,6 @@ const (
 	defaultID        = "linux"
 	defaultCheckCmd  = "ddcutil getvcp 60"
 	defaultNotifyCmd = "notify-send 'soft-kvm' 'Press Input on the monitor'"
-
-	// btFallbackOK reports whether the --bt-mac fallback detector exists on
-	// this OS (SPEC §6.3: Linux only).
-	btFallbackOK = true
 )
 
 // defaultSwitchCmd points the LG at the Mac's input: the LG-specific VCP 0xF4
@@ -35,15 +31,6 @@ func stateDir() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "state", "soft-kvm")
-}
-
-// pickDetector selects the BlueZ fallback when --bt-mac is given, else the
-// netlink USB detector (SPEC §6.1, §6.3).
-func pickDetector(btMac, usb string) (Detector, error) {
-	if btMac != "" {
-		return newBTDetector(btMac), nil
-	}
-	return newUSBDetector(usb)
 }
 
 // newGuard: the always-on desktop has no guards (SPEC §6.1).

@@ -15,10 +15,6 @@ const (
 	defaultID        = "mac"
 	defaultCheckCmd  = "betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect"
 	defaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
-
-	// btFallbackOK reports whether the --bt-mac fallback detector exists on
-	// this OS (SPEC §6.3: Linux only, the Mac has no fallback).
-	btFallbackOK = false
 )
 
 // defaultSwitchCmd points the LG at the Linux input through BetterDisplay,
@@ -34,10 +30,4 @@ var defaultSwitchCmd = []string{
 func stateDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Library", "Application Support", "soft-kvm")
-}
-
-// pickDetector: the Mac has no Bluetooth fallback (SPEC §6.3), so btMac is
-// ignored — the --bt-mac flag is not even registered on darwin.
-func pickDetector(_, usb string) (Detector, error) {
-	return newUSBDetector(usb)
 }

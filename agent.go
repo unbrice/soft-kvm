@@ -40,10 +40,9 @@ func (b *backoff) next() time.Duration {
 func (b *backoff) reset() { b.cur = time.Second }
 
 // Detector emits one event per receiver attach edge (SPEC §11.2).
-// Implementations: netlink uevents (Linux), ioreg poll (macOS), gdbus/bluez
-// (Linux fallback), and test fakes. Only attach edges exist: disconnect is
-// ambiguous (SPEC finding 2) and never reported. Run returns nil on ctx
-// cancellation.
+// Implementations: HID device events via telesma-app/hid, and test fakes.
+// Only attach edges exist: disconnect is ambiguous (SPEC finding 2) and
+// never reported. Run returns nil on ctx cancellation.
 type Detector interface {
 	Run(ctx context.Context, attach chan<- struct{}) error
 }
@@ -157,8 +156,8 @@ func (a *agent) run(ctx context.Context) error {
 			return
 		}
 		childCancel()
-		// The workers are cancel-responsive (the netlink detector within one
-		// 200 ms poll); wait so a new generation never overlaps a dying one.
+		// The workers are cancel-responsive (the HID watcher's Close is
+		// bounded); wait so a new generation never overlaps a dying one.
 		_ = workers.Wait() // the loops return nil
 		guardsUp = false
 		// Stop the timer so dormant periods do not deliver stale timer events.
