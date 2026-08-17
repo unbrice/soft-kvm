@@ -73,7 +73,6 @@
               just
               dprint
               reuse
-              rtk
             ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               ddcutil
             ];
