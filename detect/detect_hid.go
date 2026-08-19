@@ -82,7 +82,13 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 	if err != nil {
 		return fmt.Errorf("hid watch: %w", err)
 	}
-	defer func() { _ = w.Close() }()
+	// A failed close leaves the library's event goroutine running; the caller
+	// may re-watch, so a leak would stack watchers.
+	defer func() {
+		if err := w.Close(); err != nil {
+			slog.Warn("hid watcher close failed", "error", err)
+		}
+	}()
 
 	// Each target exposes several HID interfaces (keyboard, mouse, raw),
 	// each reported as a separate device with the same VID:PID. Track the

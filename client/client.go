@@ -146,7 +146,10 @@ func (c *Client) request(ctx context.Context, method, url string, timeout time.D
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
 	return resp.StatusCode, body, nil
 }
 

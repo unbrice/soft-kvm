@@ -197,7 +197,11 @@ func activateCmd(ctx context.Context) error {
 		return err
 	}
 
-	resolver := discover.NewResolver(filepath.Join(platform.StateDir(), "server"))
+	stateDir, err := platform.StateDir()
+	if err != nil {
+		return err
+	}
+	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
 
 	// Try each candidate until one answers: a stale cache entry or an
 	// unroutable advertised address should not end the attempt (SPEC §5.1).
@@ -306,7 +310,11 @@ func connectCmd(ctx context.Context) error {
 		BreakerOpenFor: 60 * time.Second,
 	}
 
-	resolver := discover.NewResolver(filepath.Join(platform.StateDir(), "server"))
+	stateDir, err := platform.StateDir()
+	if err != nil {
+		return err
+	}
+	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
 
 	cfg := agent.Config{
 		ID:             *id,
@@ -317,7 +325,7 @@ func connectCmd(ctx context.Context) error {
 		Client:         c,
 		Runner:         platform.Run,
 		Machine:        &machineCfg,
-		AgentStatePath: filepath.Join(platform.StateDir(), "agent.json"),
+		AgentStatePath: filepath.Join(stateDir, "agent.json"),
 		SwitchArgv:     switchArgv,
 		CheckArgv:      platform.ShellArgv(*checkCmd),
 		NotifyArgv:     platform.ShellArgv(*notifyCmd),

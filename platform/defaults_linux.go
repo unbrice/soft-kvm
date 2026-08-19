@@ -25,10 +25,13 @@ var DefaultSwitchCmd = []string{
 }
 
 // StateDir is $XDG_STATE_HOME/soft-kvm, defaulting to ~/.local/state/soft-kvm.
-func StateDir() string {
+func StateDir() (string, error) {
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		return filepath.Join(dir, "soft-kvm")
+		return filepath.Join(dir, "soft-kvm"), nil
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "state", "soft-kvm")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "state", "soft-kvm"), nil
 }

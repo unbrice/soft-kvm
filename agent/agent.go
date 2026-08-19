@@ -279,8 +279,9 @@ func (a *agent) guardWatch(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			ok, _ := a.cfg.Guard.OK(ctx)
+			ok, reason := a.cfg.Guard.OK(ctx)
 			if !ok {
+				slog.Info("guards down, tearing down generation", "reason", reason)
 				return errGuardsDown
 			}
 		}

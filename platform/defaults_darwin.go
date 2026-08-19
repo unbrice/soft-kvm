@@ -27,7 +27,10 @@ var DefaultSwitchCmd = []string{
 }
 
 // StateDir is ~/Library/Application Support/soft-kvm (SPEC §4.3).
-func StateDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "Application Support", "soft-kvm")
+func StateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "Application Support", "soft-kvm"), nil
 }
