@@ -4,22 +4,24 @@
 
 // machine.go: the pure switch-decision state machine (SPEC §4.3, §11.3).
 
-package main
+package model
 
 import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/unbrice/soft-kvm/state"
 )
 
 // Event is the machine's only input. Exactly one semantic field is set, plus
 // Now (SPEC §11.3).
 type Event struct {
 	Now        time.Time
-	Attach     bool         // receiver attach edge from the Detector
-	State      *ServerState // from /state or a /wait wake
-	SwitchExit *error       // result of running SWITCH-CMD (nil = exit 0)
-	ProbeExit  *error       // result of running --check-cmd (nil = exit 0 = my input IS active)
+	Attach     bool               // receiver attach edge from the Detector
+	State      *state.ServerState // from /state or a /wait wake
+	SwitchExit *error             // result of running SWITCH-CMD (nil = exit 0)
+	ProbeExit  *error             // result of running --check-cmd (nil = exit 0 = my input IS active)
 }
 
 // Action is the machine's only output. Glue executes it and feeds results back
@@ -53,13 +55,13 @@ type MachineConfig struct {
 // §4.3: "poll", not a tight loop paced by check-cmd latency).
 const probeInterval = 500 * time.Millisecond
 
-// switchDeadline is the watchdog for modeSwitching, the only mode whose sole
+// SwitchDeadline is the watchdog for modeSwitching, the only mode whose sole
 // exit is an external event: a lost SwitchExit would otherwise wedge the
 // machine for the process lifetime. It is a watchdog, not a tuned timeout —
 // well above the slowest legitimate switch and above the glue's
 // --switch-timeout default (30 s), so the child dies before the machine gives
 // up.
-const switchDeadline = 60 * time.Second
+const SwitchDeadline = 60 * time.Second
 
 // mode is the machine's current activity. Only one activity is in progress at
 // a time.
@@ -85,11 +87,11 @@ type Machine struct {
 	settleDeadline time.Time
 	pendingAttach  bool
 
-	deferred *ServerState
+	deferred *state.ServerState
 	gateWake time.Time
 
-	reconState         *ServerState
-	latestState        *ServerState
+	reconState         *state.ServerState
+	latestState        *state.ServerState
 	switchSentAt       time.Time
 	attemptCount       int
 	confirmDeadline    time.Time
@@ -145,7 +147,7 @@ func (m *Machine) Step(e Event) []Action {
 }
 
 // handleState processes a State event.
-func (m *Machine) handleState(s *ServerState, now time.Time) []Action {
+func (m *Machine) handleState(s *state.ServerState, now time.Time) []Action {
 	if !m.hasRecord {
 		owner := s.Owner
 		m.lastOwner = owner
@@ -245,7 +247,7 @@ func (m *Machine) handleProbeExit(err error, now time.Time) []Action {
 }
 
 // reconcile evaluates the §4.3 gates for a state while idle or settling.
-func (m *Machine) reconcile(s *ServerState, now time.Time) []Action {
+func (m *Machine) reconcile(s *state.ServerState, now time.Time) []Action {
 	me := m.cfg.ID
 
 	if s.Owner == me {
@@ -342,11 +344,11 @@ func (m *Machine) processDeadlines(now time.Time, actions *[]Action) {
 			})
 			continue
 
-		case m.mode == modeSwitching && m.switchOutstanding && !now.Before(m.switchSentAt.Add(switchDeadline)):
+		case m.mode == modeSwitching && m.switchOutstanding && !now.Before(m.switchSentAt.Add(SwitchDeadline)):
 			// A lost SwitchExit must not wedge the machine: count the attempt
 			// as failed and feed the ordinary retry/failure path.
 			m.switchOutstanding = false
-			reason := fmt.Sprintf("no SwitchExit within %v (lost event or hung child) after attempt %d", switchDeadline, m.attemptCount)
+			reason := fmt.Sprintf("no SwitchExit within %v (lost event or hung child) after attempt %d", SwitchDeadline, m.attemptCount)
 			m.retryOrFail(now, actions, reason)
 			continue
 
@@ -521,7 +523,7 @@ func (m *Machine) wakeAt(now time.Time) time.Time {
 	var wake time.Time
 	candidates := []time.Time{m.settleDeadline, m.gateWake, m.confirmDeadline, m.nextProbeAt, m.retryWaitDeadline}
 	if m.mode == modeSwitching && m.switchOutstanding {
-		candidates = append(candidates, m.switchSentAt.Add(switchDeadline))
+		candidates = append(candidates, m.switchSentAt.Add(SwitchDeadline))
 	}
 	for _, t := range candidates {
 		if t.IsZero() || !t.After(now) {

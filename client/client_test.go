@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-package main
+package client_test
 
 import (
 	"context"
@@ -15,16 +15,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unbrice/soft-kvm/client"
+	"github.com/unbrice/soft-kvm/identity"
+	"github.com/unbrice/soft-kvm/server"
 )
 
 const clientTestToken = "client-test-token"
 
-func newClientTestServer(t *testing.T) (*Server, *httptest.Server) {
+func startTLSTestServer(t *testing.T, s *server.Server, token string) *httptest.Server {
+	t.Helper()
+	tlsCfg, err := identity.ServerTLSConfig(token)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(s.Handler())
+	srv.TLS = tlsCfg
+	srv.StartTLS()
+	return srv
+}
+
+func newClientTestServer(t *testing.T) (*server.Server, *httptest.Server) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	s := NewServer(statePath, clientTestToken)
-	s.waitTimeout = 300 * time.Millisecond
-	return s, startTLSTestServer(t, s)
+	s := server.NewServer(statePath, clientTestToken)
+	s.SetWaitTimeout(300 * time.Millisecond)
+	return s, startTLSTestServer(t, s, clientTestToken)
+}
+
+func newTestClient(t *testing.T, token string) *client.Client {
+	t.Helper()
+	c, err := client.NewClient(token)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return c
 }
 
 func baseFromURL(t *testing.T, raw string) string {
@@ -64,7 +89,7 @@ func TestClientClaimNoLiveAgent(t *testing.T) {
 
 	c := newTestClient(t, clientTestToken)
 	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false)
-	if !errors.Is(err, ErrNoLiveAgent) {
+	if !errors.Is(err, client.ErrNoLiveAgent) {
 		t.Fatalf("expected ErrNoLiveAgent, got %v", err)
 	}
 }
@@ -90,8 +115,8 @@ func TestClientWaitWakesOnClaim(t *testing.T) {
 	// Wait for the server's wait handler to register mac as live.
 	deadline := time.Now().Add(time.Second)
 	for {
-		state := s.currentState()
-		if state.Live["mac"] {
+		st := s.CurrentState()
+		if st.Live["mac"] {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -192,9 +217,9 @@ func TestClientMalformedResponse(t *testing.T) {
 		_, _ = w.Write([]byte("not json"))
 	}))
 	var err error
-	malformed.TLS, err = serverTLSConfig(clientTestToken)
+	malformed.TLS, err = identity.ServerTLSConfig(clientTestToken)
 	if err != nil {
-		t.Fatalf("serverTLSConfig: %v", err)
+		t.Fatalf("ServerTLSConfig: %v", err)
 	}
 	malformed.StartTLS()
 	defer malformed.Close()
@@ -215,9 +240,9 @@ func TestClientNonJSONErrorBody(t *testing.T) {
 		_, _ = fmt.Fprint(w, "plain text error")
 	}))
 	var err error
-	server.TLS, err = serverTLSConfig(clientTestToken)
+	server.TLS, err = identity.ServerTLSConfig(clientTestToken)
 	if err != nil {
-		t.Fatalf("serverTLSConfig: %v", err)
+		t.Fatalf("ServerTLSConfig: %v", err)
 	}
 	server.StartTLS()
 	defer server.Close()

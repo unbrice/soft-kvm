@@ -4,7 +4,7 @@
 
 // tls.go: TLS identity derived from the shared secret (SPEC §7, §9).
 
-package main
+package identity
 
 import (
 	"crypto/ed25519"
@@ -23,14 +23,14 @@ import (
 // as ServerName, so verification succeeds regardless of the dial address.
 const tlsServerName = "soft-kvm"
 
-// keyFingerprint derives the short identifier the mDNS TXT record broadcasts
+// KeyFingerprint derives the short identifier the mDNS TXT record broadcasts
 // as kh= (SPEC §5.1) so a client holding a different token can recognise the
 // mismatch before dialling. It is a filter, not authentication: a match proves
 // nothing (a rogue can copy a broadcast value), a mismatch proves "not ours".
 // The HKDF domain differs from the TLS identity's, so the broadcast value
 // reveals nothing about the certificate seed; truncation to 8 bytes plus the
 // token's high entropy (SPEC §9) make it safe to broadcast.
-func keyFingerprint(secret string) string {
+func KeyFingerprint(secret string) string {
 	// 8 bytes is far inside HKDF-SHA256's length limit, so this cannot fail.
 	fp, err := hkdf.Key(sha256.New, []byte(secret), nil, "soft-kvm key fingerprint v1", 8)
 	if err != nil {
@@ -77,8 +77,8 @@ func tlsIdentity(secret string) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv, Leaf: leaf}, nil
 }
 
-// serverTLSConfig serves the secret-derived identity.
-func serverTLSConfig(secret string) (*tls.Config, error) {
+// ServerTLSConfig serves the secret-derived identity.
+func ServerTLSConfig(secret string) (*tls.Config, error) {
 	cert, err := tlsIdentity(secret)
 	if err != nil {
 		return nil, err
@@ -89,9 +89,9 @@ func serverTLSConfig(secret string) (*tls.Config, error) {
 	}, nil
 }
 
-// clientTLSConfig trusts exactly the secret-derived identity: the derived
+// ClientTLSConfig trusts exactly the secret-derived identity: the derived
 // certificate is its own root and ServerName is pinned to its SAN.
-func clientTLSConfig(secret string) (*tls.Config, error) {
+func ClientTLSConfig(secret string) (*tls.Config, error) {
 	cert, err := tlsIdentity(secret)
 	if err != nil {
 		return nil, err

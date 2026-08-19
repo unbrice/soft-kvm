@@ -14,8 +14,7 @@ laptop.
 `GEMINI.md` are symlinks to it). Read SPEC §11 *Implementation notes* before
 writing code — it fixes the package layout, the cancellation rules and the state
 machine — and §4.3, which fixes what may authorise a switch. Where SPEC and the
-tree disagree on detail (§11 still folds the per-OS defaults into `run.go`), the
-tree wins; fix the SPEC in the same change.
+tree disagree on detail, the tree wins; fix the SPEC in the same change.
 
 ## How it works
 
@@ -43,33 +42,37 @@ every host, four subcommands:
 fingerprint are deterministic, salt-free functions of the token (SPEC §9).
 `SOFTKVM_SERVER` and `--server` override discovery.
 
-Per-host state lives under `stateDir()` — `$XDG_STATE_HOME/soft-kvm` on Linux,
-`~/Library/Application Support/soft-kvm` on macOS: `agent.json` (last owner) and
-`server` (last address that answered, the discovery cache).
+Per-host state lives under `platform.StateDir()` — `$XDG_STATE_HOME/soft-kvm` on
+Linux, `~/Library/Application Support/soft-kvm` on macOS: `agent.json` (last
+owner) and `server` (last address that answered, the discovery cache).
 
 ## Code layout
 
-One package `main`, one file per concern (SPEC §11). Per-OS splits use filename
-build tags (`*_linux.go`, `*_darwin.go`), never `//go:build` lines.
+One module, one binary, nine packages under the root `main` (SPEC §11). Per-OS
+splits use filename build tags (`*_linux.go`, `*_darwin.go`), never `//go:build`
+lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
+`platform`, `detect`) import nothing internal; `model` imports `state`; `client`
+and `server` import `state` and `identity`; `agent` imports `model`, `state`,
+`client` and `discover`.
 
-| File                                      | Concern                                                                                                                     |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `main.go`                                 | CLI dispatch, one `flag.FlagSet` per subcommand, token checks                                                               |
-| `machine.go`                              | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                          |
-| `agent.go`                                | supervisor, generations, decision loop, claims; the `Detector` and `Guard` interfaces; no policy; invariants at top of file |
-| `watcher.go`                              | resolve/poll/backoff watcher: `/state` + `/wait`                                                                            |
-| `actions.go`                              | the action worker: runs Switch/Probe/Notify one at a time, posts results as Events                                          |
-| `server.go`, `client.go`                  | the coordinator HTTP service and its client                                                                                 |
-| `state.go`                                | the `/state` wire type and atomic JSON persistence                                                                          |
-| `discover.go`                             | mDNS advertise/browse, address resolution, address cache                                                                    |
-| `tls.go`                                  | TLS identity and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                |
-| `run.go`                                  | the `Runner` argv runner and the §11.1 child-process conventions                                                            |
-| `detect.go`, `detect_hid.go`              | HID enumeration for the subcommand; the attach detector both OSes share                                                     |
-| `guard_darwin.go`                         | macOS AC-power and display guards                                                                                           |
-| `defaults_linux.go`, `defaults_darwin.go` | per-OS `defaultID`, `defaultSwitchCmd`, `defaultCheckCmd`, `defaultNotifyCmd`, `stateDir`, `newGuard`                       |
+| Package    | Files                                  | Concern                                                                                               |
+| ---------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| (root)     | `main.go`                              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring                                 |
+| `state`    | `state.go`                             | the `/state` wire type and atomic JSON persistence                                                    |
+| `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                    |
+| `identity` | `tls.go`                               | TLS identity and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                          |
+| `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)     |
+| `platform` | `run.go`, `defaults_*`, `guard_*`      | the argv runner and the §11.1 child-process conventions; per-OS defaults; the per-OS `Guard`          |
+| `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                               |
+| `client`   | `client.go`                            | the coordinator's HTTP client                                                                         |
+| `server`   | `server.go`                            | the coordinator HTTP service                                                                          |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go` | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy |
 
-`newGuard` lives with the defaults on Linux, where it returns `alwaysOK` — the
-always-on desktop has no guards.
+The invariants header lives at the top of `agent/agent.go`.
+`platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op
+on Linux (the always-on desktop has no guards), AC-power and display checks on
+macOS. It satisfies `agent.Guard` structurally — `platform` imports nothing
+internal.
 
 ## Stack
 
@@ -125,9 +128,9 @@ Three of those surprise people:
 - `just test-unit` (`go test -v ./...`); SPEC §11.4 also asks for
   `go test -race ./...` — the long-poll broadcast channel is the one place a
   race is plausible.
-- **`Machine.Step` table tests are the bulk of the suite** (`machine_test.go`) —
-  every §8 edge case and every §4.3 gate combination, with no clock, no
-  processes, no sockets.
+- **`Machine.Step` table tests are the bulk of the suite**
+  (`model/machine_test.go`) — every §8 edge case and every §4.3 gate
+  combination, with no clock, no processes, no sockets.
 - Server tests run the real handler under `httptest.NewServer` with the real
   client pointed at it: a mocked client would test the mock (SPEC §11.2).
 - An interface needs two real implementations to exist. `Detector` and `Guard`

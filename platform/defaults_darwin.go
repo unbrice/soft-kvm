@@ -4,7 +4,7 @@
 
 // Per-OS flag defaults for connect (SPEC §5.4) — macOS column.
 
-package main
+package platform
 
 import (
 	"os"
@@ -12,22 +12,22 @@ import (
 )
 
 const (
-	defaultID        = "mac"
-	defaultCheckCmd  = "betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect"
-	defaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
+	DefaultID        = "mac"
+	DefaultCheckCmd  = "betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect"
+	DefaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
 )
 
-// defaultSwitchCmd points the LG at the Linux input through BetterDisplay,
+// DefaultSwitchCmd points the LG at the Linux input through BetterDisplay,
 // which writes the standard VCP 0x60. 15 is BetterDisplay's DisplayPort
 // value; §10 records this monitor's real per-port codes, and `-- SWITCH-CMD
 // ARGS...` overrides the whole command when they deviate (SPEC §5.4).
-var defaultSwitchCmd = []string{
+var DefaultSwitchCmd = []string{
 	"betterdisplaycli", "set", "-productNameLike=LG", "-feature=ddc",
 	"-vcp=inputSelect", "-value=15",
 }
 
-// stateDir is ~/Library/Application Support/soft-kvm (SPEC §4.3).
-func stateDir() string {
+// StateDir is ~/Library/Application Support/soft-kvm (SPEC §4.3).
+func StateDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Library", "Application Support", "soft-kvm")
 }

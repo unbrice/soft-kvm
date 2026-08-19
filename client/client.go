@@ -4,7 +4,7 @@
 
 // client.go: HTTP client for the coordinator service (SPEC §5.3, §7, §11.2).
 
-package main
+package client
 
 import (
 	"context"
@@ -16,6 +16,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/unbrice/soft-kvm/identity"
+	"github.com/unbrice/soft-kvm/state"
 )
 
 // ErrUnauthorized is returned when the server rejects the X-Display-Token.
@@ -34,7 +37,7 @@ type Client struct {
 // NewClient returns a client that authenticates with token and trusts exactly
 // the TLS identity derived from it (SPEC §9).
 func NewClient(token string) (*Client, error) {
-	tlsCfg, err := clientTLSConfig(token)
+	tlsCfg, err := identity.ClientTLSConfig(token)
 	if err != nil {
 		return nil, fmt.Errorf("derive TLS identity: %w", err)
 	}
@@ -80,7 +83,7 @@ func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, 
 }
 
 // State GETs /state and returns the current server state.
-func (c *Client) State(ctx context.Context, base string) (*ServerState, error) {
+func (c *Client) State(ctx context.Context, base string) (*state.ServerState, error) {
 	url := "https://" + base + "/state"
 	status, body, err := c.request(ctx, http.MethodGet, url, 5*time.Second)
 	if err != nil {
@@ -93,23 +96,23 @@ func (c *Client) State(ctx context.Context, base string) (*ServerState, error) {
 		return nil, httpError(http.MethodGet, "/state", status, body)
 	}
 
-	var state ServerState
-	if err := json.Unmarshal(body, &state); err != nil {
+	var st state.ServerState
+	if err := json.Unmarshal(body, &st); err != nil {
 		return nil, fmt.Errorf("decode state response: %w", err)
 	}
-	return &state, nil
+	return &st, nil
 }
 
-// waitClientTimeout is the internal timeout for GET /wait. It must be larger
+// WaitClientTimeout is the internal timeout for GET /wait. It must be larger
 // than the server's long-poll timeout so the server fires first.
-const waitClientTimeout = 60 * time.Second
+const WaitClientTimeout = 60 * time.Second
 
 // Wait GETs /wait?epoch=N&id=me. It returns woke=true on a 200 wake and
 // woke=false on a 204 timeout. The caller supplies ctx; the internal timeout is
-// waitClientTimeout so the server fires first.
+// WaitClientTimeout so the server fires first.
 func (c *Client) Wait(ctx context.Context, base string, epoch int64, id string) (bool, error) {
 	u := fmt.Sprintf("https://%s/wait?epoch=%d&id=%s", base, epoch, url.QueryEscape(id))
-	status, body, err := c.request(ctx, http.MethodGet, u, waitClientTimeout)
+	status, body, err := c.request(ctx, http.MethodGet, u, WaitClientTimeout)
 	if err != nil {
 		return false, err
 	}

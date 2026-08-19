@@ -5,13 +5,16 @@
 // watcher.go: the /state + /wait watcher — resolve/backoff outer layer and
 // one-session long-poll inner layer (SPEC §5.4.3, §5.4.5).
 
-package main
+package agent
 
 import (
 	"context"
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/unbrice/soft-kvm/client"
+	"github.com/unbrice/soft-kvm/state"
 )
 
 const (
@@ -30,10 +33,10 @@ var errSleepDetected = errors.New("sleep detected")
 // watch resolves the server and pumps fresh states into stateCh until ctx is
 // cancelled. Transient failures wait on the backoff before re-resolving; a
 // sleep detection skips the backoff.
-func (a *agent) watch(ctx context.Context, stateCh chan<- *ServerState) error {
+func (a *agent) watch(ctx context.Context, stateCh chan<- *state.ServerState) error {
 	b := a.newBackoff()
 	for {
-		base, state, ok := a.connectServer(ctx)
+		base, st, ok := a.connectServer(ctx)
 		if !ok {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -47,11 +50,11 @@ func (a *agent) watch(ctx context.Context, stateCh chan<- *ServerState) error {
 		// A successful /state proves the coordinator is reachable; only now
 		// does the backoff reset (SPEC §5.4.3).
 		b.reset()
-		saveCachedServer(base)
-		if !a.sendState(ctx, stateCh, state) {
+		a.cfg.Resolver.Save(base)
+		if !a.sendState(ctx, stateCh, st) {
 			return ctx.Err()
 		}
-		if err := a.poll(ctx, stateCh, base, state.Epoch, b); err != nil {
+		if err := a.poll(ctx, stateCh, base, st.Epoch, b); err != nil {
 			if errors.Is(err, errSleepDetected) {
 				continue
 			}
@@ -69,7 +72,7 @@ func (a *agent) watch(ctx context.Context, stateCh chan<- *ServerState) error {
 // poll runs one long-poll session against base, sending every wake to stateCh.
 // It returns errSleepDetected when the wall jump implies a sleep, or any error
 // that should tear down this session. Cancellation returns ctx.Err().
-func (a *agent) poll(ctx context.Context, stateCh chan<- *ServerState, base string, epoch int64, b *backoff) error {
+func (a *agent) poll(ctx context.Context, stateCh chan<- *state.ServerState, base string, epoch int64, b *backoff) error {
 	for {
 		// Wall-only start so sleep detection compares wall-clock progress.
 		start := time.Now().Round(0)
@@ -78,26 +81,26 @@ func (a *agent) poll(ctx context.Context, stateCh chan<- *ServerState, base stri
 			return ctx.Err()
 		}
 		if err != nil {
-			if errors.Is(err, ErrUnauthorized) {
+			if errors.Is(err, client.ErrUnauthorized) {
 				slog.Error("watcher: token rejected")
 			} else {
 				slog.Error("watcher: wait failed", "error", err)
 			}
 			return err
 		}
-		if time.Since(start) > 2*waitClientTimeout {
+		if time.Since(start) > 2*client.WaitClientTimeout {
 			slog.Info("watcher: sleep detected, re-resolving")
 			return errSleepDetected
 		}
 		if !woke {
 			continue
 		}
-		state, err := a.clientState(ctx, base)
+		st, err := a.clientState(ctx, base)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return ctx.Err()
 			}
-			if errors.Is(err, ErrUnauthorized) {
+			if errors.Is(err, client.ErrUnauthorized) {
 				slog.Error("watcher: token rejected")
 			} else {
 				slog.Error("watcher: state failed", "error", err)
@@ -105,28 +108,28 @@ func (a *agent) poll(ctx context.Context, stateCh chan<- *ServerState, base stri
 			return err
 		}
 		b.reset()
-		saveCachedServer(base)
-		if !a.sendState(ctx, stateCh, state) {
+		a.cfg.Resolver.Save(base)
+		if !a.sendState(ctx, stateCh, st) {
 			return ctx.Err()
 		}
-		epoch = state.Epoch
+		epoch = st.Epoch
 	}
 }
 
-// connectServer ranges over resolveServer's candidates and returns the base
+// connectServer ranges over Resolver.Resolve's candidates and returns the base
 // and state of the first whose /state answers. ok is false when the sequence
 // ended without a working candidate — for explicit/env sources after one
 // candidate, for mDNS only when ctx is done (SPEC §5.1, §8).
-func (a *agent) connectServer(ctx context.Context) (base string, state *ServerState, ok bool) {
-	for base := range resolveServer(ctx, a.cfg.explicitServer, a.cfg.keyFP) {
-		state, err := a.clientState(ctx, base)
+func (a *agent) connectServer(ctx context.Context) (base string, st *state.ServerState, ok bool) {
+	for base := range a.cfg.Resolver.Resolve(ctx, a.cfg.ExplicitServer, a.cfg.KeyFP) {
+		st, err := a.clientState(ctx, base)
 		if err == nil {
-			return base, state, true
+			return base, st, true
 		}
 		if errors.Is(err, context.Canceled) {
 			return "", nil, false
 		}
-		if errors.Is(err, ErrUnauthorized) {
+		if errors.Is(err, client.ErrUnauthorized) {
 			slog.Error("watcher: token rejected")
 		} else {
 			slog.Debug("watcher: candidate failed", "base", base, "error", err)
@@ -135,21 +138,21 @@ func (a *agent) connectServer(ctx context.Context) (base string, state *ServerSt
 	return "", nil, false
 }
 
-func (a *agent) clientState(ctx context.Context, base string) (*ServerState, error) {
+func (a *agent) clientState(ctx context.Context, base string) (*state.ServerState, error) {
 	cctx, cancel := context.WithTimeout(ctx, stateTimeout)
 	defer cancel()
-	return a.cfg.client.State(cctx, base)
+	return a.cfg.Client.State(cctx, base)
 }
 
 func (a *agent) clientWait(ctx context.Context, base string, epoch int64) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
-	return a.cfg.client.Wait(cctx, base, epoch, a.cfg.id)
+	return a.cfg.Client.Wait(cctx, base, epoch, a.cfg.ID)
 }
 
-func (a *agent) sendState(ctx context.Context, stateCh chan<- *ServerState, state *ServerState) bool {
+func (a *agent) sendState(ctx context.Context, stateCh chan<- *state.ServerState, st *state.ServerState) bool {
 	select {
-	case stateCh <- state:
+	case stateCh <- st:
 		return true
 	case <-ctx.Done():
 		return false

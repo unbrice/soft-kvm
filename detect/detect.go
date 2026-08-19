@@ -4,15 +4,13 @@
 
 // detect.go: HID device enumeration and --trigger suggestions.
 
-package main
+package detect
 
 import (
 	"cmp"
 	"context"
-	"flag"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 
@@ -36,28 +34,16 @@ type hidDevice struct {
 	interfaces []ifaceUsage
 }
 
-// detectCmd enumerates HID devices and prints how to set --trigger for
-// connect.
-func detectCmd(ctx context.Context) error {
-	fs := flag.NewFlagSet("detect", flag.ContinueOnError)
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm detect")
-	}
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
-	}
-	if fs.NArg() > 0 {
-		return errUsage
-	}
-
+// Run enumerates HID devices and prints how to set --trigger for connect.
+func Run(ctx context.Context, w io.Writer) error {
 	devices, err := enumerateHIDDevices(ctx)
 	if err != nil {
 		return fmt.Errorf("enumerate HID devices: %w", err)
 	}
-	if err := renderDevices(os.Stdout, devices); err != nil {
+	if err := renderDevices(w, devices); err != nil {
 		return err
 	}
-	if err := renderSuggestions(os.Stdout, devices); err != nil {
+	if err := renderSuggestions(w, devices); err != nil {
 		return err
 	}
 	return nil

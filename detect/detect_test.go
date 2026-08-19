@@ -4,7 +4,7 @@
 
 // Tests for detect.go rendering and suggestion logic.
 
-package main
+package detect
 
 import (
 	"bytes"

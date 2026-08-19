@@ -2,45 +2,20 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-package main
+package identity
 
 import (
 	"bytes"
 	"encoding/hex"
-	"net/http/httptest"
 	"testing"
 )
 
-// startTLSTestServer serves s.Handler() over TLS with the identity derived
-// from s.token — the same path Server.Run takes.
-func startTLSTestServer(t *testing.T, s *Server) *httptest.Server {
-	t.Helper()
-	tlsCfg, err := serverTLSConfig(s.token)
-	if err != nil {
-		t.Fatalf("serverTLSConfig: %v", err)
-	}
-	srv := httptest.NewUnstartedServer(s.Handler())
-	srv.TLS = tlsCfg
-	srv.StartTLS()
-	return srv
-}
-
-// newTestClient returns a Client for token or fails the test.
-func newTestClient(t *testing.T, token string) *Client {
-	t.Helper()
-	c, err := NewClient(token)
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return c
-}
-
 func TestKeyFingerprint(t *testing.T) {
-	fp1 := keyFingerprint("secret-a")
-	if fp1 != keyFingerprint("secret-a") {
+	fp1 := KeyFingerprint("secret-a")
+	if fp1 != KeyFingerprint("secret-a") {
 		t.Fatal("same secret produced different fingerprints")
 	}
-	if fp1 == keyFingerprint("secret-b") {
+	if fp1 == KeyFingerprint("secret-b") {
 		t.Fatal("different secrets produced the same fingerprint")
 	}
 	if len(fp1) != 16 {

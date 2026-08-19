@@ -4,7 +4,7 @@
 
 // macOS guard: AC power and LG display presence (SPEC §6.2).
 
-package main
+package platform
 
 import (
 	"context"
@@ -14,17 +14,29 @@ import (
 	"time"
 )
 
-func newGuard(displayMatch string) Guard {
-	return &displayGuard{match: strings.ToLower(displayMatch)}
-}
-
-type displayGuard struct {
+// Guard is the macOS AC-power and display-presence guard.
+type Guard struct {
 	match    string
+	disabled bool
 	mu       sync.Mutex
 	lastSeen time.Time
 }
 
-func (g *displayGuard) OK(ctx context.Context) (ok bool, reason string) {
+// NewGuard returns a macOS guard. When disabled is true all checks are
+// bypassed; match is the display name substring used when disabled is false.
+func NewGuard(match string, disabled bool) *Guard {
+	return &Guard{
+		match:    strings.ToLower(match),
+		disabled: disabled,
+	}
+}
+
+// OK reports whether this host may participate in switching.
+func (g *Guard) OK(ctx context.Context) (ok bool, reason string) {
+	if g.disabled {
+		return true, "guards disabled"
+	}
+
 	if err := g.acPower(ctx); err != nil {
 		return false, "no AC power"
 	}
@@ -49,10 +61,10 @@ func (g *displayGuard) OK(ctx context.Context) (ok bool, reason string) {
 	return true, ""
 }
 
-func (g *displayGuard) acPower(ctx context.Context) error {
+func (g *Guard) acPower(ctx context.Context) error {
 	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := commandContext(ctx2, []string{"pmset", "-g", "ps"}).Output()
+	out, err := CommandContext(ctx2, []string{"pmset", "-g", "ps"}).Output()
 	if err != nil {
 		return err
 	}
@@ -62,10 +74,10 @@ func (g *displayGuard) acPower(ctx context.Context) error {
 	return nil
 }
 
-func (g *displayGuard) displayPresent(ctx context.Context) (bool, error) {
+func (g *Guard) displayPresent(ctx context.Context) (bool, error) {
 	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := commandContext(ctx2, []string{"betterdisplaycli", "get", "-identifiers"}).Output()
+	out, err := CommandContext(ctx2, []string{"betterdisplaycli", "get", "-identifiers"}).Output()
 	if err != nil {
 		return false, err
 	}

@@ -22,7 +22,7 @@
 //     atomic file write inline; nothing downstream depends on it synchronously,
 //     and moving it would reorder it against logs for no gain.
 
-package main
+package agent
 
 import (
 	"context"
@@ -33,8 +33,16 @@ import (
 	"os"
 	"time"
 
+	"github.com/unbrice/soft-kvm/client"
+	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/model"
+	"github.com/unbrice/soft-kvm/state"
 	"golang.org/x/sync/errgroup"
 )
+
+// DefaultSwitchTimeout bounds one SWITCH-CMD run. A hung I²C write must not
+// freeze the agent (§4.3).
+const DefaultSwitchTimeout = 30 * time.Second
 
 const (
 	// backoffBase and backoffCap bound the exponential backoff with full
@@ -99,60 +107,62 @@ type Guard interface {
 	OK(ctx context.Context) (ok bool, reason string)
 }
 
-// alwaysOK is a Guard adapter used when macOS --no-guards disables the real
-// checks.
-type alwaysOK struct{ reason string }
+// Runner executes one argv slice and reports the exit status: nil on exit 0,
+// an error wrapping *exec.ExitError otherwise. It is a func type, not an
+// interface: there is one implementation, and the seam the tests fake is the
+// runner itself (SPEC §11.2). Child output is captured and attached to the
+// error, never streamed.
+type Runner func(ctx context.Context, argv []string) error
 
-func (g alwaysOK) OK(context.Context) (bool, string) { return true, g.reason }
-
-// agentConfig is the wiring the agent loop needs. It contains no policy; that
+// Config is the wiring the agent loop needs. It contains no policy; that
 // lives in Machine (SPEC §11.3).
-type agentConfig struct {
-	id             string
-	explicitServer string
-	keyFP          string
-	detector       Detector
-	guard          Guard
-	client         *Client
-	runner         Runner
-	machine        *MachineConfig
-	agentStatePath string
-	switchArgv     []string
-	checkArgv      []string
-	notifyArgv     []string
-	checkTimeout   time.Duration
-	switchTimeout  time.Duration
-	guardPoll      time.Duration
-	backoffBase    time.Duration
+type Config struct {
+	ID             string
+	ExplicitServer string
+	KeyFP          string
+	Detector       Detector
+	Guard          Guard
+	Client         *client.Client
+	Runner         Runner
+	Machine        *model.MachineConfig
+	AgentStatePath string
+	SwitchArgv     []string
+	CheckArgv      []string
+	NotifyArgv     []string
+	CheckTimeout   time.Duration
+	SwitchTimeout  time.Duration
+	GuardPoll      time.Duration
+	BackoffBase    time.Duration
+	Resolver       *discover.Resolver
 }
 
-func (c agentConfig) switchTimeoutOrDefault() time.Duration {
-	if c.switchTimeout > 0 {
-		return c.switchTimeout
+func (c Config) switchTimeoutOrDefault() time.Duration {
+	if c.SwitchTimeout > 0 {
+		return c.SwitchTimeout
 	}
-	return defaultSwitchTimeout
+	return DefaultSwitchTimeout
 }
 
-func (c agentConfig) guardPollOrDefault() time.Duration {
-	if c.guardPoll > 0 {
-		return c.guardPoll
+func (c Config) guardPollOrDefault() time.Duration {
+	if c.GuardPoll > 0 {
+		return c.GuardPoll
 	}
 	return defaultGuardPoll
 }
 
-func (c agentConfig) backoffBaseOrDefault() time.Duration {
-	if c.backoffBase > 0 {
-		return c.backoffBase
+func (c Config) backoffBaseOrDefault() time.Duration {
+	if c.BackoffBase > 0 {
+		return c.BackoffBase
 	}
 	return backoffBase
 }
 
 // agent runs the connect loop until ctx is cancelled.
 type agent struct {
-	cfg      agentConfig
+	cfg      Config
 	claims   errgroup.Group
 	actionCh chan effect
-	results  chan Event
+	results  chan model.Event
 }
 
 // newBackoff returns a backoff using the configured base.
@@ -162,24 +172,31 @@ func (a *agent) newBackoff() *backoff {
 
 var errGuardsDown = errors.New("guards down")
 
-// run starts the action worker and claims group, then loops over guards-up
-// generations until ctx is cancelled. Returns nil on ctx cancellation.
-func (a *agent) run(ctx context.Context) error {
-	as := agentState{}
-	_, statErr := os.Stat(a.cfg.agentStatePath)
+// Run starts the connect agent and blocks until ctx is cancelled. Returns nil
+// on ctx cancellation.
+func Run(ctx context.Context, cfg Config) error {
+	as := state.AgentState{}
+	_, statErr := os.Stat(cfg.AgentStatePath)
 	hasRecord := statErr == nil
-	if err := loadJSON(a.cfg.agentStatePath, &as); err != nil {
-		slog.Warn("corrupt agent state, starting fresh", "path", a.cfg.agentStatePath, "error", err)
-		as = agentState{}
+	if err := state.Load(cfg.AgentStatePath, &as); err != nil {
+		slog.Warn("corrupt agent state, starting fresh", "path", cfg.AgentStatePath, "error", err)
+		as = state.AgentState{}
 		hasRecord = false
 	}
 
 	// Invariant 1: the Machine lives on the loop goroutine, never on agent.
-	m := NewMachine(*a.cfg.machine, as.LastOwner, hasRecord)
+	m := model.NewMachine(*cfg.Machine, as.LastOwner, hasRecord)
 
+	a := &agent{cfg: cfg}
 	a.actionCh = make(chan effect, 2)
-	a.results = make(chan Event, 1)
+	a.results = make(chan model.Event, 1)
 
+	return a.run(ctx, m)
+}
+
+// run starts the action worker and claims group, then loops over guards-up
+// generations until ctx is cancelled.
+func (a *agent) run(ctx context.Context, m *model.Machine) error {
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Claims are supervised one-shots. SetLimit(1) + TryGo coalesces a
@@ -217,7 +234,7 @@ func (a *agent) run(ctx context.Context) error {
 // waitGuardsUp blocks until the Guard reports up, logging each transition
 // once. Returns false on ctx cancellation.
 func (a *agent) waitGuardsUp(ctx context.Context) bool {
-	ok, reason := a.cfg.guard.OK(ctx)
+	ok, reason := a.cfg.Guard.OK(ctx)
 	if ok {
 		slog.Info("guards up", "reason", reason)
 		return true
@@ -229,7 +246,7 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 			return false
 		case <-time.After(a.cfg.guardPollOrDefault()):
 		}
-		ok, reason = a.cfg.guard.OK(ctx)
+		ok, reason = a.cfg.Guard.OK(ctx)
 	}
 	slog.Info("guards up", "reason", reason)
 	return true
@@ -240,9 +257,9 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 // goroutine may return are errGuardsDown and ctx.Err(); transient failures
 // (HTTP, HID) are retried in place. runCtx is the run-level context the loop
 // uses for claims: a guard flap must not cancel an in-flight claim.
-func (a *agent) generation(ctx context.Context, m *Machine) error {
+func (a *agent) generation(ctx context.Context, m *model.Machine) error {
 	attachCh := make(chan struct{}, 1)
-	stateCh := make(chan *ServerState, 1)
+	stateCh := make(chan *state.ServerState, 1)
 
 	runCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
@@ -262,7 +279,7 @@ func (a *agent) guardWatch(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			ok, _ := a.cfg.guard.OK(ctx)
+			ok, _ := a.cfg.Guard.OK(ctx)
 			if !ok {
 				return errGuardsDown
 			}
@@ -276,7 +293,7 @@ func (a *agent) guardWatch(ctx context.Context) error {
 func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) error {
 	b := a.newBackoff()
 	for {
-		err := a.cfg.detector.Run(ctx, attachCh)
+		err := a.cfg.Detector.Run(ctx, attachCh)
 		if err == nil {
 			return nil
 		}
@@ -293,9 +310,9 @@ func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) erro
 // loop is the only goroutine that touches m. It stamps Now at processing time
 // and dispatches the Actions the Machine returns. runCtx is the run-level
 // context claims run under; everything else uses the generation ctx.
-func (a *agent) loop(ctx context.Context, m *Machine, attachCh <-chan struct{}, stateCh <-chan *ServerState, runCtx context.Context) error {
+func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, runCtx context.Context) error {
 	timer := stoppedTimer()
-	step := func(ev Event) error {
+	step := func(ev model.Event) error {
 		ev.Now = time.Now() // the loop is the only clock (§11.3)
 		sawWake := false
 		for _, act := range m.Step(ev) {
@@ -303,8 +320,8 @@ func (a *agent) loop(ctx context.Context, m *Machine, attachCh <-chan struct{}, 
 				slog.Info(act.Log)
 			}
 			if act.SaveOwner != nil {
-				if err := saveJSON(a.cfg.agentStatePath, agentState{LastOwner: *act.SaveOwner}); err != nil {
-					slog.Error("failed to save agent state", "path", a.cfg.agentStatePath, "error", err)
+				if err := state.Save(a.cfg.AgentStatePath, state.AgentState{LastOwner: *act.SaveOwner}); err != nil {
+					slog.Error("failed to save agent state", "path", a.cfg.AgentStatePath, "error", err)
 				}
 			}
 			if act.Claim != "" {
@@ -348,18 +365,18 @@ func (a *agent) loop(ctx context.Context, m *Machine, attachCh <-chan struct{}, 
 		return nil
 	}
 	// Deadlines may have elapsed while dormant; let the machine catch up.
-	if err := step(Event{}); err != nil {
+	if err := step(model.Event{}); err != nil {
 		return err
 	}
 	for {
-		var ev Event
+		var ev model.Event
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-attachCh:
-			ev = Event{Attach: true}
+			ev = model.Event{Attach: true}
 		case s := <-stateCh:
-			ev = Event{State: s}
+			ev = model.Event{State: s}
 		case r := <-a.results:
 			ev = r
 		case <-timer.C:
@@ -391,10 +408,10 @@ func (a *agent) claim(ctx context.Context, id string) {
 
 		cctx, cancel := context.WithTimeout(ctx, stateTimeout)
 		claimed := false
-		for base := range resolveServer(cctx, a.cfg.explicitServer, a.cfg.keyFP) {
-			changed, err := a.cfg.client.Claim(cctx, base, id, false)
+		for base := range a.cfg.Resolver.Resolve(cctx, a.cfg.ExplicitServer, a.cfg.KeyFP) {
+			changed, err := a.cfg.Client.Claim(cctx, base, id, false)
 			if err != nil {
-				if errors.Is(err, ErrUnauthorized) {
+				if errors.Is(err, client.ErrUnauthorized) {
 					slog.Error("claim: token rejected", "attempt", attempt+1)
 				} else {
 					slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
@@ -402,7 +419,7 @@ func (a *agent) claim(ctx context.Context, id string) {
 				continue
 			}
 			if changed {
-				saveCachedServer(base)
+				a.cfg.Resolver.Save(base)
 			}
 			slog.Info("claim: success", "id", id, "changed", changed)
 			claimed = true

@@ -4,7 +4,7 @@
 
 // machine_test.go: table-driven tests of the pure switch state machine.
 
-package main
+package model
 
 import (
 	"errors"
@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unbrice/soft-kvm/state"
 )
 
 func testConfig(id string) MachineConfig {
@@ -28,8 +30,8 @@ func testConfig(id string) MachineConfig {
 	}
 }
 
-func mkstate(owner string, epoch int64, live map[string]bool) *ServerState {
-	return &ServerState{Owner: owner, Epoch: epoch, Live: live}
+func mkstate(owner string, epoch int64, live map[string]bool) *state.ServerState {
+	return &state.ServerState{Owner: owner, Epoch: epoch, Live: live}
 }
 
 func exit(err error) *error { return &err }
@@ -122,7 +124,7 @@ func TestMachine(t *testing.T) {
 		acts = m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
 		checkActions(t, acts, []Action{
 			{Switch: true, Log: "attempt 1"},
-			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+			{WakeAt: t0.Add(1*time.Second + SwitchDeadline)},
 		})
 
 		confirmUntil := t0.Add(1 * time.Second).Add(cfg.Confirm)
@@ -206,7 +208,7 @@ func TestMachine(t *testing.T) {
 		acts := m.Step(Event{Now: t0.Add(6 * time.Second), ProbeExit: exit(nil)})
 		checkActions(t, acts, []Action{
 			{Switch: true, Log: "attempt 2"},
-			{WakeAt: t0.Add(6*time.Second + switchDeadline)},
+			{WakeAt: t0.Add(6*time.Second + SwitchDeadline)},
 		})
 
 		// Second attempt lands.
@@ -451,11 +453,11 @@ func TestMachine(t *testing.T) {
 		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
 		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
 
-		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		watchdogTime := t0.Add(1*time.Second + SwitchDeadline)
 		acts := m.Step(Event{Now: watchdogTime})
 		checkActions(t, acts, []Action{
 			{Switch: true, Log: "no SwitchExit within 1m0s (lost event or hung child)"},
-			{WakeAt: watchdogTime.Add(switchDeadline)},
+			{WakeAt: watchdogTime.Add(SwitchDeadline)},
 		})
 		if !strings.Contains(acts[0].Log, "attempt 1") {
 			t.Fatalf("expected attempt 1 in log, got %q", acts[0].Log)
@@ -473,7 +475,7 @@ func TestMachine(t *testing.T) {
 		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
 		m.Step(Event{Now: t0.Add(1 * time.Second), ProbeExit: exit(nil)})
 
-		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		watchdogTime := t0.Add(1*time.Second + SwitchDeadline)
 		acts := m.Step(Event{Now: watchdogTime})
 		requireActionCount(t, acts, 2)
 		if acts[0].Switch {
@@ -490,7 +492,7 @@ func TestMachine(t *testing.T) {
 	t.Run("watchdog exhausts retries and trips breaker", func(t *testing.T) {
 		cfg := testConfig("linux")
 		cfg.SwitchRetries = 0
-		// Watchdog failures are spaced by switchDeadline, so widen the breaker
+		// Watchdog failures are spaced by SwitchDeadline, so widen the breaker
 		// window enough to keep all three failures in the count.
 		cfg.BreakerWindow = 300 * time.Second
 		m := NewMachine(cfg, "linux", true)
@@ -503,7 +505,7 @@ func TestMachine(t *testing.T) {
 			switchAt := base.Add(1 * time.Second)
 			m.Step(Event{Now: switchAt, ProbeExit: exit(nil)})
 
-			lastFail = switchAt.Add(switchDeadline)
+			lastFail = switchAt.Add(SwitchDeadline)
 			acts := m.Step(Event{Now: lastFail})
 			checkActions(t, acts, []Action{{Notify: true, SaveOwner: ptr(owners[i]), Log: "failed"}})
 			if !strings.Contains(acts[0].Log, "no SwitchExit within 1m0s (lost event or hung child)") {
@@ -556,7 +558,7 @@ func TestMachine(t *testing.T) {
 		acts := m.Step(Event{Now: t0.Add(2 * time.Second), ProbeExit: exit(nil)})
 		checkActions(t, acts, []Action{
 			{Log: "ignoring late ProbeExit"},
-			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+			{WakeAt: t0.Add(1*time.Second + SwitchDeadline)},
 		})
 		if acts[0].Switch || acts[0].Probe || acts[0].Notify || acts[0].SaveOwner != nil {
 			t.Fatalf("expected only log action, got %+v", acts[0])
@@ -578,7 +580,7 @@ func TestMachine(t *testing.T) {
 		acts = m.Step(Event{Now: confirmDeadline, ProbeExit: exit(nil)})
 		checkActions(t, acts, []Action{
 			{Switch: true, Log: "confirm elapsed; retry switch to \"mac\" attempt 2"},
-			{WakeAt: confirmDeadline.Add(switchDeadline)},
+			{WakeAt: confirmDeadline.Add(SwitchDeadline)},
 		})
 	})
 
@@ -591,7 +593,7 @@ func TestMachine(t *testing.T) {
 
 		acts := m.Step(Event{Now: t0.Add(2 * time.Second), State: mkstate("win2", 2, map[string]bool{"win2": true})})
 		checkActions(t, acts, []Action{
-			{WakeAt: t0.Add(1*time.Second + switchDeadline)},
+			{WakeAt: t0.Add(1*time.Second + SwitchDeadline)},
 		})
 		if m.latestState == nil || m.latestState.Owner != "win2" {
 			t.Fatalf("expected latestState stashed to win2, got %+v", m.latestState)
@@ -621,7 +623,7 @@ func TestMachine(t *testing.T) {
 			t.Fatalf("expected switch, got %+v", acts[0])
 		}
 		wake := acts[1]
-		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(t0.Add(1*time.Second+switchDeadline)) {
+		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(t0.Add(1*time.Second+SwitchDeadline)) {
 			t.Fatalf("expected wake at switch deadline, got %+v", wake)
 		}
 		if wake.Claim != "" || wake.Switch || wake.Probe || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
@@ -630,11 +632,11 @@ func TestMachine(t *testing.T) {
 
 		// A bare timer at the switch deadline fires the watchdog; the batch again
 		// ends with a standalone WakeAt.
-		watchdogTime := t0.Add(1*time.Second + switchDeadline)
+		watchdogTime := t0.Add(1*time.Second + SwitchDeadline)
 		acts = m.Step(Event{Now: watchdogTime})
 		requireActionCount(t, acts, 2)
 		wake = acts[1]
-		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(watchdogTime.Add(switchDeadline)) {
+		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(watchdogTime.Add(SwitchDeadline)) {
 			t.Fatalf("expected wake at next switch deadline, got %+v", wake)
 		}
 		if wake.Claim != "" || wake.Switch || wake.Probe || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
@@ -771,7 +773,7 @@ func ExampleMachine_Step() {
 
 	acts := m.Step(Event{
 		Now: t0,
-		State: &ServerState{
+		State: &state.ServerState{
 			Owner: "mac",
 			Live:  map[string]bool{"mac": true},
 		},

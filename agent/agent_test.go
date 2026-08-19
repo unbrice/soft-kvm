@@ -6,7 +6,7 @@
 // machine is real; the detector, guard, and runner are fakes; the server is
 // real under httptest.
 
-package main
+package agent
 
 import (
 	"context"
@@ -19,7 +19,16 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/unbrice/soft-kvm/client"
+	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/identity"
+	"github.com/unbrice/soft-kvm/model"
+	"github.com/unbrice/soft-kvm/server"
+	"github.com/unbrice/soft-kvm/state"
 )
+
+const testToken = "test-token-12345"
 
 func agentTestBase(t *testing.T, raw string) string {
 	t.Helper()
@@ -30,12 +39,33 @@ func agentTestBase(t *testing.T, raw string) string {
 	return u.Host
 }
 
-func newAgentTestServer(t *testing.T) (*Server, *httptest.Server) {
+func startTLSTestServer(t *testing.T, s *server.Server, token string) *httptest.Server {
+	t.Helper()
+	tlsCfg, err := identity.ServerTLSConfig(token)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(s.Handler())
+	srv.TLS = tlsCfg
+	srv.StartTLS()
+	return srv
+}
+
+func newAgentTestServer(t *testing.T) (*server.Server, *httptest.Server) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	s := NewServer(statePath, testToken)
-	s.waitTimeout = 200 * time.Millisecond
-	return s, startTLSTestServer(t, s)
+	s := server.NewServer(statePath, testToken)
+	s.SetWaitTimeout(200 * time.Millisecond)
+	return s, startTLSTestServer(t, s, testToken)
+}
+
+func newTestClient(t *testing.T, token string) *client.Client {
+	t.Helper()
+	c, err := client.NewClient(token)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return c
 }
 
 // fakeDetector lets tests inject attach edges. Run is not started until the
@@ -110,8 +140,8 @@ func (r *recordingRunner) Calls() [][]string {
 	return out
 }
 
-func agentMachineConfig(id string) *MachineConfig {
-	return &MachineConfig{
+func agentMachineConfig(id string) *model.MachineConfig {
+	return &model.MachineConfig{
 		ID:             id,
 		Settle:         50 * time.Millisecond,
 		Confirm:        50 * time.Millisecond,
@@ -124,31 +154,33 @@ func agentMachineConfig(id string) *MachineConfig {
 	}
 }
 
-func agentTestConfig(t *testing.T, base, statePath string, s *Server, det Detector, guard Guard, runner Runner) agentConfig {
+func agentTestConfig(t *testing.T, base, statePath string, s *server.Server, det Detector, guard Guard, runner Runner) Config {
 	t.Helper()
-	return agentConfig{
-		id:             "linux",
-		explicitServer: base,
-		detector:       det,
-		guard:          guard,
-		client:         newTestClient(t, testToken),
-		runner:         runner,
-		machine:        agentMachineConfig("linux"),
-		agentStatePath: statePath,
-		switchArgv:     []string{"switch", "cmd"},
-		checkArgv:      []string{"check", "cmd"},
-		notifyArgv:     []string{"notify", "cmd"},
-		checkTimeout:   1 * time.Second,
-		switchTimeout:  1 * time.Second,
-		guardPoll:      20 * time.Millisecond,
-		backoffBase:    10 * time.Millisecond,
+	return Config{
+		ID:             "linux",
+		ExplicitServer: base,
+		KeyFP:          identity.KeyFingerprint(testToken),
+		Detector:       det,
+		Guard:          guard,
+		Client:         newTestClient(t, testToken),
+		Runner:         runner,
+		Machine:        agentMachineConfig("linux"),
+		AgentStatePath: statePath,
+		SwitchArgv:     []string{"switch", "cmd"},
+		CheckArgv:      []string{"check", "cmd"},
+		NotifyArgv:     []string{"notify", "cmd"},
+		CheckTimeout:   1 * time.Second,
+		SwitchTimeout:  1 * time.Second,
+		GuardPoll:      20 * time.Millisecond,
+		BackoffBase:    10 * time.Millisecond,
+		Resolver:       discover.NewResolver(filepath.Join(t.TempDir(), "server")),
 	}
 }
 
-func runAgent(ctx context.Context, t *testing.T, ag *agent) {
+func runAgent(ctx context.Context, t *testing.T, cfg Config) {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- ag.run(ctx) }()
+	go func() { done <- Run(ctx, cfg) }()
 	t.Cleanup(func() {
 		<-ctx.Done()
 		select {
@@ -175,8 +207,7 @@ func TestAgentAttachClaims(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ag := &agent{cfg: cfg}
-	runAgent(ctx, t, ag)
+	runAgent(ctx, t, cfg)
 
 	waitForLive(t, s, "linux")
 	det.attach()
@@ -210,14 +241,12 @@ func TestAgentSwitchPath(t *testing.T) {
 	}
 
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := saveJSON(statePath, agentState{LastOwner: "linux"}); err != nil {
+	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
 		t.Fatalf("save agent state: %v", err)
 	}
 
 	// Make "other" appear live to the server so the agent will switch to it.
-	s.mu.Lock()
-	s.waiters["other"] = 1
-	s.mu.Unlock()
+	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
 	// Probe succeeds (veto passed), switch succeeds, confirm probe fails (landed).
@@ -227,8 +256,7 @@ func TestAgentSwitchPath(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ag := &agent{cfg: cfg}
-	runAgent(ctx, t, ag)
+	runAgent(ctx, t, cfg)
 
 	waitForLive(t, s, "linux")
 
@@ -249,18 +277,18 @@ func TestAgentSwitchPath(t *testing.T) {
 	}
 
 	calls := runner.Calls()
-	if !slices.Equal(calls[0], cfg.checkArgv) {
-		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.checkArgv)
+	if !slices.Equal(calls[0], cfg.CheckArgv) {
+		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
 	}
-	if !slices.Equal(calls[1], cfg.switchArgv) {
-		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.switchArgv)
+	if !slices.Equal(calls[1], cfg.SwitchArgv) {
+		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchArgv)
 	}
-	if !slices.Equal(calls[2], cfg.checkArgv) {
-		t.Errorf("call 2 = %v, want confirm probe %v", calls[2], cfg.checkArgv)
+	if !slices.Equal(calls[2], cfg.CheckArgv) {
+		t.Errorf("call 2 = %v, want confirm probe %v", calls[2], cfg.CheckArgv)
 	}
 
-	var as agentState
-	if err := loadJSON(statePath, &as); err != nil {
+	var as state.AgentState
+	if err := state.Load(statePath, &as); err != nil {
 		t.Fatalf("load agent state: %v", err)
 	}
 	if as.LastOwner != "other" {
@@ -279,13 +307,11 @@ func TestAgentVetoPath(t *testing.T) {
 	}
 
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := saveJSON(statePath, agentState{LastOwner: "linux"}); err != nil {
+	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
 		t.Fatalf("save agent state: %v", err)
 	}
 
-	s.mu.Lock()
-	s.waiters["other"] = 1
-	s.mu.Unlock()
+	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
 	// First probe fails the veto, so no switch runs.
@@ -295,8 +321,7 @@ func TestAgentVetoPath(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ag := &agent{cfg: cfg}
-	runAgent(ctx, t, ag)
+	runAgent(ctx, t, cfg)
 
 	waitForLive(t, s, "linux")
 
@@ -320,15 +345,15 @@ func TestAgentVetoPath(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 runner call, got %d: %v", len(calls), calls)
 	}
-	if !slices.Equal(calls[0], cfg.checkArgv) {
-		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.checkArgv)
+	if !slices.Equal(calls[0], cfg.CheckArgv) {
+		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
 	}
-	if slices.ContainsFunc(calls, func(argv []string) bool { return slices.Equal(argv, cfg.switchArgv) }) {
+	if slices.ContainsFunc(calls, func(argv []string) bool { return slices.Equal(argv, cfg.SwitchArgv) }) {
 		t.Error("switch command ran despite veto")
 	}
 
-	var as agentState
-	if err := loadJSON(statePath, &as); err != nil {
+	var as state.AgentState
+	if err := state.Load(statePath, &as); err != nil {
 		t.Fatalf("load agent state: %v", err)
 	}
 	if as.LastOwner != "other" {
@@ -347,7 +372,7 @@ func TestAgentGuardsDown(t *testing.T) {
 	}
 
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := saveJSON(statePath, agentState{LastOwner: "linux"}); err != nil {
+	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
 		t.Fatalf("save agent state: %v", err)
 	}
 
@@ -358,14 +383,13 @@ func TestAgentGuardsDown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ag := &agent{cfg: cfg}
-	runAgent(ctx, t, ag)
+	runAgent(ctx, t, cfg)
 
 	// This asserts an absence (no decisions while dormant); it cannot be
 	// event-driven. Sleep a small multiple of the injected guard poll.
-	time.Sleep(5 * cfg.guardPoll)
+	time.Sleep(5 * cfg.GuardPoll)
 	det.attach()
-	time.Sleep(5 * cfg.guardPoll)
+	time.Sleep(5 * cfg.GuardPoll)
 
 	if det.runCalled.Load() {
 		t.Error("detector started while guards were down")
@@ -373,9 +397,9 @@ func TestAgentGuardsDown(t *testing.T) {
 	if len(runner.Calls()) != 0 {
 		t.Errorf("expected zero runner calls, got %v", runner.Calls())
 	}
-	state := s.currentState()
-	if state.Owner != "other" {
-		t.Errorf("server owner changed to %q while guards down", state.Owner)
+	st := s.CurrentState()
+	if st.Owner != "other" {
+		t.Errorf("server owner changed to %q while guards down", st.Owner)
 	}
 }
 
@@ -391,25 +415,22 @@ func TestAgentSwitchTimeout(t *testing.T) {
 	}
 
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := saveJSON(statePath, agentState{LastOwner: "linux"}); err != nil {
+	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
 		t.Fatalf("save agent state: %v", err)
 	}
 
 	// Make "other" appear live so the agent will try to switch to it.
-	s.mu.Lock()
-	s.waiters["other"] = 1
-	s.mu.Unlock()
+	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
 	runner := newHungSwitchRunner()
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.switchTimeout = 50 * time.Millisecond
+	cfg.SwitchTimeout = 50 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ag := &agent{cfg: cfg}
-	runAgent(ctx, t, ag)
+	runAgent(ctx, t, cfg)
 
 	waitForLive(t, s, "linux")
 
@@ -444,13 +465,13 @@ func TestAgentSwitchTimeout(t *testing.T) {
 }
 
 func TestTimingOrdering(t *testing.T) {
-	if defaultWaitTimeout >= waitClientTimeout || waitClientTimeout >= waitTimeout {
+	if server.DefaultWaitTimeout >= client.WaitClientTimeout || client.WaitClientTimeout >= waitTimeout {
 		t.Fatalf("wait timeouts out of order: server=%v client=%v agent=%v",
-			defaultWaitTimeout, waitClientTimeout, waitTimeout)
+			server.DefaultWaitTimeout, client.WaitClientTimeout, waitTimeout)
 	}
-	if defaultSwitchTimeout >= switchDeadline {
+	if DefaultSwitchTimeout >= model.SwitchDeadline {
 		t.Fatalf("switch timeout %v must be below switch deadline %v",
-			defaultSwitchTimeout, switchDeadline)
+			DefaultSwitchTimeout, model.SwitchDeadline)
 	}
 }
 
@@ -525,4 +546,19 @@ func (r *hungSwitchRunner) firstCtxCanceled() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.firstCtxCanceled_
+}
+
+func waitForLive(t *testing.T, s *server.Server, id string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		st := s.CurrentState()
+		if st.Live[id] {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter %q never registered", id)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

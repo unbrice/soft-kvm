@@ -4,7 +4,7 @@
 
 // server.go: the coordinator HTTP service (SPEC §6.4, §7, §11.1).
 
-package main
+package server
 
 import (
 	"context"
@@ -21,13 +21,16 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/unbrice/soft-kvm/identity"
+	"github.com/unbrice/soft-kvm/state"
 )
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-// defaultWaitTimeout is how long /wait blocks before returning 204. It must be
+// DefaultWaitTimeout is how long /wait blocks before returning 204. It must be
 // smaller than the client's internal /wait timeout.
-const defaultWaitTimeout = 50 * time.Second
+const DefaultWaitTimeout = 50 * time.Second
 
 // Server carries the display bit and serves the /claim /state /wait API.
 type Server struct {
@@ -47,10 +50,10 @@ type Server struct {
 // a fresh server (owner="", epoch=0); a corrupt one logs a warning and starts
 // fresh the same way (SPEC §6.4).
 func NewServer(statePath, token string) *Server {
-	var persisted ownerState
-	if err := loadJSON(statePath, &persisted); err != nil {
+	var persisted state.OwnerState
+	if err := state.Load(statePath, &persisted); err != nil {
 		slog.Warn("corrupt state file, starting fresh", "path", statePath, "error", err)
-		persisted = ownerState{}
+		persisted = state.OwnerState{}
 	}
 
 	s := &Server{
@@ -62,9 +65,36 @@ func NewServer(statePath, token string) *Server {
 		serverID:    newUUID(),
 		waiters:     make(map[string]int),
 		broadcast:   make(chan struct{}),
-		waitTimeout: defaultWaitTimeout,
+		waitTimeout: DefaultWaitTimeout,
 	}
 	return s
+}
+
+// SetWaitTimeout configures the long-poll timeout. Exported for tests.
+func (s *Server) SetWaitTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waitTimeout = d
+}
+
+// SetWaiterCount is a test hook that makes id appear live with the given
+// waiter count.
+func (s *Server) SetWaiterCount(id string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n <= 0 {
+		delete(s.waiters, id)
+		return
+	}
+	s.waiters[id] = n
+}
+
+// WaiterCount returns the number of registered waiters for id. Exported for
+// tests.
+func (s *Server) WaiterCount(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.waiters[id]
 }
 
 // newUUID returns a random UUIDv4 as a hyphenated hex string.
@@ -111,7 +141,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
 			slog.Info("rejected request", "path", r.URL.Path, "remote", r.RemoteAddr, "reason", "bad token")
 			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid token"})
+			maybeWriteJSON(w, map[string]string{"error": "invalid token"})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -123,7 +153,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validID.MatchString(id) {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid id"})
+		maybeWriteJSON(w, map[string]string{"error": "invalid id"})
 		return
 	}
 
@@ -131,7 +161,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	if id == s.owner {
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		maybeWriteJSON(w, map[string]any{
 			"owner":   s.owner,
 			"epoch":   s.epoch,
 			"changed": false,
@@ -142,7 +172,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force")
 	if s.waiters[id] == 0 && force != "true" && force != "1" {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("no live agent for %s", id)})
+		maybeWriteJSON(w, map[string]string{"error": fmt.Sprintf("no live agent for %s", id)})
 		return
 	}
 
@@ -150,14 +180,14 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	s.owner = id
 	s.epoch++
 	s.since = time.Now().UTC()
-	if err := saveJSON(s.statePath, ownerState{Owner: s.owner, Epoch: s.epoch, Since: s.since}); err != nil {
+	if err := state.Save(s.statePath, state.OwnerState{Owner: s.owner, Epoch: s.epoch, Since: s.since}); err != nil {
 		// Persist failure is logged but does not block the in-memory bit.
 		slog.Error("failed to persist state", "path", s.statePath, "error", err)
 	}
 	slog.Info("owner changed", "from", old, "to", s.owner, "epoch", s.epoch)
 	s.wake()
 
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	maybeWriteJSON(w, map[string]any{
 		"owner":   s.owner,
 		"epoch":   s.epoch,
 		"changed": true,
@@ -166,12 +196,12 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 
 // handleState implements GET /state (SPEC §7).
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	state := s.currentState()
-	_ = json.NewEncoder(w).Encode(state)
+	st := s.CurrentState()
+	maybeWriteJSON(w, st)
 }
 
-// currentState returns a snapshot of ServerState; caller must not mutate it.
-func (s *Server) currentState() ServerState {
+// CurrentState returns a snapshot of ServerState; caller must not mutate it.
+func (s *Server) CurrentState() state.ServerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -183,7 +213,7 @@ func (s *Server) currentState() ServerState {
 		}
 	}
 
-	return ServerState{
+	return state.ServerState{
 		Owner:    s.owner,
 		Epoch:    s.epoch,
 		Since:    s.since,
@@ -199,21 +229,21 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	if epochStr == "" || id == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing epoch or id"})
+		maybeWriteJSON(w, map[string]string{"error": "missing epoch or id"})
 		return
 	}
 	epoch, err := strconv.ParseInt(epochStr, 10, 64)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid epoch"})
+		maybeWriteJSON(w, map[string]string{"error": "invalid epoch"})
 		return
 	}
 
 	s.mu.Lock()
 	if epoch != s.epoch {
-		state := s.serverStateLocked()
+		st := s.serverStateLocked()
 		s.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]any{"owner": state.Owner, "epoch": state.Epoch})
+		maybeWriteJSON(w, map[string]any{"owner": st.Owner, "epoch": st.Epoch})
 		return
 	}
 
@@ -238,13 +268,13 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	timeout := s.waitTimeout
 	if timeout <= 0 {
-		timeout = defaultWaitTimeout
+		timeout = DefaultWaitTimeout
 	}
 
 	select {
 	case <-bc:
-		state := s.currentState()
-		_ = json.NewEncoder(w).Encode(map[string]any{"owner": state.Owner, "epoch": state.Epoch})
+		st := s.CurrentState()
+		maybeWriteJSON(w, map[string]any{"owner": st.Owner, "epoch": st.Epoch})
 	case <-time.After(timeout):
 		w.WriteHeader(http.StatusNoContent)
 	case <-r.Context().Done():
@@ -252,7 +282,7 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 }
 
 // serverStateLocked returns the ServerState snapshot while s.mu is held.
-func (s *Server) serverStateLocked() ServerState {
+func (s *Server) serverStateLocked() state.ServerState {
 	live := make(map[string]bool, len(s.waiters)+1)
 	live[s.owner] = false
 	for id, n := range s.waiters {
@@ -260,7 +290,7 @@ func (s *Server) serverStateLocked() ServerState {
 			live[id] = true
 		}
 	}
-	return ServerState{
+	return state.ServerState{
 		Owner:    s.owner,
 		Epoch:    s.epoch,
 		Since:    s.since,
@@ -288,7 +318,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // releases all /wait long-polls and Shutdown returns in ms (SPEC §11.1).
 // Returns nil on ctx cancellation.
 func (s *Server) Run(ctx context.Context, addr string) error {
-	tlsCfg, err := serverTLSConfig(s.token)
+	tlsCfg, err := identity.ServerTLSConfig(s.token)
 	if err != nil {
 		return fmt.Errorf("derive TLS identity: %w", err)
 	}
@@ -322,4 +352,15 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// maybeWriteJSON encodes v to w. A marshal error is a programming bug —
+// every payload here is a JSON-safe value — so it panics. A write error means
+// the client is already gone and is ignored.
+func maybeWriteJSON(w http.ResponseWriter, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	_, _ = w.Write(data)
 }

@@ -5,7 +5,7 @@
 // discover.go: mDNS advertise/browse and server address resolution (SPEC §5.1,
 // §8).
 
-package main
+package discover
 
 import (
 	"context"
@@ -22,11 +22,11 @@ import (
 	"github.com/grandcat/zeroconf"
 )
 
-// advertise registers the server under _soft-kvm._tcp.local. with instance
+// Advertise registers the server under _soft-kvm._tcp.local. with instance
 // name `instance` on `port`. The TXT record carries the protocol version, the
 // instance id and the key fingerprint — NEVER the token, it is broadcast to
 // the whole LAN (SPEC §5.1). The returned func deregisters.
-func advertise(instance string, port int, fp string) (stop func(), err error) {
+func Advertise(instance string, port int, fp string) (stop func(), err error) {
 	txt := []string{"proto=1", "id=" + instance, "kh=" + fp}
 	srv, err := zeroconf.Register(instance, "_soft-kvm._tcp", "local.", port, txt, nil)
 	if err != nil {
@@ -47,7 +47,7 @@ func advertise(instance string, port int, fp string) (stop func(), err error) {
 // channel across Browse calls races into close-of-closed-channel panics
 // (#118, #113), so every round builds both fresh; and the mainloop drops an
 // entry whose first response carries no A/AAAA record (#124), which the retry
-// loop in resolveServer absorbs.
+// loop in Resolver.Resolve absorbs.
 func browseRound(ctx context.Context, wantFP string, yield func(string) bool) error {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
@@ -124,8 +124,18 @@ func rankAddrs(entry *zeroconf.ServiceEntry) []net.IP {
 	return ranked
 }
 
-// resolveServer implements the SPEC §5.1 resolution order: explicit
-// (--server flag) → SOFTKVM_SERVER env → cached address → mDNS browse. It
+// Resolver resolves server addresses, caching the last working one.
+type Resolver struct {
+	cachePath string
+}
+
+// NewResolver returns a Resolver that reads and writes its cache at cachePath.
+func NewResolver(cachePath string) *Resolver {
+	return &Resolver{cachePath: cachePath}
+}
+
+// Resolve implements the SPEC §5.1 resolution order: explicit
+// override → SOFTKVM_SERVER env → cached address → mDNS browse. It
 // streams "host:port" candidates instead of resolving to one: the caller
 // tries each with the real TLS-verified request until one connects. Explicit
 // and env yield once; the cached address yields first, then resolution falls
@@ -134,7 +144,7 @@ func rankAddrs(entry *zeroconf.ServiceEntry) []net.IP {
 // rounds with exponential backoff capped at 60 s, until ctx is cancelled.
 // wantFP filters mDNS entries by their kh= fingerprint; empty disables the
 // check.
-func resolveServer(ctx context.Context, explicit, wantFP string) iter.Seq[string] {
+func (r *Resolver) Resolve(ctx context.Context, explicit, wantFP string) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		if explicit != "" {
 			yield(explicit)
@@ -144,7 +154,7 @@ func resolveServer(ctx context.Context, explicit, wantFP string) iter.Seq[string
 			yield(addr)
 			return
 		}
-		if addr := loadCachedServer(); addr != "" {
+		if addr := r.load(); addr != "" {
 			if !yield(addr) {
 				return
 			}
@@ -189,27 +199,26 @@ func resolveServer(ctx context.Context, explicit, wantFP string) iter.Seq[string
 	}
 }
 
-// loadCachedServer reads the last successfully used server address from
-// stateDir()/server. Any problem (missing file, bad permissions, etc.) returns
-// "" so resolution falls through to mDNS (SPEC §5.1).
-func loadCachedServer() string {
-	data, err := os.ReadFile(filepath.Join(stateDir(), "server"))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-// saveCachedServer writes "host:port\n" to stateDir()/server. It is best-effort:
-// failures are logged but never fatal.
-func saveCachedServer(addr string) {
-	dir := stateDir()
+// Save writes "host:port\n" to the cache path. It is best-effort: failures are
+// logged but never fatal.
+func (r *Resolver) Save(addr string) {
+	dir := filepath.Dir(r.cachePath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		slog.Error("failed to create state directory", "dir", dir, "error", err)
 		return
 	}
-	path := filepath.Join(dir, "server")
-	if err := os.WriteFile(path, []byte(addr+"\n"), 0o600); err != nil {
-		slog.Error("failed to cache server address", "path", path, "error", err)
+	if err := os.WriteFile(r.cachePath, []byte(addr+"\n"), 0o600); err != nil {
+		slog.Error("failed to cache server address", "path", r.cachePath, "error", err)
 	}
+}
+
+// load reads the last successfully used server address from the cache path.
+// Any problem (missing file, bad permissions, etc.) returns "" so resolution
+// falls through to mDNS (SPEC §5.1).
+func (r *Resolver) load() string {
+	data, err := os.ReadFile(r.cachePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

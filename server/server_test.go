@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-package main
+package server_test
 
 import (
 	"context"
@@ -16,15 +16,18 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unbrice/soft-kvm/server"
+	"github.com/unbrice/soft-kvm/state"
 )
 
 const testToken = "test-token-12345"
 
-func testServer(t *testing.T) (*Server, *httptest.Server) {
+func testServer(t *testing.T) (*server.Server, *httptest.Server) {
 	t.Helper()
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	s := NewServer(statePath, testToken)
-	s.waitTimeout = 200 * time.Millisecond
+	s := server.NewServer(statePath, testToken)
+	s.SetWaitTimeout(200 * time.Millisecond)
 	return s, httptest.NewServer(s.Handler())
 }
 
@@ -61,12 +64,12 @@ func readJSON(t *testing.T, resp *http.Response, v any) {
 	}
 }
 
-func waitForLive(t *testing.T, s *Server, id string) {
+func waitForLive(t *testing.T, s *server.Server, id string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
-		state := s.currentState()
-		if state.Live[id] {
+		st := s.CurrentState()
+		if st.Live[id] {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -76,13 +79,11 @@ func waitForLive(t *testing.T, s *Server, id string) {
 	}
 }
 
-func waitForWaiters(t *testing.T, s *Server, id string, want int) {
+func waitForWaiters(t *testing.T, s *server.Server, id string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
-		s.mu.Lock()
-		n := s.waiters[id]
-		s.mu.Unlock()
+		n := s.WaiterCount(id)
 		if n >= want {
 			return
 		}
@@ -94,7 +95,10 @@ func waitForWaiters(t *testing.T, s *Server, id string, want int) {
 }
 
 func TestServerClaimPersists(t *testing.T) {
-	s, srv := testServer(t)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s := server.NewServer(statePath, testToken)
+	s.SetWaitTimeout(200 * time.Millisecond)
+	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
 	// The server only accepts a claim for a live id (or with force=true).
@@ -118,10 +122,10 @@ func TestServerClaimPersists(t *testing.T) {
 	_ = wake.Body.Close()
 
 	// A new server on the same state path reloads the persisted owner/epoch.
-	s2 := NewServer(s.statePath, testToken)
-	state := s2.currentState()
-	if state.Owner != "mac" || state.Epoch != 1 {
-		t.Fatalf("reloaded state mismatch: %+v", state)
+	s2 := server.NewServer(statePath, testToken)
+	st := s2.CurrentState()
+	if st.Owner != "mac" || st.Epoch != 1 {
+		t.Fatalf("reloaded state mismatch: %+v", st)
 	}
 }
 
@@ -228,12 +232,12 @@ func TestServerStateLive(t *testing.T) {
 	defer srv.Close()
 
 	// No waiters yet; live map contains only the owner key.
-	state := s.currentState()
-	if state.Live == nil {
+	st := s.CurrentState()
+	if st.Live == nil {
 		t.Fatal("live map is nil")
 	}
-	if _, ok := state.Live[state.Owner]; !ok {
-		t.Fatalf("owner key missing from live map: %+v", state.Live)
+	if _, ok := st.Live[st.Owner]; !ok {
+		t.Fatalf("owner key missing from live map: %+v", st.Live)
 	}
 
 	// Open a wait connection and wait for it to register.
@@ -244,8 +248,8 @@ func TestServerStateLive(t *testing.T) {
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
-		state = s.currentState()
-		if state.Live["mac"] {
+		st = s.CurrentState()
+		if st.Live["mac"] {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -265,12 +269,12 @@ func TestServerStateLive(t *testing.T) {
 	// After the waiter exits, mac is no longer live.
 	deadline = time.Now().Add(time.Second)
 	for {
-		state = s.currentState()
-		if !state.Live["mac"] {
+		st = s.CurrentState()
+		if !st.Live["mac"] {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("mac still live after wait closed: %+v", state.Live)
+			t.Fatalf("mac still live after wait closed: %+v", st.Live)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -353,12 +357,12 @@ func TestServerEpochBackwards(t *testing.T) {
 	statePath := filepath.Join(dir, "state.json")
 
 	// Seed epoch 10.
-	if err := saveJSON(statePath, ownerState{Owner: "mac", Epoch: 10, Since: time.Now().UTC()}); err != nil {
+	if err := state.Save(statePath, state.OwnerState{Owner: "mac", Epoch: 10, Since: time.Now().UTC()}); err != nil {
 		t.Fatalf("seed state: %v", err)
 	}
 
-	s1 := NewServer(statePath, testToken)
-	s1.waitTimeout = 200 * time.Millisecond
+	s1 := server.NewServer(statePath, testToken)
+	s1.SetWaitTimeout(200 * time.Millisecond)
 	srv1 := httptest.NewServer(s1.Handler())
 	defer srv1.Close()
 
@@ -371,13 +375,13 @@ func TestServerEpochBackwards(t *testing.T) {
 	}
 
 	// Rewind the file to epoch 3; the server serves what it loaded.
-	if err := saveJSON(statePath, ownerState{Owner: "mac", Epoch: 3, Since: time.Now().UTC()}); err != nil {
+	if err := state.Save(statePath, state.OwnerState{Owner: "mac", Epoch: 3, Since: time.Now().UTC()}); err != nil {
 		t.Fatalf("rewind state: %v", err)
 	}
-	s2 := NewServer(statePath, testToken)
-	state := s2.currentState()
-	if state.Epoch != 3 {
-		t.Fatalf("expected reloaded epoch 3, got %d", state.Epoch)
+	s2 := server.NewServer(statePath, testToken)
+	st := s2.CurrentState()
+	if st.Epoch != 3 {
+		t.Fatalf("expected reloaded epoch 3, got %d", st.Epoch)
 	}
 }
 
@@ -388,10 +392,10 @@ func TestServerCorruptState(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	s := NewServer(statePath, testToken)
-	state := s.currentState()
-	if state.Owner != "" || state.Epoch != 0 {
-		t.Fatalf("corrupt state did not start fresh: %+v", state)
+	s := server.NewServer(statePath, testToken)
+	st := s.CurrentState()
+	if st.Owner != "" || st.Epoch != 0 {
+		t.Fatalf("corrupt state did not start fresh: %+v", st)
 	}
 }
 
@@ -402,8 +406,8 @@ func TestServerRunShutdown(t *testing.T) {
 	// Run on an ephemeral port and cancel the context; Shutdown should complete
 	// quickly because BaseContext ties request contexts to ctx.
 	ctx, cancel := context.WithCancel(context.Background())
-	s := NewServer(filepath.Join(t.TempDir(), "state.json"), testToken)
-	s.waitTimeout = 200 * time.Millisecond
+	s := server.NewServer(filepath.Join(t.TempDir(), "state.json"), testToken)
+	s.SetWaitTimeout(200 * time.Millisecond)
 
 	done := make(chan error, 1)
 	go func() {

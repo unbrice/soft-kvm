@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-package main
+package discover
 
 import (
 	"context"
@@ -10,36 +10,27 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/grandcat/zeroconf"
+	"github.com/unbrice/soft-kvm/identity"
 )
 
 func TestCacheRoundTrip(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("stateDir env override is only verified on Linux")
-	}
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
 	const addr = "127.0.0.1:8700"
-	saveCachedServer(addr)
-	if got := loadCachedServer(); got != addr {
-		t.Fatalf("loadCachedServer returned %q, want %q", got, addr)
+	r.Save(addr)
+	if got := r.load(); got != addr {
+		t.Fatalf("load returned %q, want %q", got, addr)
 	}
 }
 
 func TestCacheMissing(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("stateDir env override is only verified on Linux")
-	}
-	dir := t.TempDir()
-	// Point at an empty directory so the cache file is missing.
-	t.Setenv("XDG_STATE_HOME", dir)
-	if got := loadCachedServer(); got != "" {
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
+	if got := r.load(); got != "" {
 		t.Fatalf("missing cache returned %q, want empty", got)
 	}
 }
@@ -55,7 +46,7 @@ func TestMDNSRoundTrip(t *testing.T) {
 
 	const instance = "test-instance"
 	const token = "round-trip-token"
-	stop, err := advertise(instance, port, keyFingerprint(token))
+	stop, err := Advertise(instance, port, identity.KeyFingerprint(token))
 	if err != nil {
 		t.Fatalf("advertise: %v", err)
 	}
@@ -87,7 +78,7 @@ func TestMDNSRoundTrip(t *testing.T) {
 		if entry.Port != port {
 			t.Errorf("port %d, want %d", entry.Port, port)
 		}
-		wantTXT := []string{"proto=1", "id=" + instance, "kh=" + keyFingerprint(token)}
+		wantTXT := []string{"proto=1", "id=" + instance, "kh=" + identity.KeyFingerprint(token)}
 		for _, w := range wantTXT {
 			found := false
 			for _, txt := range entry.Text {
@@ -169,7 +160,7 @@ func TestBrowseSkipsForeignToken(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	stop, err := advertise("test-instance", port, keyFingerprint("token-a"))
+	stop, err := Advertise("test-instance", port, identity.KeyFingerprint("token-a"))
 	if err != nil {
 		t.Fatalf("advertise: %v", err)
 	}
@@ -180,7 +171,7 @@ func TestBrowseSkipsForeignToken(t *testing.T) {
 	// nothing, multicast loopback is unavailable and the test proves nothing.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	found := false
-	_ = browseRound(ctx, keyFingerprint("token-a"), func(string) bool {
+	_ = browseRound(ctx, identity.KeyFingerprint("token-a"), func(string) bool {
 		found = true
 		return false
 	})
@@ -192,7 +183,7 @@ func TestBrowseSkipsForeignToken(t *testing.T) {
 	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	found = false
-	_ = browseRound(ctx, keyFingerprint("token-b"), func(string) bool {
+	_ = browseRound(ctx, identity.KeyFingerprint("token-b"), func(string) bool {
 		found = true
 		return false
 	})
@@ -214,7 +205,8 @@ func TestResolveServerExplicit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	got := collect(resolveServer(ctx, "explicit.example:1234", ""))
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
+	got := collect(r.Resolve(ctx, "explicit.example:1234", ""))
 	if len(got) != 1 || got[0] != "explicit.example:1234" {
 		t.Fatalf("got %v, want [explicit.example:1234]", got)
 	}
@@ -225,20 +217,18 @@ func TestResolveServerEnv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	got := collect(resolveServer(ctx, "", ""))
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
+	got := collect(r.Resolve(ctx, "", ""))
 	if len(got) != 1 || got[0] != "env.example:5678" {
 		t.Fatalf("got %v, want [env.example:5678]", got)
 	}
 }
 
 func TestResolveServerCacheFallsThrough(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("stateDir env override is only verified on Linux")
-	}
 	t.Setenv("SOFTKVM_SERVER", "")
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
 	const cached = "cached.example:9999"
-	saveCachedServer(cached)
+	r.Save(cached)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
 	defer cancel()
@@ -247,7 +237,7 @@ func TestResolveServerCacheFallsThrough(t *testing.T) {
 	// A fingerprint nothing on the LAN advertises, so the mDNS phase yields
 	// nothing: the cached candidate comes first, then the sequence only ends
 	// with ctx — proving the cache fell through to mDNS instead of returning.
-	got := collect(resolveServer(ctx, "", keyFingerprint("no-such-token")))
+	got := collect(r.Resolve(ctx, "", identity.KeyFingerprint("no-such-token")))
 	elapsed := time.Since(start)
 	if len(got) != 1 || got[0] != cached {
 		t.Fatalf("got %v, want [%s]", got, cached)
@@ -258,20 +248,16 @@ func TestResolveServerCacheFallsThrough(t *testing.T) {
 }
 
 func TestResolveServerBrowseUntilCancelled(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("stateDir env override is only verified on Linux")
-	}
 	// Ensure none of the higher-priority sources are set.
 	t.Setenv("SOFTKVM_SERVER", "")
-	dir := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", dir)
-	_ = os.Remove(filepath.Join(stateDir(), "server"))
+	r := NewResolver(filepath.Join(t.TempDir(), "server"))
+	_ = os.Remove(r.cachePath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	got := collect(resolveServer(ctx, "", keyFingerprint("no-such-token")))
+	got := collect(r.Resolve(ctx, "", identity.KeyFingerprint("no-such-token")))
 	elapsed := time.Since(start)
 	if len(got) != 0 {
 		t.Fatalf("expected no candidates, got %v", got)

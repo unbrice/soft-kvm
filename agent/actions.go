@@ -4,13 +4,15 @@
 
 // actions.go: the action worker (SPEC §4.3, §11.1).
 
-package main
+package agent
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/unbrice/soft-kvm/model"
 )
 
 // errSwitchTimeout names the class of failure where --switch-timeout kills a
@@ -48,7 +50,7 @@ func (a *agent) runEffect(ctx context.Context, e effect) {
 	switch e {
 	case effectSwitch:
 		sctx, cancel := context.WithTimeout(ctx, a.cfg.switchTimeoutOrDefault())
-		err := a.cfg.runner(sctx, a.cfg.switchArgv)
+		err := a.cfg.Runner(sctx, a.cfg.SwitchArgv)
 		cancel()
 		if errors.Is(sctx.Err(), context.DeadlineExceeded) {
 			if err == nil {
@@ -58,19 +60,19 @@ func (a *agent) runEffect(ctx context.Context, e effect) {
 			}
 		}
 		select {
-		case a.results <- Event{SwitchExit: &err}:
+		case a.results <- model.Event{SwitchExit: &err}:
 		case <-ctx.Done():
 		}
 	case effectProbe:
-		pctx, cancel := context.WithTimeout(ctx, a.cfg.checkTimeout)
-		err := a.cfg.runner(pctx, a.cfg.checkArgv)
+		pctx, cancel := context.WithTimeout(ctx, a.cfg.CheckTimeout)
+		err := a.cfg.Runner(pctx, a.cfg.CheckArgv)
 		cancel()
 		select {
-		case a.results <- Event{ProbeExit: &err}:
+		case a.results <- model.Event{ProbeExit: &err}:
 		case <-ctx.Done():
 		}
 	case effectNotify:
-		if err := a.cfg.runner(ctx, a.cfg.notifyArgv); err != nil {
+		if err := a.cfg.Runner(ctx, a.cfg.NotifyArgv); err != nil {
 			slog.Error("notify command failed", "error", err)
 		}
 	}

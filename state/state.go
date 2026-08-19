@@ -4,7 +4,7 @@
 
 // state.go: the /state wire type and atomic JSON persistence (SPEC §6.4, §7).
 
-package main
+package state
 
 import (
 	"encoding/json"
@@ -26,23 +26,23 @@ type ServerState struct {
 	ServerID string          `json:"server_id"`
 }
 
-// ownerState is the persisted subset of ServerState (SPEC §5.2 --state).
-type ownerState struct {
+// OwnerState is the persisted subset of ServerState (SPEC §5.2 --state).
+type OwnerState struct {
 	Owner string    `json:"owner"`
 	Epoch int64     `json:"epoch"`
 	Since time.Time `json:"since"`
 }
 
-// agentState is the agent's persisted record (SPEC §4.3 agent.json).
-type agentState struct {
+// AgentState is the agent's persisted record (SPEC §4.3 agent.json).
+type AgentState struct {
 	LastOwner string `json:"last_owner"`
 }
 
-// loadJSON reads path into v. A missing file is not an error: v is left
+// Load reads path into v. A missing file is not an error: v is left
 // untouched (fresh install). On any other error the caller must discard v
 // (it may be partially decoded) and start from the zero value (SPEC §6.4:
 // a truncated state file after a power cut must not crash-loop the service).
-func loadJSON(path string, v any) error {
+func Load(path string, v any) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -53,9 +53,9 @@ func loadJSON(path string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-// saveJSON writes v to path atomically: temp file in the same directory,
+// Save writes v to path atomically: temp file in the same directory,
 // fsync, rename (SPEC §6.4).
-func saveJSON(path string, v any) error {
+func Save(path string, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err

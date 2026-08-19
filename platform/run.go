@@ -5,7 +5,7 @@
 // run.go: the argv runner (SPEC §11.2) and the §11.1 child-process
 // conventions.
 
-package main
+package platform
 
 import (
 	"bytes"
@@ -19,17 +19,10 @@ import (
 	"time"
 )
 
-// Runner executes one argv slice and reports the exit status: nil on exit 0,
-// an error wrapping *exec.ExitError otherwise. It is a func type, not an
-// interface: there is one implementation, and the seam the tests fake is the
-// runner itself (SPEC §11.2). Child output is captured and attached to the
-// error, never streamed.
-type Runner func(ctx context.Context, argv []string) error
-
-// commandContext builds a *exec.Cmd with the §11.1 conventions: cancel sends
+// CommandContext builds a *exec.Cmd with the §11.1 conventions: cancel sends
 // SIGTERM first (a SIGKILL mid-I2C transaction is the fallback, not the first
 // move), and WaitDelay bounds how long SIGKILL is withheld.
-func commandContext(ctx context.Context, argv []string) *exec.Cmd {
+func CommandContext(ctx context.Context, argv []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Cancel = func() error {
 		err := cmd.Process.Signal(syscall.SIGTERM)
@@ -42,12 +35,14 @@ func commandContext(ctx context.Context, argv []string) *exec.Cmd {
 	return cmd
 }
 
-// run is the real Runner.
-func run(ctx context.Context, argv []string) error {
+// Run executes one argv slice and reports the exit status: nil on exit 0,
+// an error wrapping *exec.ExitError otherwise. Child output is captured and
+// attached to the error, never streamed.
+func Run(ctx context.Context, argv []string) error {
 	if len(argv) == 0 {
 		return errors.New("empty argv")
 	}
-	cmd := commandContext(ctx, argv)
+	cmd := CommandContext(ctx, argv)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -60,9 +55,9 @@ func run(ctx context.Context, argv []string) error {
 	return nil
 }
 
-// shellArgv wraps a --check-cmd / --notify-cmd flag string for `sh -c` — those
-// defaults carry shell quoting, so they go through a shell. The trailing
+// ShellArgv wraps a --check-cmd / --notify-cmd flag string for `sh -c` — those
+// defaults carry shell quoting, so they run through a shell. The trailing
 // SWITCH-CMD is the opposite: an argv slice, never a shell string (SPEC §9).
-func shellArgv(cmdline string) []string {
+func ShellArgv(cmdline string) []string {
 	return []string{"sh", "-c", cmdline}
 }

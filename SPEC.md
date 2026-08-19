@@ -604,16 +604,21 @@ trailing switch command is read as an unknown flag unless interspersal is turned
 off. Stdlib `flag` stops at the first non-flag argument and hands the rest to
 `Args()` — which *is* the `-- SWITCH-CMD ARGS...` convention, for free.
 
-**One package.** Everything in `main`, one file per concern: `main.go`
-(dispatch, flag sets), `machine.go` + `machine_test.go` (§11.3), `agent.go`
-(supervisor, generations, decision loop, claims; the `Detector` and `Guard`
-interfaces), `watcher.go` (resolve, backoff, and one-session `/wait` poll),
-`actions.go` (the action worker), `server.go`, `state.go` (atomic JSON),
-`discover.go` (mDNS advertise, browse, address cache), `run.go` (the argv runner
-and the per-OS defaults), `detect_hid.go` (the agent's attach detector),
-`detect.go` (the `detect` subcommand: enumeration and `--trigger` suggestions),
-`guard_darwin.go`. Build tags in filenames, not in `//go:build` lines, wherever
-the split is per-OS. Around 2000 lines total does not need `internal/`.
+**Package layout.** One module, one binary, nine packages under the root `main`:
+`state` (the `/state` wire type and atomic JSON persistence), `model` (§11.3),
+`identity` (TLS identity and `kh=` fingerprint from the shared secret),
+`discover` (mDNS advertise/browse; the address cache sits behind a `Resolver`
+whose cache path is injected), `platform` (the argv runner, the per-OS defaults,
+and the per-OS `Guard` — a concrete type: no-op on Linux, pmset+display on
+macOS), `detect` (HID enumeration for the subcommand and the attach detector
+both OSes share), `client`, `server`, and `agent` (supervisor, generations,
+decision loop, claims; the `Detector`, `Guard` and `Runner` seams live here, in
+their only consumer). `main` keeps flag parsing and wiring. Layering is a DAG:
+the leaves (`state`, `identity`, `discover`, `platform`, `detect`) import
+nothing internal; `model` imports `state`; `client` and `server` import `state`
+and `identity`; `agent` imports `model`, `state`, `client` and `discover`. Build
+tags in filenames, not in `//go:build` lines, wherever the split is per-OS
+(`platform`).
 
 **Logging is `log/slog`** to stderr, text handler — journald on Linux, the
 LaunchAgent log file on macOS. Every switch decision logs at Info with the
@@ -627,9 +632,9 @@ struct field. Three blocking things do not respect it by default:
 
 - **The HID watcher.** Its event loop lives on a library goroutine (a locked OS
   thread running a CFRunLoop on macOS, a netlink poll on Linux), which ctx
-  cancellation cannot reach. `detect_hid.go` defers `Watcher.Close()`, which
-  stops that loop from outside; on macOS the shutdown latency is bounded by the
-  run loop's 1 s wakeup.
+  cancellation cannot reach. `detect/detect_hid.go` defers `Watcher.Close()`,
+  which stops that loop from outside; on macOS the shutdown latency is bounded
+  by the run loop's 1 s wakeup.
 - **Child processes.** `exec.CommandContext` sends SIGKILL on cancel, which can
   cut `ddcutil` mid-I2C transaction. Set `cmd.Cancel` to send SIGTERM and
   `cmd.WaitDelay = 2 * time.Second` so SIGKILL is the fallback rather than the
@@ -652,13 +657,14 @@ longer blocks the decision loop.
 
 ### 11.2 What is an interface, and what is not
 
-An interface earns its place when two real implementations exist. Two do:
+An interface earns its place when two real implementations exist. Two do, both
+defined in `agent`, their only consumer:
 
 ```go
-type Detector interface {  // hid events and a fake
+type Detector interface {  // detect.HIDDetector and a fake
     Run(ctx context.Context, attach chan<- struct{}) error
 }
-type Guard interface {     // none on Linux, pmset+display on macOS, and a fake
+type Guard interface {     // platform.Guard (no-op on Linux), and a fake
     OK(ctx context.Context) (ok bool, reason string)
 }
 ```
@@ -671,8 +677,9 @@ What does *not* get an interface:
 - **The display.** There is one implementation — run this argv slice — for the
   switch, the probe, the notification, and later the flip. The seam tests need
   is the runner, so it is a func type, not an interface:
-  `type Runner func(ctx context.Context, argv []string) error`. A fake runner
-  records calls and returns canned exit codes.
+  `type Runner func(ctx context.Context, argv []string) error` — defined in
+  `agent`, implemented by `platform.Run`. A fake runner records calls and
+  returns canned exit codes.
 - **The server client.** Tests point the real client at `httptest.NewServer`
   wrapping the real handler, which exercises the actual protocol. A mocked
   client would test the mock.
@@ -710,13 +717,13 @@ type Action struct {
 func (m *Machine) Step(e Event) []Action
 ```
 
-`agent.go` is the supervisor: it waits for guards up, runs one generation, and
-recycles on `errGuardsDown`. The decision loop stamps `Now` at processing time
-for every event, dispatches the `Action`s to a run-level worker in `actions.go`,
-and posts results back as ordinary events. Effects are no longer executed
-inline: one action worker runs Switch/Probe/Notify one at a time and posts
-`SwitchExit`/`ProbeExit` to the loop. Channels are scoped by freshness —
-`attachCh` and `stateCh` are created per generation, while `results` and the
+`agent/agent.go` is the supervisor: it waits for guards up, runs one generation,
+and recycles on `errGuardsDown`. The decision loop stamps `Now` at processing
+time for every event, dispatches the `Action`s to a run-level worker in
+`agent/actions.go`, and posts results back as ordinary events. Effects are no
+longer executed inline: one action worker runs Switch/Probe/Notify one at a time
+and posts `SwitchExit`/`ProbeExit` to the loop. Channels are scoped by freshness
+— `attachCh` and `stateCh` are created per generation, while `results` and the
 action worker are run-level. It contains no policy.
 
 ### 11.4 Tests

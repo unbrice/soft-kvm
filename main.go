@@ -20,6 +20,15 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/unbrice/soft-kvm/agent"
+	"github.com/unbrice/soft-kvm/client"
+	"github.com/unbrice/soft-kvm/detect"
+	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/identity"
+	"github.com/unbrice/soft-kvm/model"
+	"github.com/unbrice/soft-kvm/platform"
+	"github.com/unbrice/soft-kvm/server"
 )
 
 // errUsage marks flag-parse failures: the FlagSet has already printed the
@@ -148,9 +157,9 @@ func serveCmd(ctx context.Context) error {
 		*instance = hn
 	}
 
-	srv := NewServer(*statePath, token)
+	srv := server.NewServer(*statePath, token)
 	if !*noAdvertise {
-		stopAdv, err := advertise(*instance, port, keyFingerprint(token))
+		stopAdv, err := discover.Advertise(*instance, port, identity.KeyFingerprint(token))
 		if err != nil {
 			// e.g. Avahi owning UDP 5353 despite SO_REUSEPORT (SPEC §6.4).
 			slog.Warn("mDNS advertisement failed, continuing without it", "error", err)
@@ -183,25 +192,27 @@ func activateCmd(ctx context.Context) error {
 		return errUsage
 	}
 
-	client, err := NewClient(token)
+	c, err := client.NewClient(token)
 	if err != nil {
 		return err
 	}
+
+	resolver := discover.NewResolver(filepath.Join(platform.StateDir(), "server"))
 
 	// Try each candidate until one answers: a stale cache entry or an
 	// unroutable advertised address should not end the attempt (SPEC §5.1).
 	var base string
 	var changed bool
 	var lastErr error
-	for candidate := range resolveServer(ctx, *serverFlag, keyFingerprint(token)) {
+	for candidate := range resolver.Resolve(ctx, *serverFlag, identity.KeyFingerprint(token)) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ch, err := client.Claim(cctx, candidate, id, *force)
+		ch, err := c.Claim(cctx, candidate, id, *force)
 		cancel()
 		if err != nil {
-			if errors.Is(err, ErrNoLiveAgent) && !*force {
+			if errors.Is(err, client.ErrNoLiveAgent) && !*force {
 				return fmt.Errorf("no live agent for %q; re-run with --force to claim anyway", id)
 			}
-			if errors.Is(err, ErrUnauthorized) {
+			if errors.Is(err, client.ErrUnauthorized) {
 				return errors.New("token rejected")
 			}
 			slog.Debug("activate: candidate failed", "base", candidate, "error", err)
@@ -209,7 +220,7 @@ func activateCmd(ctx context.Context) error {
 			continue
 		}
 		base, changed = candidate, ch
-		saveCachedServer(base) // the connection worked — cache the address (SPEC §5.1)
+		resolver.Save(base) // the connection worked — cache the address (SPEC §5.1)
 		break
 	}
 	if base == "" {
@@ -219,30 +230,26 @@ func activateCmd(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	state, err := client.State(ctx, base)
+	st, err := c.State(ctx, base)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("owner=%s epoch=%d changed=%v\n", state.Owner, state.Epoch, changed)
+	fmt.Printf("owner=%s epoch=%d changed=%v\n", st.Owner, st.Epoch, changed)
 	return nil
 }
 
-// defaultSwitchTimeout bounds one SWITCH-CMD run. A hung I²C write must not
-// freeze the agent (§4.3).
-const defaultSwitchTimeout = 30 * time.Second
-
 func connectCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
-	id := fs.String("id", defaultID, "claimed identity")
+	id := fs.String("id", platform.DefaultID, "claimed identity")
 	serverFlag := fs.String("server", "", "server address HOST:PORT")
 	trigger := fs.String("trigger", "", "comma-separated VID:PID filters for the trigger detector (USB receiver, optional Bluetooth keyboard); required — run `soft-kvm detect` to list VID:PIDs")
 	settle := fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming")
 	confirm := fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed")
 	switchRetries := fs.Int("switch-retries", 3, "re-runs of the switch command before giving up")
 	checkTimeout := fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run")
-	switchTimeout := fs.Duration("switch-timeout", defaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)")
-	checkCmd := fs.String("check-cmd", defaultCheckCmd, "veto before the switch, receipt after it")
-	notifyCmd := fs.String("notify-cmd", defaultNotifyCmd, "command run when the switch cannot be confirmed")
+	switchTimeout := fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)")
+	checkCmd := fs.String("check-cmd", platform.DefaultCheckCmd, "veto before the switch, receipt after it")
+	notifyCmd := fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch cannot be confirmed")
 
 	var noGuards bool
 	var displayMatch string
@@ -267,30 +274,27 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 
-	detector, err := newHIDDetector(*trigger)
+	detector, err := detect.NewHIDDetector(*trigger)
 	if err != nil {
 		return err
 	}
 
-	// The Linux desktop has no guards: newGuard there ignores displayMatch and
+	// The Linux desktop has no guards: NewGuard there ignores displayMatch and
 	// is always ok (SPEC §6.1-6.2).
-	guard := newGuard(displayMatch)
-	if noGuards {
-		guard = alwaysOK{reason: "guards disabled"}
-	}
+	guard := platform.NewGuard(displayMatch, noGuards)
 
 	// The trailing SWITCH-CMD is an argv slice, never a shell string (SPEC §9).
 	switchArgv := fs.Args()
 	if len(switchArgv) == 0 {
-		switchArgv = defaultSwitchCmd
+		switchArgv = platform.DefaultSwitchCmd
 	}
 
-	client, err := NewClient(token)
+	c, err := client.NewClient(token)
 	if err != nil {
 		return err
 	}
 
-	machineCfg := MachineConfig{
+	machineCfg := model.MachineConfig{
 		ID:             *id,
 		Settle:         *settle,
 		Confirm:        *confirm,
@@ -302,23 +306,39 @@ func connectCmd(ctx context.Context) error {
 		BreakerOpenFor: 60 * time.Second,
 	}
 
-	cfg := agentConfig{
-		id:             *id,
-		explicitServer: *serverFlag,
-		keyFP:          keyFingerprint(token),
-		detector:       detector,
-		guard:          guard,
-		client:         client,
-		runner:         run,
-		machine:        &machineCfg,
-		agentStatePath: filepath.Join(stateDir(), "agent.json"),
-		switchArgv:     switchArgv,
-		checkArgv:      shellArgv(*checkCmd),
-		notifyArgv:     shellArgv(*notifyCmd),
-		checkTimeout:   *checkTimeout,
-		switchTimeout:  *switchTimeout,
+	resolver := discover.NewResolver(filepath.Join(platform.StateDir(), "server"))
+
+	cfg := agent.Config{
+		ID:             *id,
+		ExplicitServer: *serverFlag,
+		KeyFP:          identity.KeyFingerprint(token),
+		Detector:       detector,
+		Guard:          guard,
+		Client:         c,
+		Runner:         platform.Run,
+		Machine:        &machineCfg,
+		AgentStatePath: filepath.Join(platform.StateDir(), "agent.json"),
+		SwitchArgv:     switchArgv,
+		CheckArgv:      platform.ShellArgv(*checkCmd),
+		NotifyArgv:     platform.ShellArgv(*notifyCmd),
+		CheckTimeout:   *checkTimeout,
+		SwitchTimeout:  *switchTimeout,
+		Resolver:       resolver,
 	}
 
-	ag := &agent{cfg: cfg}
-	return ag.run(ctx)
+	return agent.Run(ctx, cfg)
+}
+
+func detectCmd(ctx context.Context) error {
+	fs := flag.NewFlagSet("detect", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm detect")
+	}
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		return errUsage
+	}
+	if fs.NArg() > 0 {
+		return errUsage
+	}
+	return detect.Run(ctx, os.Stdout)
 }

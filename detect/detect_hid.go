@@ -8,7 +8,7 @@
 // optionally, a Bluetooth keyboard (HID over BT surfaces like any HID
 // device on both OSes) (SPEC §6.1, §6.3).
 
-package main
+package detect
 
 import (
 	"context"
@@ -46,19 +46,23 @@ func parseVIDPIDList(list string) ([]vidpid, error) {
 	return out, nil
 }
 
-func newHIDDetector(list string) (Detector, error) {
+// NewHIDDetector returns a detector that emits an attach edge whenever any of
+// the configured VID:PID targets becomes present. The list is a comma-separated
+// "VID:PID" string.
+func NewHIDDetector(list string) (*HIDDetector, error) {
 	targets, err := parseVIDPIDList(list)
 	if err != nil {
 		return nil, err
 	}
-	return &hidDetector{targets: targets}, nil
+	return &HIDDetector{targets: targets}, nil
 }
 
-type hidDetector struct {
+// HIDDetector watches HID device events for the configured targets.
+type HIDDetector struct {
 	targets []vidpid
 }
 
-func (d *hidDetector) matches(info *hid.DeviceInfo) bool {
+func (d *HIDDetector) matches(info *hid.DeviceInfo) bool {
 	if info == nil {
 		return false
 	}
@@ -73,7 +77,7 @@ func (d *hidDetector) matches(info *hid.DeviceInfo) bool {
 // Run watches HID device events until ctx is cancelled, emitting one attach
 // edge per absent→present transition of the targets. Returns nil on ctx
 // cancellation.
-func (d *hidDetector) Run(ctx context.Context, attach chan<- struct{}) error {
+func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 	w, err := hid.Watch()
 	if err != nil {
 		return fmt.Errorf("hid watch: %w", err)
@@ -86,7 +90,7 @@ func (d *hidDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 	present := map[string]bool{}
 
 	// Non-blocking and coalescing: an edge already queued makes this one
-	// redundant — attach edges are idempotent triggers (agent.go invariant 3).
+	// redundant — attach edges are idempotent triggers (agent invariant 3).
 	emit := func(info *hid.DeviceInfo) {
 		slog.Info("hid target attached",
 			"vid", fmt.Sprintf("%04x", info.VendorID),
