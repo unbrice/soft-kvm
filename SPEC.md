@@ -267,12 +267,12 @@ Sharp edges, in the order they will bite:
 The bit and nothing else. `IP` optional — omitted binds all interfaces
 (`soft-kvm serve 8700` ≡ `:8700`).
 
-| Flag / env        | Default                        | Meaning                                                      |
-| ----------------- | ------------------------------ | ------------------------------------------------------------ |
-| `--state PATH`    | `/var/lib/soft-kvm/state.json` | Persisted owner/epoch/since                                  |
-| `--instance NAME` | hostname                       | mDNS instance name under `_soft-kvm._tcp`                    |
-| `--no-advertise`  | off                            | Skip the mDNS registration; clients must be given an address |
-| `SOFTKVM_TOKEN`   | required                       | Shared secret for all endpoints except `/health`             |
+| Flag / env        | Default                        | Meaning                                                        |
+| ----------------- | ------------------------------ | -------------------------------------------------------------- |
+| `--state PATH`    | `/var/lib/soft-kvm/state.json` | Persisted owner/epoch/since                                    |
+| `--instance NAME` | hostname                       | mDNS instance name under `_soft-kvm._tcp`                      |
+| `--no-advertise`  | off                            | Skip the mDNS registration; clients must be given an address   |
+| `SOFTKVM_TOKEN`   | required                       | Shared secret; derives the TLS identity and client certificate |
 
 The advertised port is the listening port. Bind a fixed 8700 rather than port 0
 — a changing port turns every stale cache entry into a failed connection.
@@ -449,7 +449,6 @@ nothing.
   which has no timed `Wait` and would need a second goroutine per waiter.
 - `WriteTimeout` must exceed 50 s or be zero, otherwise the server kills its own
   long-polls. `ReadHeaderTimeout` 10 s.
-- Token comparison via `crypto/subtle.ConstantTimeCompare`.
 - **Atomic state writes:** temp file in the same directory, `fsync`, `rename`. A
   truncated `state.json` after a power cut must not crash-loop the service — on
   parse failure, log and start from `owner=""`, `epoch=0`. A fresh server with
@@ -460,18 +459,16 @@ nothing.
 
 ## 7. Service API spec
 
-**Base:** `https://<coordinator>:8700` · **Auth:** TLS proves both peers hold
-`SOFTKVM_TOKEN` (the identity is derived from it, §9); the header
-`X-Display-Token: <SOFTKVM_TOKEN>` rides on top of that on all endpoints except
-`/health`. The secret is scoped by construction: it can read/flip one display
-bit and nothing else.
+**Base:** `https://<coordinator>:8700` · **Auth:** mutual TLS proves both peers
+hold `SOFTKVM_TOKEN`: the server identity and the client certificate are both
+derived from it (§9). The secret is scoped by construction: it can read/flip one
+display bit and nothing else.
 
-| Endpoint                    | Behavior                                                                                                                                           |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /claim/{id}`          | Idempotent. Increments `epoch` and wakes waiters **only on actual change**. → `200 {owner, epoch, changed}` · `401` bad token · `400` unknown host |
-| `GET /state`                | → `200 {owner, epoch, since, live, server_id}`                                                                                                     |
-| `GET /wait?epoch=N&id=<me>` | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration                    |
-| `GET /health`               | Unauthenticated liveness → `200 ok`                                                                                                                |
+| Endpoint                    | Behavior                                                                                                                         |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /claim/{id}`          | Idempotent. Increments `epoch` and wakes waiters **only on actual change**. → `200 {owner, epoch, changed}` · `400` unknown host |
+| `GET /state`                | → `200 {owner, epoch, since, live, server_id}`                                                                                   |
+| `GET /wait?epoch=N&id=<me>` | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration  |
 
 - `since` is RFC 3339. `live` is `{"linux": true, "mac": false}`, derived from
   currently-open `/wait` connections. `server_id` is a UUID regenerated on every
@@ -509,13 +506,15 @@ bit and nothing else.
 ## 9. Security notes
 
 - **TLS identity is derived from the shared secret.** Every instance runs
-  `HKDF-SHA256(SOFTKVM_TOKEN, info="soft-kvm tls v1")` into an Ed25519 seed and
-  self-signs a fixed-template CA certificate. The template is constant and
-  Ed25519 signing is deterministic, so all holders of the secret generate
-  byte-identical certificates. The server presents it; clients trust exactly it
-  (the derived certificate is their only root, `ServerName` pinned to its SAN).
-  No fingerprint comparison, no PKI, no config beyond the token. Rotating the
-  token rotates the identity for free.
+  `HKDF-SHA256(SOFTKVM_TOKEN, info="soft-kvm tls v1")` into an Ed25519 seed. The
+  same key and seed self-sign a fixed-template CA certificate (serial 1) and
+  sign a fixed-template client certificate (serial 2). Both templates are
+  constant and Ed25519 signing is deterministic, so all holders of the secret
+  generate byte-identical certificates. The server presents the CA certificate;
+  clients trust exactly it (the derived certificate is their only root,
+  `ServerName` pinned to its SAN) and present the client certificate back. No
+  fingerprint comparison, no PKI, no config beyond the token. Rotating the token
+  rotates the identity for free.
 - The certificate is publicly derivable from the secret, so anyone who has seen
   a handshake can test candidate secrets **offline** against the observed
   certificate. Neither derivation carries a salt — they cannot: client and
@@ -527,9 +526,7 @@ bit and nothing else.
 - Token blast radius: read/flip one display bit. Rotating = editing the env
   files and restarting the server and both agents — the token is read at process
   start, and handshakes fail until they agree (§8). The token never appears in
-  `ps` or shell history. The `X-Display-Token` header stays as an
-  application-layer check on top of TLS; it is unreachable by anyone without the
-  secret.
+  `ps` or shell history.
 - No Home Assistant credentials anywhere in the system.
 - Corp device surface: one binary, outbound HTTPS to one LAN host, no listeners,
   no credentials of value, no installs. mDNS adds outbound multicast on UDP 5353

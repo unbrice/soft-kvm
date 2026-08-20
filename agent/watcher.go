@@ -81,11 +81,7 @@ func (a *agent) poll(ctx context.Context, stateCh chan<- *state.ServerState, bas
 			return ctx.Err()
 		}
 		if err != nil {
-			if errors.Is(err, client.ErrUnauthorized) {
-				slog.Error("watcher: token rejected")
-			} else {
-				slog.Error("watcher: wait failed", "error", err)
-			}
+			slog.Error("watcher: wait failed", "error", err)
 			return err
 		}
 		if time.Since(start) > 2*client.WaitClientTimeout {
@@ -100,11 +96,7 @@ func (a *agent) poll(ctx context.Context, stateCh chan<- *state.ServerState, bas
 			if errors.Is(err, context.Canceled) {
 				return ctx.Err()
 			}
-			if errors.Is(err, client.ErrUnauthorized) {
-				slog.Error("watcher: token rejected")
-			} else {
-				slog.Error("watcher: state failed", "error", err)
-			}
+			slog.Error("watcher: state failed", "error", err)
 			return err
 		}
 		b.reset()
@@ -129,11 +121,7 @@ func (a *agent) connectServer(ctx context.Context) (base string, st *state.Serve
 		if errors.Is(err, context.Canceled) {
 			return "", nil, false
 		}
-		if errors.Is(err, client.ErrUnauthorized) {
-			slog.Error("watcher: token rejected")
-		} else {
-			slog.Debug("watcher: candidate failed", "base", base, "error", err)
-		}
+		slog.Debug("watcher: candidate failed", "base", base, "error", err)
 	}
 	return "", nil, false
 }

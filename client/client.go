@@ -21,9 +21,6 @@ import (
 	"github.com/unbrice/soft-kvm/state"
 )
 
-// ErrUnauthorized is returned when the server rejects the X-Display-Token.
-var ErrUnauthorized = errors.New("invalid display token")
-
 // ErrNoLiveAgent is returned by Claim when the server reports the target host
 // has no live agent and the claim was not forced.
 var ErrNoLiveAgent = errors.New("no live agent")
@@ -48,9 +45,9 @@ func NewClient(token string) (*Client, error) {
 }
 
 // Claim POSTs /claim/<id> (?force=true when force). It returns whether the
-// server's owner changed. 401 becomes ErrUnauthorized; a 400 whose body reports
-// no live agent becomes ErrNoLiveAgent (SPEC §5.3: activate needs --force).
-// Any other non-2xx returns an error that includes the response body.
+// server's owner changed. A 400 whose body reports no live agent becomes
+// ErrNoLiveAgent (SPEC §5.3: activate needs --force). Any other non-2xx
+// returns an error that includes the response body.
 func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, error) {
 	url := "https://" + base + "/claim/" + id
 	if force {
@@ -59,9 +56,6 @@ func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, 
 	status, body, err := c.request(ctx, http.MethodPost, url, 5*time.Second)
 	if err != nil {
 		return false, err
-	}
-	if status == http.StatusUnauthorized {
-		return false, ErrUnauthorized
 	}
 	if status == http.StatusBadRequest {
 		if strings.Contains(string(body), "no live agent for") {
@@ -89,9 +83,6 @@ func (c *Client) State(ctx context.Context, base string) (*state.ServerState, er
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusUnauthorized {
-		return nil, ErrUnauthorized
-	}
 	if status != http.StatusOK {
 		return nil, httpError(http.MethodGet, "/state", status, body)
 	}
@@ -116,9 +107,6 @@ func (c *Client) Wait(ctx context.Context, base string, epoch int64, id string) 
 	if err != nil {
 		return false, err
 	}
-	if status == http.StatusUnauthorized {
-		return false, ErrUnauthorized
-	}
 	if status == http.StatusNoContent {
 		return false, nil
 	}
@@ -128,8 +116,9 @@ func (c *Client) Wait(ctx context.Context, base string, epoch int64, id string) 
 	return true, nil
 }
 
-// request performs one authenticated request with a per-call timeout. It
-// returns the status, the full response body, and any transport-level error.
+// request performs one request with a per-call timeout. It returns the status,
+// the full response body, and any transport-level error. TLS handshake
+// failures are wrapped with a hint that SOFTKVM_TOKEN may differ.
 func (c *Client) request(ctx context.Context, method, url string, timeout time.Duration) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -138,10 +127,12 @@ func (c *Client) request(ctx context.Context, method, url string, timeout time.D
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("X-Display-Token", c.token)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		if strings.Contains(err.Error(), "tls:") {
+			return 0, nil, fmt.Errorf("%w (SOFTKVM_TOKEN mismatch?)", err)
+		}
 		return 0, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()

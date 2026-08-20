@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/server"
 	"github.com/unbrice/soft-kvm/state"
 )
@@ -28,19 +29,37 @@ func testServer(t *testing.T) (*server.Server, *httptest.Server) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	s := server.NewServer(statePath, testToken)
 	s.SetWaitTimeout(200 * time.Millisecond)
-	return s, httptest.NewServer(s.Handler())
+	srv := httptest.NewUnstartedServer(s.Handler())
+	tlsCfg, err := identity.ServerTLSConfig(testToken)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv.TLS = tlsCfg
+	srv.StartTLS()
+	return s, srv
 }
 
-func doReq(t *testing.T, method, rawURL, token string, body io.Reader) *http.Response {
+func testHTTPClient(t *testing.T, token string) *http.Client {
+	t.Helper()
+	tlsCfg, err := identity.ClientTLSConfig(token)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+}
+
+func doReq(t *testing.T, method, rawURL string, body io.Reader) *http.Response {
+	t.Helper()
+	return doReqWithClient(t, testHTTPClient(t, testToken), method, rawURL, body)
+}
+
+func doReqWithClient(t *testing.T, client *http.Client, method, rawURL string, body io.Reader) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(method, rawURL, body)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-	if token != "" {
-		req.Header.Set("X-Display-Token", token)
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Do %s %s: %v", method, rawURL, err)
 	}
@@ -98,17 +117,23 @@ func TestServerClaimPersists(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	s := server.NewServer(statePath, testToken)
 	s.SetWaitTimeout(200 * time.Millisecond)
-	srv := httptest.NewServer(s.Handler())
+	srv := httptest.NewUnstartedServer(s.Handler())
+	tlsCfg, err := identity.ServerTLSConfig(testToken)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv.TLS = tlsCfg
+	srv.StartTLS()
 	defer srv.Close()
 
 	// The server only accepts a claim for a live id (or with force=true).
 	waitDone := make(chan *http.Response, 1)
 	go func() {
-		waitDone <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", testToken, nil)
+		waitDone <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", nil)
 	}()
 	waitForLive(t, s, "mac")
 
-	resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", testToken, nil)
+	resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", nil)
 	mustStatus(t, resp, http.StatusOK)
 	var claim map[string]any
 	readJSON(t, resp, &claim)
@@ -136,11 +161,11 @@ func TestServerClaimIdempotent(t *testing.T) {
 	// Establish mac as a live agent and claim it once.
 	wait1Done := make(chan *http.Response, 1)
 	go func() {
-		wait1Done <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", testToken, nil)
+		wait1Done <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", nil)
 	}()
 	waitForLive(t, s, "mac")
 
-	resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", testToken, nil)
+	resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", nil)
 	mustStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
 	wake1 := <-wait1Done
@@ -150,12 +175,12 @@ func TestServerClaimIdempotent(t *testing.T) {
 	// Start a second waiter at the current epoch; re-claims must not wake it.
 	wait2Done := make(chan *http.Response, 1)
 	go func() {
-		wait2Done <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=1&id=mac", testToken, nil)
+		wait2Done <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=1&id=mac", nil)
 	}()
 	waitForLive(t, s, "mac")
 
 	for i := 0; i < 50; i++ {
-		resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", testToken, nil)
+		resp := doReq(t, http.MethodPost, srv.URL+"/claim/mac", nil)
 		mustStatus(t, resp, http.StatusOK)
 		var body map[string]any
 		readJSON(t, resp, &body)
@@ -177,7 +202,7 @@ func TestServerWaitWokenByClaim(t *testing.T) {
 	results := make(chan *http.Response, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			results <- doReq(t, http.MethodGet, waitURL, testToken, nil)
+			results <- doReq(t, http.MethodGet, waitURL, nil)
 		}()
 	}
 
@@ -185,7 +210,7 @@ func TestServerWaitWokenByClaim(t *testing.T) {
 	waitForWaiters(t, s, "mac", 2)
 
 	// Claim linux with force because no linux agent is currently live.
-	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true", testToken, nil)
+	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true", nil)
 	mustStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
 
@@ -205,7 +230,7 @@ func TestServerWaitStaleEpoch(t *testing.T) {
 	defer srv.Close()
 
 	// Current epoch is 0; asking for 99 returns immediately.
-	resp := doReq(t, http.MethodGet, srv.URL+"/wait?epoch=99&id=mac", testToken, nil)
+	resp := doReq(t, http.MethodGet, srv.URL+"/wait?epoch=99&id=mac", nil)
 	mustStatus(t, resp, http.StatusOK)
 	var body map[string]any
 	readJSON(t, resp, &body)
@@ -219,7 +244,7 @@ func TestServerWaitTimeout(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	resp := doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", testToken, nil)
+	resp := doReq(t, http.MethodGet, srv.URL+"/wait?epoch=0&id=mac", nil)
 	mustStatus(t, resp, http.StatusNoContent)
 	_ = resp.Body.Close()
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -244,7 +269,7 @@ func TestServerStateLive(t *testing.T) {
 	waitURL := fmt.Sprintf("%s/wait?epoch=0&id=mac", srv.URL)
 	waitDone := make(chan *http.Response, 1)
 	go func() {
-		waitDone <- doReq(t, http.MethodGet, waitURL, testToken, nil)
+		waitDone <- doReq(t, http.MethodGet, waitURL, nil)
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -284,23 +309,24 @@ func TestServerAuth(t *testing.T) {
 	_, srv := testServer(t)
 	defer srv.Close()
 
-	cases := []struct {
-		method, path, token string
-		want                int
-	}{
-		{http.MethodPost, "/claim/mac", "wrong", http.StatusUnauthorized},
-		{http.MethodPost, "/claim/mac", "", http.StatusUnauthorized},
-		{http.MethodGet, "/state", "wrong", http.StatusUnauthorized},
-		{http.MethodGet, "/state", "", http.StatusUnauthorized},
-		{http.MethodGet, "/wait?epoch=0&id=mac", "wrong", http.StatusUnauthorized},
-		{http.MethodGet, "/wait?epoch=0&id=mac", "", http.StatusUnauthorized},
-		{http.MethodGet, "/health", "", http.StatusOK},
-		{http.MethodGet, "/health", testToken, http.StatusOK},
+	// A client with the matching token succeeds.
+	resp := doReq(t, http.MethodGet, srv.URL+"/state", nil)
+	mustStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	// A client with a different token fails at the TLS handshake.
+	badClient := testHTTPClient(t, "wrong-token")
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/state", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
 	}
-	for _, tc := range cases {
-		resp := doReq(t, tc.method, srv.URL+tc.path, tc.token, nil)
-		mustStatus(t, resp, tc.want)
+	resp, err = badClient.Do(req)
+	if err == nil {
 		_ = resp.Body.Close()
+		t.Fatal("expected TLS handshake failure for wrong token")
+	}
+	if !strings.Contains(err.Error(), "tls:") {
+		t.Fatalf("expected tls error, got %v", err)
 	}
 }
 
@@ -308,7 +334,7 @@ func TestServerClaimNoLiveAgent(t *testing.T) {
 	_, srv := testServer(t)
 	defer srv.Close()
 
-	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux", testToken, nil)
+	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux", nil)
 	mustStatus(t, resp, http.StatusBadRequest)
 	var body map[string]string
 	readJSON(t, resp, &body)
@@ -317,7 +343,7 @@ func TestServerClaimNoLiveAgent(t *testing.T) {
 	}
 
 	// With force=true the claim succeeds anyway.
-	resp = doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true", testToken, nil)
+	resp = doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true", nil)
 	mustStatus(t, resp, http.StatusOK)
 	var claim map[string]any
 	readJSON(t, resp, &claim)
@@ -326,7 +352,7 @@ func TestServerClaimNoLiveAgent(t *testing.T) {
 	}
 
 	// force=1 is also accepted.
-	resp = doReq(t, http.MethodPost, srv.URL+"/claim/mac?force=1", testToken, nil)
+	resp = doReq(t, http.MethodPost, srv.URL+"/claim/mac?force=1", nil)
 	mustStatus(t, resp, http.StatusOK)
 	_ = resp.Body.Close()
 }
@@ -345,7 +371,7 @@ func TestServerBadRequests(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := doReq(t, tc.method, srv.URL+tc.path, testToken, nil)
+			resp := doReq(t, tc.method, srv.URL+tc.path, nil)
 			mustStatus(t, resp, http.StatusBadRequest)
 			_ = resp.Body.Close()
 		})
@@ -363,10 +389,16 @@ func TestServerEpochBackwards(t *testing.T) {
 
 	s1 := server.NewServer(statePath, testToken)
 	s1.SetWaitTimeout(200 * time.Millisecond)
-	srv1 := httptest.NewServer(s1.Handler())
+	srv1 := httptest.NewUnstartedServer(s1.Handler())
+	tlsCfg, err := identity.ServerTLSConfig(testToken)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv1.TLS = tlsCfg
+	srv1.StartTLS()
 	defer srv1.Close()
 
-	resp := doReq(t, http.MethodPost, srv1.URL+"/claim/linux?force=true", testToken, nil)
+	resp := doReq(t, http.MethodPost, srv1.URL+"/claim/linux?force=true", nil)
 	mustStatus(t, resp, http.StatusOK)
 	var claim map[string]any
 	readJSON(t, resp, &claim)

@@ -216,9 +216,6 @@ func activateCmd(ctx context.Context) error {
 			if errors.Is(err, client.ErrNoLiveAgent) && !*force {
 				return fmt.Errorf("no live agent for %q; re-run with --force to claim anyway", id)
 			}
-			if errors.Is(err, client.ErrUnauthorized) {
-				return errors.New("token rejected")
-			}
 			slog.Debug("activate: candidate failed", "base", candidate, "error", err)
 			lastErr = err
 			continue

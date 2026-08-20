@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// tls.go: TLS identity derived from the shared secret (SPEC §7, §9).
+// tls.go: TLS identity and derived client certificate from the shared secret
+// (SPEC §7, §9).
 
 package identity
 
@@ -39,20 +40,21 @@ func KeyFingerprint(secret string) string {
 	return hex.EncodeToString(fp)
 }
 
-// tlsIdentity derives the Ed25519 key and self-signed CA certificate that
-// every instance sharing secret generates. The template is fixed and Ed25519
-// signing is deterministic, so all of them produce byte-identical
-// certificates: knowing the secret is both what lets a server present the
-// certificate and what lets a client trust it. No fingerprint comparison, no
+// tlsIdentity derives the Ed25519 key, the self-signed CA certificate and the
+// client certificate signed by that CA. Both templates are fixed and Ed25519
+// signing is deterministic, so all instances sharing the secret generate
+// byte-identical certificates: knowing the secret is what lets a server
+// present the CA, what lets a client trust it, and what lets a client present
+// a valid client certificate. No fingerprint comparison, no PKI, no
 // configuration beyond SOFTKVM_TOKEN (SPEC §9).
-func tlsIdentity(secret string) (tls.Certificate, error) {
+func tlsIdentity(secret string) (ca tls.Certificate, client tls.Certificate, err error) {
 	seed, err := hkdf.Key(sha256.New, []byte(secret), nil, "soft-kvm tls v1", ed25519.SeedSize)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, tls.Certificate{}, err
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
 
-	tmpl := &x509.Certificate{
+	caTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: tlsServerName},
 		DNSNames:     []string{tlsServerName},
@@ -63,44 +65,76 @@ func tlsIdentity(secret string) (tls.Certificate, error) {
 		// its own root on the client side.
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		// The CA is presented as the server certificate and must also be able to
+		// sign client certificates, so both EKUs are required.
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 	// Ed25519 ignores the random source, so the DER is deterministic.
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, priv.Public(), priv)
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, priv.Public(), priv)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, tls.Certificate{}, err
 	}
-	leaf, err := x509.ParseCertificate(der)
+	caLeaf, err := x509.ParseCertificate(caDER)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, tls.Certificate{}, err
 	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv, Leaf: leaf}, nil
+	ca = tls.Certificate{Certificate: [][]byte{caDER}, PrivateKey: priv, Leaf: caLeaf}
+
+	clientTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "soft-kvm-client"},
+		NotBefore:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		NotAfter:     time.Date(2126, 1, 1, 0, 0, 0, 0, time.UTC),
+		IsCA:         false,
+		// BasicConstraintsValid with IsCA false lets the verifier reject this
+		// as an intermediate CA.
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, clientTmpl, caLeaf, priv.Public(), priv)
+	if err != nil {
+		return tls.Certificate{}, tls.Certificate{}, err
+	}
+	clientLeaf, err := x509.ParseCertificate(clientDER)
+	if err != nil {
+		return tls.Certificate{}, tls.Certificate{}, err
+	}
+	client = tls.Certificate{Certificate: [][]byte{clientDER}, PrivateKey: priv, Leaf: clientLeaf}
+	return ca, client, nil
 }
 
-// ServerTLSConfig serves the secret-derived identity.
+// ServerTLSConfig serves the secret-derived identity and requires a
+// secret-derived client certificate.
 func ServerTLSConfig(secret string) (*tls.Config, error) {
-	cert, err := tlsIdentity(secret)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}, nil
-}
-
-// ClientTLSConfig trusts exactly the secret-derived identity: the derived
-// certificate is its own root and ServerName is pinned to its SAN.
-func ClientTLSConfig(secret string) (*tls.Config, error) {
-	cert, err := tlsIdentity(secret)
+	ca, _, err := tlsIdentity(secret)
 	if err != nil {
 		return nil, err
 	}
 	pool := x509.NewCertPool()
-	pool.AddCert(cert.Leaf)
+	pool.AddCert(ca.Leaf)
 	return &tls.Config{
-		RootCAs:    pool,
-		ServerName: tlsServerName,
-		MinVersion: tls.VersionTLS13,
+		Certificates: []tls.Certificate{ca},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		MinVersion:   tls.VersionTLS13,
+	}, nil
+}
+
+// ClientTLSConfig presents and trusts exactly the secret-derived identity:
+// the derived CA is the only root, ServerName is pinned to its SAN, and the
+// derived client certificate is presented to the server.
+func ClientTLSConfig(secret string) (*tls.Config, error) {
+	ca, client, err := tlsIdentity(secret)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(ca.Leaf)
+	return &tls.Config{
+		Certificates: []tls.Certificate{client},
+		RootCAs:      pool,
+		ServerName:   tlsServerName,
+		MinVersion:   tls.VersionTLS13,
 	}, nil
 }

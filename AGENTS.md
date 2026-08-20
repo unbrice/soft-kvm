@@ -22,11 +22,11 @@ One binary, `soft-kvm` (module `github.com/unbrice/soft-kvm`), same artifact on
 every host, four subcommands:
 
 - `serve [IP:]PORT` — the coordinator. Owns `owner/epoch`, serves `GET /state`,
-  `POST /claim/{id}`, `GET /wait?epoch=N&id=ME` (long-poll) and an
-  unauthenticated `GET /health`, over TLS whose identity is derived from the
-  shared secret; every other route needs the `X-Display-Token` header. Port
-  defaults to 8700, state to `--state /var/lib/soft-kvm/state.json`, and it
-  advertises itself over mDNS unless `--no-advertise` (SPEC §6.4, §7).
+  `POST /claim/{id}` and `GET /wait?epoch=N&id=ME` (long-poll) over mutual TLS:
+  the server identity and the required client certificate are both derived from
+  the shared secret. Port defaults to 8700, state to
+  `--state /var/lib/soft-kvm/state.json`, and it advertises itself over mDNS
+  unless `--no-advertise` (SPEC §6.4, §7).
 - `connect [flags] [-- SWITCH-CMD ARGS...]` — the per-host agent. An HID attach
   detector feeds the pure state machine that decides when to claim ownership; a
   run-level action worker runs the switch command (`ddcutil` on Linux,
@@ -55,18 +55,18 @@ lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
 and `server` import `state` and `identity`; `agent` imports `model`, `state`,
 `client` and `discover`.
 
-| Package    | Files                                  | Concern                                                                                               |
-| ---------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| (root)     | `main.go`                              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring                                 |
-| `state`    | `state.go`                             | the `/state` wire type and atomic JSON persistence                                                    |
-| `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                    |
-| `identity` | `tls.go`                               | TLS identity and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                          |
-| `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)     |
-| `platform` | `run.go`, `defaults_*`, `guard_*`      | the argv runner and the §11.1 child-process conventions; per-OS defaults; the per-OS `Guard`          |
-| `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                               |
-| `client`   | `client.go`                            | the coordinator's HTTP client                                                                         |
-| `server`   | `server.go`                            | the coordinator HTTP service                                                                          |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go` | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy |
+| Package    | Files                                  | Concern                                                                                                         |
+| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| (root)     | `main.go`                              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring                                           |
+| `state`    | `state.go`                             | the `/state` wire type and atomic JSON persistence                                                              |
+| `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                              |
+| `identity` | `tls.go`                               | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf` |
+| `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)               |
+| `platform` | `run.go`, `defaults_*`, `guard_*`      | the argv runner and the §11.1 child-process conventions; per-OS defaults; the per-OS `Guard`                    |
+| `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                                         |
+| `client`   | `client.go`                            | the coordinator's HTTP client                                                                                   |
+| `server`   | `server.go`                            | the coordinator HTTP service                                                                                    |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go` | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy           |
 
 The invariants header lives at the top of `agent/agent.go`.
 `platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op

@@ -412,11 +412,7 @@ func (a *agent) claim(ctx context.Context, id string) {
 		for base := range a.cfg.Resolver.Resolve(cctx, a.cfg.ExplicitServer, a.cfg.KeyFP) {
 			changed, err := a.cfg.Client.Claim(cctx, base, id, false)
 			if err != nil {
-				if errors.Is(err, client.ErrUnauthorized) {
-					slog.Error("claim: token rejected", "attempt", attempt+1)
-				} else {
-					slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
-				}
+				slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
 				continue
 			}
 			if changed {

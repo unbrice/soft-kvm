@@ -9,7 +9,6 @@ package server
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -120,32 +119,16 @@ func newUUID() string {
 	)
 }
 
-// Handler returns the http.Handler for the service endpoints.
+// Handler returns the http.Handler for the service endpoints. Authentication is
+// mutual TLS: the server only accepts a client certificate signed by the
+// secret-derived CA, and clients pin the secret-derived server identity (SPEC
+// §7, §9).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /claim/{id}", s.handleClaim)
 	mux.HandleFunc("GET /state", s.handleState)
 	mux.HandleFunc("GET /wait", s.handleWait)
-	return s.withAuth(mux)
-}
-
-// withAuth enforces X-Display-Token on every handler except /health.
-func (s *Server) withAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		got := r.Header.Get("X-Display-Token")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
-			slog.Info("rejected request", "path", r.URL.Path, "remote", r.RemoteAddr, "reason", "bad token")
-			w.WriteHeader(http.StatusUnauthorized)
-			maybeWriteJSON(w, map[string]string{"error": "invalid token"})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return mux
 }
 
 // handleClaim implements POST /claim/{id} (SPEC §7).
@@ -304,12 +287,6 @@ func (s *Server) serverStateLocked() state.ServerState {
 func (s *Server) wake() {
 	close(s.broadcast)
 	s.broadcast = make(chan struct{})
-}
-
-// handleHealth implements GET /health (SPEC §7).
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("ok"))
 }
 
 // Run serves HTTPS on addr ("[IP:]PORT") until ctx is cancelled, then shuts
