@@ -126,7 +126,7 @@ type Config struct {
 	Runner         Runner
 	Machine        *model.MachineConfig
 	AgentStatePath string
-	SwitchArgv     []string
+	SwitchCommands [][]string
 	CheckArgv      []string
 	NotifyArgv     []string
 	CheckTimeout   time.Duration

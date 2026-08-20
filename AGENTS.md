@@ -27,11 +27,12 @@ every host, four subcommands:
   the shared secret. Port defaults to 8700, state to
   `--state /var/lib/soft-kvm/state.json`, and it advertises itself over mDNS
   unless `--no-advertise` (SPEC §6.4, §7).
-- `connect [flags] [-- SWITCH-CMD ARGS...]` — the per-host agent. An HID attach
-  detector feeds the pure state machine that decides when to claim ownership; a
-  run-level action worker runs the switch command (`ddcutil` on Linux,
-  `betterdisplaycli` on macOS) on the losing host. `--trigger VID:PID[,…]` is
-  required; macOS also gets `--no-guards` and `--display-match` (SPEC §5.4, §6).
+- `connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]` — the per-host agent. An
+  HID attach detector feeds the pure state machine that decides when to claim
+  ownership; a run-level action worker runs the switch commands (`ddcutil` on
+  Linux, `betterdisplaycli` on macOS, then e.g. a USB device command after a
+  bare `--`) on the losing host. `--trigger VID:PID[,…]` is required; macOS also
+  gets `--no-guards` and `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
   with a pointer to `--force` when the target has no live agent.
 - `detect` — prints attached HID devices and suggested `--trigger` values (SPEC
@@ -205,7 +206,7 @@ jj sharp edges:
   mDNS fingerprint are deterministic salt-free functions of the token, so a weak
   one is one offline dictionary pass from compromise (SPEC §9). Generate with
   `openssl rand -hex 32`.
-- The switch command is an argv slice taken after `--`, never a shell string
+- The switch commands are argv slices taken after `--`, never shell strings
   (SPEC §9). `--check-cmd` and `--notify-cmd` are the exception: their per-OS
   defaults carry shell quoting, so they run as `sh -c <string>`.
 - `cmd.Cancel` sends SIGTERM (SIGKILL only after `WaitDelay`) so cancellation

@@ -20,7 +20,7 @@ type Event struct {
 	Now        time.Time
 	Attach     bool               // receiver attach edge from the Detector
 	State      *state.ServerState // from /state or a /wait wake
-	SwitchExit *error             // result of running SWITCH-CMD (nil = exit 0)
+	SwitchExit *error             // result of the switch commands (nil = all exit 0)
 	ProbeExit  *error             // result of running --check-cmd (nil = exit 0 = my input IS active)
 }
 

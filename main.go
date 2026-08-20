@@ -81,7 +81,7 @@ func usage() {
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
-  connect [flags] [-- SWITCH-CMD ARGS...]
+  connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]
   detect
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
@@ -260,7 +260,7 @@ func connectCmd(ctx context.Context) error {
 	}
 
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm connect [flags] [-- SWITCH-CMD ARGS...]")
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[2:]); err != nil {
@@ -284,10 +284,14 @@ func connectCmd(ctx context.Context) error {
 	// is always ok (SPEC §6.1-6.2).
 	guard := platform.NewGuard(displayMatch, noGuards)
 
-	// The trailing SWITCH-CMD is an argv slice, never a shell string (SPEC §9).
-	switchArgv := fs.Args()
-	if len(switchArgv) == 0 {
-		switchArgv = platform.DefaultSwitchCmd
+	// The trailing commands are argv slices, never shell strings (SPEC §9).
+	switchCommands, err := splitSwitchCommands(fs.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return errUsage
+	}
+	if len(switchCommands) == 0 {
+		switchCommands = [][]string{platform.DefaultSwitchCmd}
 	}
 
 	c, err := client.NewClient(token)
@@ -323,7 +327,7 @@ func connectCmd(ctx context.Context) error {
 		Runner:         platform.Run,
 		Machine:        &machineCfg,
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
-		SwitchArgv:     switchArgv,
+		SwitchCommands: switchCommands,
 		CheckArgv:      platform.ShellArgv(*checkCmd),
 		NotifyArgv:     platform.ShellArgv(*notifyCmd),
 		CheckTimeout:   *checkTimeout,
@@ -332,6 +336,32 @@ func connectCmd(ctx context.Context) error {
 	}
 
 	return agent.Run(ctx, cfg)
+}
+
+// splitSwitchCommands splits the trailing arguments on bare "--" tokens: each
+// chunk is one switch command's argv (SPEC §5.4). flag.Parse has already
+// consumed the first "--"; later ones arrive literally. An empty chunk is a
+// user error.
+func splitSwitchCommands(args []string) ([][]string, error) {
+	var cmds [][]string
+	var cur []string
+	for _, arg := range args {
+		if arg == "--" {
+			if len(cur) == 0 {
+				return nil, errors.New("connect: empty switch command (lone `--`)")
+			}
+			cmds = append(cmds, cur)
+			cur = nil
+			continue
+		}
+		cur = append(cur, arg)
+	}
+	if len(cur) > 0 {
+		cmds = append(cmds, cur)
+	} else if len(cmds) > 0 {
+		return nil, errors.New("connect: empty switch command (trailing `--`)")
+	}
+	return cmds, nil
 }
 
 func detectCmd(ctx context.Context) error {

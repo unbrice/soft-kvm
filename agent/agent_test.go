@@ -166,7 +166,7 @@ func agentTestConfig(t *testing.T, base, statePath string, s *server.Server, det
 		Runner:         runner,
 		Machine:        agentMachineConfig("linux"),
 		AgentStatePath: statePath,
-		SwitchArgv:     []string{"switch", "cmd"},
+		SwitchCommands: [][]string{{"switch", "cmd"}},
 		CheckArgv:      []string{"check", "cmd"},
 		NotifyArgv:     []string{"notify", "cmd"},
 		CheckTimeout:   1 * time.Second,
@@ -249,10 +249,13 @@ func TestAgentSwitchPath(t *testing.T) {
 	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
-	// Probe succeeds (veto passed), switch succeeds, confirm probe fails (landed).
-	runner := &recordingRunner{errs: []error{nil, nil, errors.New("input inactive")}}
+	// Probe succeeds (veto passed), both switch commands succeed, confirm probe
+	// fails (landed).
+	runner := &recordingRunner{errs: []error{nil, nil, nil, errors.New("input inactive")}}
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	// A second switch command (e.g. a USB device) runs after the display one.
+	cfg.SwitchCommands = append(cfg.SwitchCommands, []string{"switch", "usb"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -267,11 +270,11 @@ func TestAgentSwitchPath(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		calls := runner.Calls()
-		if len(calls) >= 3 {
+		if len(calls) >= 4 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("expected 3 runner calls, got %d: %v", len(calls), calls)
+			t.Fatalf("expected 4 runner calls, got %d: %v", len(calls), calls)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -280,11 +283,14 @@ func TestAgentSwitchPath(t *testing.T) {
 	if !slices.Equal(calls[0], cfg.CheckArgv) {
 		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
 	}
-	if !slices.Equal(calls[1], cfg.SwitchArgv) {
-		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchArgv)
+	if !slices.Equal(calls[1], cfg.SwitchCommands[0]) {
+		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchCommands[0])
 	}
-	if !slices.Equal(calls[2], cfg.CheckArgv) {
-		t.Errorf("call 2 = %v, want confirm probe %v", calls[2], cfg.CheckArgv)
+	if !slices.Equal(calls[2], cfg.SwitchCommands[1]) {
+		t.Errorf("call 2 = %v, want switch %v", calls[2], cfg.SwitchCommands[1])
+	}
+	if !slices.Equal(calls[3], cfg.CheckArgv) {
+		t.Errorf("call 3 = %v, want confirm probe %v", calls[3], cfg.CheckArgv)
 	}
 
 	var as state.AgentState
@@ -348,7 +354,7 @@ func TestAgentVetoPath(t *testing.T) {
 	if !slices.Equal(calls[0], cfg.CheckArgv) {
 		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
 	}
-	if slices.ContainsFunc(calls, func(argv []string) bool { return slices.Equal(argv, cfg.SwitchArgv) }) {
+	if slices.ContainsFunc(calls, func(argv []string) bool { return slices.Equal(argv, cfg.SwitchCommands[0]) }) {
 		t.Error("switch command ran despite veto")
 	}
 

@@ -46,19 +46,33 @@ func (a *agent) actionLoop(ctx context.Context) error {
 	}
 }
 
+// runSwitch runs one switch command bounded by --switch-timeout and
+// distinguishes a hung child from a spontaneous non-zero exit.
+func (a *agent) runSwitch(ctx context.Context, argv []string) error {
+	sctx, cancel := context.WithTimeout(ctx, a.cfg.switchTimeoutOrDefault())
+	err := a.cfg.Runner(sctx, argv)
+	cancel()
+	if errors.Is(sctx.Err(), context.DeadlineExceeded) {
+		if err == nil {
+			return errSwitchTimeout
+		}
+		return fmt.Errorf("%w: %w", errSwitchTimeout, err)
+	}
+	return err
+}
+
 func (a *agent) runEffect(ctx context.Context, e effect) {
 	switch e {
 	case effectSwitch:
-		sctx, cancel := context.WithTimeout(ctx, a.cfg.switchTimeoutOrDefault())
-		err := a.cfg.Runner(sctx, a.cfg.SwitchArgv)
-		cancel()
-		if errors.Is(sctx.Err(), context.DeadlineExceeded) {
-			if err == nil {
-				err = errSwitchTimeout
-			} else {
-				err = fmt.Errorf("%w: %w", errSwitchTimeout, err)
-			}
+		// The switch is a set of argv commands (display, then e.g. a USB
+		// device) run in order; each gets its own timeout. One failure does
+		// not skip the rest — the commands target independent devices and the
+		// display probe remains the receipt (§4.3).
+		var errs []error
+		for _, argv := range a.cfg.SwitchCommands {
+			errs = append(errs, a.runSwitch(ctx, argv))
 		}
+		err := errors.Join(errs...)
 		select {
 		case a.results <- model.Event{SwitchExit: &err}:
 		case <-ctx.Done():
