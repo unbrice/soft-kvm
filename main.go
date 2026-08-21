@@ -25,6 +25,7 @@ import (
 	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/detect"
 	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/model"
 	"github.com/unbrice/soft-kvm/platform"
@@ -39,7 +40,13 @@ var errUsage = errors.New("usage")
 var errToken = errors.New("SOFTKVM_TOKEN is required")
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	var level slog.LevelVar // Info by default
+	if s := os.Getenv("SOFTKVM_LOG"); s != "" {
+		if err := level.UnmarshalText([]byte(s)); err != nil {
+			fmt.Fprintf(os.Stderr, "soft-kvm: unknown SOFTKVM_LOG level %q (debug, info, warn, error)\n", s)
+		}
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &level})))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -59,6 +66,8 @@ func main() {
 		err = connectCmd(ctx)
 	case "detect":
 		err = detectCmd(ctx)
+	case "hid-switch":
+		err = hidSwitchCmd(ctx)
 	default:
 		usage()
 		os.Exit(2)
@@ -83,10 +92,13 @@ func usage() {
   activate ID [--server HOST:PORT] [--force]
   connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]
   detect
+  hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
-serve, activate and connect; detect needs no token. SOFTKVM_SERVER overrides
-server discovery (SPEC §5).`)
+serve, activate and connect; detect and hid-switch need no token.
+SOFTKVM_SERVER overrides server discovery (SPEC §5); SOFTKVM_LOG=debug turns
+on debug logs. A connect switch command named "hid-switch" is built in, not
+exec'd (SPEC §5.5).`)
 }
 
 // requireToken reads the shared secret from the environment — never a flag
@@ -376,4 +388,21 @@ func detectCmd(ctx context.Context) error {
 		return errUsage
 	}
 	return detect.Run(ctx, os.Stdout)
+}
+
+func hidSwitchCmd(ctx context.Context) error {
+	fs := flag.NewFlagSet("hid-switch", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		return errUsage
+	}
+	sw, err := hidpp.Parse(fs.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return errUsage
+	}
+	return sw.Do(ctx)
 }

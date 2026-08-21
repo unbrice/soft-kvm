@@ -1,0 +1,446 @@
+// SPDX-FileCopyrightText: 2026 Brice Arnould
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+// Tests for hidpp.go. Parsing and framing are table-tested; exchanges run
+// against scripted fakes inside synctest bubbles, so silent-device paths cost
+// fake time, not real time. t.Run cannot be called from inside a bubble, so
+// the nesting is reversed: each timed subtest wraps its body in synctest.Test.
+// The I/O path itself needs hardware and is covered by the SPEC §10 checklist.
+
+package hidpp
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"syscall"
+	"testing"
+	"testing/synctest"
+)
+
+func TestParse(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		want    *Switch
+		wantErr bool
+	}{
+		{
+			name: "direct device",
+			args: []string{"046d:b35b", "1"},
+			want: &Switch{VID: 0x046d, PID: 0xb35b, Target: TargetDirect, DeviceIndex: DeviceIndexDirect, HostIndex: 1},
+		},
+		{
+			name: "receiver kind mouse",
+			args: []string{"046d:c548", "mouse", "0"},
+			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetKind, DeviceIndex: DeviceIndexDirect, Kind: KindMouse, HostIndex: 0},
+		},
+		{
+			name: "receiver kind keyboard",
+			args: []string{"046d:c548", "keyboard", "2"},
+			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetKind, DeviceIndex: DeviceIndexDirect, Kind: KindKeyboard, HostIndex: 2},
+		},
+		{
+			name: "receiver explicit slot",
+			args: []string{"046d:c548", "3", "1"},
+			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetSlot, DeviceIndex: 3, HostIndex: 1},
+		},
+		{name: "too few args", args: []string{"046d:b35b"}, wantErr: true},
+		{name: "too many args", args: []string{"046d:b35b", "1", "1", "1"}, wantErr: true},
+		{name: "bad separator", args: []string{"046db35b", "1"}, wantErr: true},
+		{name: "bad vid", args: []string{"zzzz:b35b", "1"}, wantErr: true},
+		{name: "bad pid", args: []string{"046d:b35bb", "1"}, wantErr: true},
+		{name: "host index too high", args: []string{"046d:b35b", "3"}, wantErr: true},
+		{name: "host index not a number", args: []string{"046d:b35b", "mac"}, wantErr: true},
+		{name: "slot zero", args: []string{"046d:c548", "0", "1"}, wantErr: true},
+		{name: "slot too high", args: []string{"046d:c548", "7", "1"}, wantErr: true},
+		{name: "unknown kind", args: []string{"046d:c548", "trackball", "1"}, wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := Parse(c.args)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("Parse(%v) succeeded, want error", c.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse(%v): %v", c.args, err)
+			}
+			if *got != *c.want {
+				t.Errorf("Parse(%v) = %+v, want %+v", c.args, *got, *c.want)
+			}
+		})
+	}
+}
+
+func TestBuildReport(t *testing.T) {
+	long := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
+	if len(long) != 20 {
+		t.Fatalf("long report length = %d, want 20", len(long))
+	}
+	if long[0] != reportLong || long[1] != 0x02 || long[2] != 0x07 ||
+		long[3] != fnSetHost<<4|swID || long[4] != 0x01 {
+		t.Errorf("long report = %x", long)
+	}
+	for i, b := range long[5:] {
+		if b != 0 {
+			t.Errorf("long report padding byte %d = %#x, want 0", i+5, b)
+		}
+	}
+}
+
+func TestMatchReply(t *testing.T) {
+	devIdx, featIdx, fn := uint8(0xFF), uint8(0x00), uint8(fnGetFeature)
+	fnSw := fn<<4 | swID
+
+	// A matching data reply yields its parameters.
+	reply, err := matchReply([]byte{reportShort, devIdx, featIdx, fnSw, 0x05, 0x00, 0x00}, devIdx, featIdx, fn)
+	if err != nil || len(reply) == 0 || reply[0] != 0x05 {
+		t.Errorf("data reply = %x, %v; want feature index 5", reply, err)
+	}
+
+	// A matching error reply yields an *Error carrying the code.
+	_, err = matchReply([]byte{reportErrShort, devIdx, featIdx, fnSw, 0x02, 0x00, 0x00}, devIdx, featIdx, fn)
+	var herr *Error
+	if !errors.As(err, &herr) || herr.Code != 0x02 {
+		t.Errorf("error reply = %v, want *Error{Code:2}", err)
+	}
+
+	// Everything else is discarded.
+	noise := [][]byte{
+		{reportShort, 0x01, featIdx, fnSw, 0x05},            // other device index
+		{reportShort, devIdx, 0x07, fnSw, 0x05},             // other feature index
+		{reportShort, devIdx, featIdx, 0x9<<4 | 0x2, 0x05},  // other fn/swID
+		{0x20, devIdx, featIdx, fnSw, 0x05},                 // unknown report ID
+		{reportShort, devIdx, featIdx},                      // truncated
+		{reportErrLong, 0x01, featIdx, fnSw, 0x02, 0, 0, 0}, // error for another device
+	}
+	for i, r := range noise {
+		if reply, err := matchReply(r, devIdx, featIdx, fn); reply != nil || err != nil {
+			t.Errorf("noise %d: got (%x, %v), want (nil, nil)", i, reply, err)
+		}
+	}
+}
+
+// reportQueue models a device's inbound report stream: push queues what the
+// device would answer, and read returns one queued report — waking a parked
+// read, as a real report does — or parks until ctx is done. A parked read on
+// an empty queue is a silent device; inside a synctest bubble that costs fake
+// time only. The buffer is 1 because conn.request always reads between
+// writes, so at most one reply is ever in flight.
+type reportQueue struct{ ch chan []byte }
+
+func (q *reportQueue) push(report []byte) {
+	if q.ch == nil {
+		q.ch = make(chan []byte, 1)
+	}
+	q.ch <- report
+}
+
+// Read and Close satisfy deviceConn; embedding reportQueue promotes them
+// unmodified into every fake conn below except fakeConn, which overrides
+// Read to also honor readErr.
+func (q *reportQueue) Read(ctx context.Context, p []byte) (int, error) {
+	select {
+	case r := <-q.ch: // nil channel: never ready, only ctx can fire
+		return copy(p, r), nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (q *reportQueue) Close() error { return nil }
+
+// fakeConn is a scripted deviceConn: it records writes, and a write whose
+// report ID is wantID queues the scripted reply. writeErr and readErr fail
+// the corresponding operation.
+type fakeConn struct {
+	reportQueue
+	writes   [][]byte
+	wantID   byte
+	reply    []byte
+	writeErr error
+	readErr  error
+}
+
+func (f *fakeConn) Write(_ context.Context, p []byte) (int, error) {
+	f.writes = append(f.writes, slices.Clone(p))
+	if f.writeErr == nil && f.reply != nil && p[0] == f.wantID {
+		f.push(slices.Clone(f.reply))
+	}
+	return len(p), f.writeErr
+}
+
+func (f *fakeConn) Read(ctx context.Context, p []byte) (int, error) {
+	if f.readErr != nil {
+		return 0, f.readErr
+	}
+	return f.reportQueue.Read(ctx, p)
+}
+
+// runSync runs fn as a subtest inside a synctest bubble. t.Run cannot be
+// called from inside a bubble, so every timed subtest needs this same
+// wrapping; the helper keeps that nesting out of each call site.
+func runSync(t *testing.T, name string, fn func(t *testing.T)) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) { synctest.Test(t, fn) })
+}
+
+func TestRequest(t *testing.T) {
+	devIdx, featIdx, fn := uint8(0xFF), uint8(0x00), uint8(fnGetFeature)
+	fnSw := fn<<4 | swID
+
+	// request is bounded by the ctx deadline alone: one write, then reads
+	// until a matching reply or the deadline.
+	request := func(t *testing.T, c *conn) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), probeTimeout)
+		defer cancel()
+		return c.request(ctx, devIdx, featIdx, fn)
+	}
+
+	runSync(t, "answered", func(t *testing.T) {
+		fake := &fakeConn{wantID: reportLong,
+			reply: []byte{reportLong, devIdx, featIdx, fnSw, 0x05}}
+		reply, err := request(t, &conn{dev: fake})
+		if err != nil || len(reply) == 0 || reply[0] != 0x05 {
+			t.Fatalf("request = %x, %v; want feature index 5", reply, err)
+		}
+		if len(fake.writes) != 1 || fake.writes[0][0] != reportLong {
+			t.Errorf("writes = %x, want one long report", fake.writes)
+		}
+	})
+
+	runSync(t, "write error is terminal", func(t *testing.T) {
+		werr := errors.New("invalid argument")
+		fake := &fakeConn{writeErr: werr}
+		if _, err := request(t, &conn{dev: fake}); !errors.Is(err, werr) {
+			t.Fatalf("request error = %v, want %v", err, werr)
+		}
+		if len(fake.writes) != 1 {
+			t.Errorf("%d writes, want 1", len(fake.writes))
+		}
+	})
+
+	runSync(t, "hid++ error reply", func(t *testing.T) {
+		fake := &fakeConn{wantID: reportLong,
+			reply: []byte{reportErrLong, devIdx, featIdx, fnSw, 0x02}}
+		_, err := request(t, &conn{dev: fake})
+		var herr *Error
+		if !errors.As(err, &herr) || herr.Code != 0x02 {
+			t.Fatalf("request error = %v, want *Error{Code:2}", err)
+		}
+	})
+
+	runSync(t, "no answer", func(t *testing.T) {
+		fake := &fakeConn{} // nothing is ever queued: reads park until the deadline
+		if _, err := request(t, &conn{dev: fake}); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("request error = %v, want DeadlineExceeded", err)
+		}
+		if len(fake.writes) != 1 {
+			t.Errorf("%d writes, want 1", len(fake.writes))
+		}
+	})
+}
+
+// emuConn emulates a HID++ device tree well enough to exercise resolveKind:
+// a directly attached device and/or occupied receiver pairing slots, each
+// with a kind and a changeHost capability. Unknown device indexes and
+// requests queue no reply — the read parks on the context, which a synctest
+// bubble resolves in fake time.
+type emuConn struct {
+	reportQueue
+	writes [][]byte
+	direct *emuDevice
+	slots  map[uint8]emuDevice
+}
+
+type emuDevice struct {
+	kind       Kind
+	changeHost bool
+}
+
+func (e *emuConn) device(devIdx uint8) (emuDevice, bool) {
+	if devIdx == DeviceIndexDirect {
+		if e.direct == nil {
+			return emuDevice{}, false
+		}
+		return *e.direct, true
+	}
+	dev, ok := e.slots[devIdx]
+	return dev, ok
+}
+
+func (e *emuConn) Write(_ context.Context, p []byte) (int, error) {
+	e.writes = append(e.writes, slices.Clone(p))
+	if reply := e.answer(p); reply != nil {
+		e.push(reply)
+	}
+	return len(p), nil
+}
+
+// answer computes the reply the device tree would send for a request report,
+// or nil when it would stay silent.
+func (e *emuConn) answer(report []byte) []byte {
+	devIdx, featIdx, fnSw := report[1], report[2], report[3]
+	fn := fnSw >> 4
+	dev, ok := e.device(devIdx)
+	if !ok {
+		return nil
+	}
+	var params []byte
+	switch {
+	case featIdx == 0 && fn == fnGetFeature: // IRoot
+		switch feature := uint16(report[4])<<8 | uint16(report[5]); feature {
+		case featFeatureSet:
+			params = []byte{0x01}
+		case featDeviceName:
+			params = []byte{0x03}
+		case featChangeHost:
+			if dev.changeHost {
+				params = []byte{0x04}
+			} else {
+				params = []byte{0x00}
+			}
+		default:
+			params = []byte{0x00}
+		}
+	case featIdx == 0x03 && fn == fnGetDeviceType:
+		params = []byte{byte(dev.kind)}
+	}
+	if params == nil {
+		return nil
+	}
+	return append([]byte{report[0], devIdx, featIdx, fnSw}, params...)
+}
+
+func TestRequestLinkDropped(t *testing.T) {
+	fake := &fakeConn{readErr: syscall.EIO}
+	c := &conn{dev: fake}
+	_, err := c.request(t.Context(), 0xFF, 0, fnGetFeature)
+	if !errors.Is(err, errLinkDropped) {
+		t.Fatalf("request error = %v, want errLinkDropped", err)
+	}
+	if len(fake.writes) != 1 {
+		t.Errorf("%d writes, want 1", len(fake.writes))
+	}
+}
+
+func TestSetHost(t *testing.T) {
+	featIdx, devIdx, host := uint8(0x04), uint8(0xFF), uint8(1)
+
+	runSync(t, "link dropped after write is success", func(t *testing.T) {
+		c := &conn{dev: &fakeConn{readErr: syscall.EIO}}
+		if err := c.setHost(t.Context(), featIdx, devIdx, host); err != nil {
+			t.Errorf("setHost = %v, want nil", err)
+		}
+	})
+
+	// The silence case waits one full setHostTimeout — fake time in the bubble.
+	runSync(t, "silence is success", func(t *testing.T) {
+		c := &conn{dev: &fakeConn{}}
+		if err := c.setHost(t.Context(), featIdx, devIdx, host); err != nil {
+			t.Errorf("setHost = %v, want nil", err)
+		}
+	})
+
+	runSync(t, "write error is failure", func(t *testing.T) {
+		werr := errors.New("permission denied")
+		c := &conn{dev: &fakeConn{writeErr: werr}}
+		if err := c.setHost(t.Context(), featIdx, devIdx, host); !errors.Is(err, werr) {
+			t.Errorf("setHost = %v, want %v", err, werr)
+		}
+	})
+
+	runSync(t, "hid++ error reply is failure", func(t *testing.T) {
+		// A short error reply to a long request is still a valid reply.
+		fnSw := uint8(fnSetHost)<<4 | swID
+		c := &conn{dev: &fakeConn{wantID: reportLong,
+			reply: []byte{reportErrShort, devIdx, featIdx, fnSw, 0x06}}}
+		var herr *Error
+		if err := c.setHost(t.Context(), featIdx, devIdx, host); !errors.As(err, &herr) {
+			t.Errorf("setHost = %v, want *Error", err)
+		}
+	})
+}
+
+func TestResolveKind(t *testing.T) {
+	runSync(t, "directly attached device matches", func(t *testing.T) {
+		c := &conn{dev: &emuConn{direct: &emuDevice{kind: KindMouse, changeHost: true}}}
+		got, err := c.resolveKind(t.Context(), KindMouse)
+		if err != nil || len(got) != 1 || got[0] != DeviceIndexDirect {
+			t.Errorf("resolveKind = %v, %v; want [0xFF]", got, err)
+		}
+	})
+
+	// Empty slots each park for one fake probeTimeout.
+	runSync(t, "receiver slot scan", func(t *testing.T) {
+		c := &conn{dev: &emuConn{
+			direct: &emuDevice{kind: KindReceiver},
+			slots: map[uint8]emuDevice{
+				2: {kind: KindMouse, changeHost: true},
+				4: {kind: KindKeyboard, changeHost: true},
+			},
+		}}
+		got, err := c.resolveKind(t.Context(), KindMouse)
+		if err != nil || len(got) != 1 || got[0] != 2 {
+			t.Errorf("resolveKind = %v, %v; want [2]", got, err)
+		}
+	})
+
+	runSync(t, "kind not present", func(t *testing.T) {
+		c := &conn{dev: &emuConn{
+			direct: &emuDevice{kind: KindReceiver},
+			slots:  map[uint8]emuDevice{4: {kind: KindKeyboard, changeHost: true}},
+		}}
+		if _, err := c.resolveKind(t.Context(), KindMouse); err == nil {
+			t.Error("resolveKind succeeded, want error")
+		}
+	})
+}
+
+// nudgeConn queues its reply only once answerFrom reports have been written,
+// emulating a device that sleeps through the first handshake nudges.
+type nudgeConn struct {
+	reportQueue
+	writes     int
+	answerFrom int
+	reply      []byte
+}
+
+func (n *nudgeConn) Write(_ context.Context, p []byte) (int, error) {
+	n.writes++
+	if n.writes >= n.answerFrom {
+		n.push(n.reply)
+	}
+	return len(p), nil
+}
+
+func TestSpeaksHIDPP(t *testing.T) {
+	reply := []byte{reportLong, DeviceIndexDirect, 0x00, fnGetFeature<<4 | swID, 0x01}
+
+	runSync(t, "dozing device wakes on a later nudge", func(t *testing.T) {
+		// Answers the second written report: one write per nudge.
+		c := &conn{dev: &nudgeConn{answerFrom: 2, reply: reply}}
+		if err := c.speaksHIDPP(t.Context()); err != nil {
+			t.Errorf("speaksHIDPP = %v, want nil", err)
+		}
+	})
+
+	runSync(t, "gives up after the attempts", func(t *testing.T) {
+		c := &conn{dev: &nudgeConn{answerFrom: 99, reply: reply}}
+		if err := c.speaksHIDPP(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("speaksHIDPP = %v, want DeadlineExceeded", err)
+		}
+	})
+
+	runSync(t, "write error is not retried", func(t *testing.T) {
+		werr := errors.New("permission denied")
+		c := &conn{dev: &fakeConn{writeErr: werr}}
+		if err := c.speaksHIDPP(t.Context()); !errors.Is(err, werr) {
+			t.Errorf("speaksHIDPP = %v, want %v", err, werr)
+		}
+	})
+}

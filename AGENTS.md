@@ -19,7 +19,7 @@ tree disagree on detail, the tree wins; fix the SPEC in the same change.
 ## How it works
 
 One binary, `soft-kvm` (module `github.com/unbrice/soft-kvm`), same artifact on
-every host, four subcommands:
+every host, five subcommands:
 
 - `serve [IP:]PORT` — the coordinator. Owns `owner/epoch`, serves `GET /state`,
   `POST /claim/{id}` and `GET /wait?epoch=N&id=ME` (long-poll) over mutual TLS:
@@ -31,17 +31,23 @@ every host, four subcommands:
   HID attach detector feeds the pure state machine that decides when to claim
   ownership; a run-level action worker runs the switch commands (`ddcutil` on
   Linux, `betterdisplaycli` on macOS, then e.g. a USB device command after a
-  bare `--`) on the losing host. `--trigger VID:PID[,…]` is required; macOS also
-  gets `--no-guards` and `--display-match` (SPEC §5.4, §6).
+  bare `--`) on the losing host. A command named `hid-switch` is not exec'd — it
+  runs in-process and speaks Logitech HID++ `changeHost` (SPEC §5.5).
+  `--trigger VID:PID[,…]` is required; macOS also gets `--no-guards` and
+  `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
   with a pointer to `--force` when the target has no live agent.
-- `detect` — prints attached HID devices and suggested `--trigger` values (SPEC
-  §6.1).
+- `detect` — prints attached HID devices, suggested `--trigger` values
+  (keyboards and HID++ mice), and `hid-switch` actions that make the other
+  peripheral follow the gesture (SPEC §5.5, §6.1).
+- `hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX` — runs the
+  built-in Logitech HID++ `changeHost` command by hand, without a server or
+  token (SPEC §5.5).
 
 `SOFTKVM_TOKEN` (env, never a flag) is required by `serve`, `activate` and
-`connect`; `detect` needs no token. The TLS identity and the mDNS `kh=`
-fingerprint are deterministic, salt-free functions of the token (SPEC §9).
-`SOFTKVM_SERVER` and `--server` override discovery.
+`connect`; `detect` and `hid-switch` need no token. The TLS identity and the
+mDNS `kh=` fingerprint are deterministic, salt-free functions of the token (SPEC
+§9). `SOFTKVM_SERVER` and `--server` override discovery.
 
 Per-host state lives under `platform.StateDir()` — `$XDG_STATE_HOME/soft-kvm` on
 Linux, `~/Library/Application Support/soft-kvm` on macOS: `agent.json` (last
@@ -49,12 +55,12 @@ owner) and `server` (last address that answered, the discovery cache).
 
 ## Code layout
 
-One module, one binary, nine packages under the root `main` (SPEC §11). Per-OS
+One module, one binary, ten packages under the root `main` (SPEC §11). Per-OS
 splits use filename build tags (`*_linux.go`, `*_darwin.go`), never `//go:build`
 lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
-`platform`, `detect`) import nothing internal; `model` imports `state`; `client`
-and `server` import `state` and `identity`; `agent` imports `model`, `state`,
-`client` and `discover`.
+`platform`, `hidpp`) import nothing internal; `detect` imports `hidpp`; `model`
+imports `state`; `client` and `server` import `state` and `identity`; `agent`
+imports `model`, `state`, `client`, `discover` and `hidpp`.
 
 | Package    | Files                                  | Concern                                                                                                         |
 | ---------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -65,6 +71,7 @@ and `server` import `state` and `identity`; `agent` imports `model`, `state`,
 | `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)               |
 | `platform` | `run.go`, `defaults_*`, `guard_*`      | the argv runner and the §11.1 child-process conventions; per-OS defaults; the per-OS `Guard`                    |
 | `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                                         |
+| `hidpp`    | `hidpp.go`                             | Logitech HID++ `changeHost`: the `hid-switch` virtual command and the `detect` probe (SPEC §5.5)                |
 | `client`   | `client.go`                            | the coordinator's HTTP client                                                                                   |
 | `server`   | `server.go`                            | the coordinator HTTP service                                                                                    |
 | `agent`    | `agent.go`, `watcher.go`, `actions.go` | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy           |
@@ -83,7 +90,7 @@ Go ≥ 1.25 (`go.mod` is the language floor), `CGO_ENABLED=0`, stdlib +
 FFI: HID attach events on both OSes, SPEC §6.1-6.2). No CLI framework: stdlib
 `flag`, one `FlagSet` per subcommand, because pflag's interspersed parsing eats
 the trailing `-- SWITCH-CMD ARGS...` (SPEC §11). Logging is `log/slog` to
-stderr.
+stderr; `SOFTKVM_LOG=debug` lowers the level.
 
 ## Toolchain
 
