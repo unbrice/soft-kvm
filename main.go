@@ -268,7 +268,7 @@ func connectCmd(ctx context.Context) error {
 	var displayMatch string
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&noGuards, "no-guards", false, "disable macOS AC-power and display guards")
-		fs.StringVar(&displayMatch, "display-match", "LG", "display name substring for the macOS guard")
+		fs.StringVar(&displayMatch, "display-match", "", "display name substring for the macOS guard (default: match any external display)")
 	}
 
 	fs.Usage = func() {

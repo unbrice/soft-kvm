@@ -13,16 +13,16 @@ import (
 
 const (
 	DefaultID        = "mac"
-	DefaultCheckCmd  = "betterdisplaycli get -productNameLike=LG -feature=ddc -vcp=inputSelect"
+	DefaultCheckCmd  = `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" get -ddc -vcp=inputSelect`
 	DefaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
 )
 
-// DefaultSwitchCmd points the LG at the Linux input through BetterDisplay,
+// DefaultSwitchCmd points the monitor at the other host's input through BetterDisplay,
 // which writes the standard VCP 0x60. 15 is BetterDisplay's DisplayPort
 // value; §10 records this monitor's real per-port codes, and `-- SWITCH-CMD
 // ARGS...` overrides the whole command when they deviate (SPEC §5.4).
 var DefaultSwitchCmd = []string{
-	"betterdisplaycli", "set", "-productNameLike=LG", "-feature=ddc",
+	"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay", "set", "-ddc",
 	"-vcp=inputSelect", "-value=15",
 }
 

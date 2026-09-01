@@ -101,8 +101,8 @@ type Detector interface {
 }
 
 // Guard reports whether this host may participate in switching (SPEC §11.2).
-// The reason distinguishes "dormant, no AC power" from "dormant, no LG" in
-// logs. Linux has no guards; macOS checks AC power and LG presence (§6.2).
+// The reason distinguishes "dormant, no AC power" from "dormant, display not seen" in
+// logs. Linux has no guards; macOS checks AC power and display presence (§6.2).
 type Guard interface {
 	OK(ctx context.Context) (ok bool, reason string)
 }

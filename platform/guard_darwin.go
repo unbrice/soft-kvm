@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// macOS guard: AC power and LG display presence (SPEC §6.2).
+// macOS guard: AC power and display presence (SPEC §6.2).
 
 package platform
 
@@ -43,7 +43,7 @@ func (g *Guard) OK(ctx context.Context) (ok bool, reason string) {
 
 	present, err := g.displayPresent(ctx)
 	if err != nil {
-		return false, "no LG: " + err.Error()
+		return false, "no display: " + err.Error()
 	}
 	if present {
 		g.mu.Lock()
@@ -56,7 +56,7 @@ func (g *Guard) OK(ctx context.Context) (ok bool, reason string) {
 	g.mu.Unlock()
 
 	if !present && (seen.IsZero() || time.Since(seen) > 10*time.Minute) {
-		return false, "no LG: display not seen"
+		return false, "display not seen"
 	}
 	return true, ""
 }
@@ -77,7 +77,7 @@ func (g *Guard) acPower(ctx context.Context) error {
 func (g *Guard) displayPresent(ctx context.Context) (bool, error) {
 	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := CommandContext(ctx2, []string{"betterdisplaycli", "get", "-identifiers"}).Output()
+	out, err := CommandContext(ctx2, []string{"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay", "get", "-identifiers"}).Output()
 	if err != nil {
 		return false, err
 	}

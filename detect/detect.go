@@ -72,6 +72,9 @@ func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if info.VendorID == 0 {
+			continue
+		}
 		key := deviceKey{vid: info.VendorID, pid: info.ProductID, serial: info.SerialNbr}
 		dev, ok := groups[key]
 		if !ok {
@@ -255,7 +258,7 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 	var kbdTriggers, mouseTriggers []string
 	for _, dev := range devices {
 		vidpid := vidpidString(dev.key.vid, dev.key.pid)
-		if dev.hasKeyboard() {
+		if dev.hasKeyboard() && dev.key.vid != 0 {
 			kbdTriggers = append(kbdTriggers, vidpid)
 		}
 		if dev.status == probeOK && dev.inv.Kind == hidpp.KindMouse {
@@ -406,6 +409,9 @@ func (d *hidDevice) hasHIDPP() bool {
 // exposes a vendor-defined interface or is a Logitech device (Bluetooth HID++
 // peripherals often flatten the vendor collection into the primary HID node).
 func (d *hidDevice) shouldProbe() bool {
+	if d.key.vid == 0 {
+		return false
+	}
 	return d.hasHIDPP() || d.key.vid == logitechVID
 }
 

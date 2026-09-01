@@ -181,6 +181,28 @@ func TestRenderSuggestions(t *testing.T) {
 	}
 }
 
+func TestRenderSuggestionsFiltersVIDZero(t *testing.T) {
+	internal := probedDevice{hidDevice: hidDevice{
+		key:        deviceKey{vid: 0, pid: 0},
+		interfaces: []ifaceUsage{{0x01, 0x06}},
+	}}
+	external := probedDevice{hidDevice: hidDevice{
+		key:        deviceKey{vid: 0x046d, pid: 0xb359},
+		interfaces: []ifaceUsage{{0x01, 0x06}},
+	}}
+	var buf bytes.Buffer
+	if err := renderSuggestions(&buf, []probedDevice{internal, external}); err != nil {
+		t.Fatalf("renderSuggestions: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "0000:0000") {
+		t.Errorf("expected internal device 0000:0000 to be filtered from suggestions:\n%s", out)
+	}
+	if !strings.Contains(out, "046d:b359") {
+		t.Errorf("expected external keyboard 046d:b359 to be in suggestions:\n%s", out)
+	}
+}
+
 func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	keyboard := probedDevice{hidDevice: hidDevice{
 		key:        deviceKey{vid: 0x046d, pid: 0xb35b},

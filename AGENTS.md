@@ -30,7 +30,7 @@ every host, five subcommands:
 - `connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]` — the per-host agent. An
   HID attach detector feeds the pure state machine that decides when to claim
   ownership; a run-level action worker runs the switch commands (`ddcutil` on
-  Linux, `betterdisplaycli` on macOS, then e.g. a USB device command after a
+  Linux, BetterDisplay on macOS, then e.g. a USB device command after a
   bare `--`) on the losing host. A command named `hid-switch` is not exec'd — it
   runs in-process and speaks Logitech HID++ `changeHost` (SPEC §5.5).
   `--trigger VID:PID[,…]` is required; macOS also gets `--no-guards` and
