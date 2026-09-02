@@ -677,7 +677,10 @@ trailing switch command is read as an unknown flag unless interspersal is turned
 off. Stdlib `flag` stops at the first non-flag argument and hands the rest to
 `Args()` — which *is* the `-- SWITCH-CMD ARGS...` convention, for free. Bare
 `--` tokens past the first survive into `Args()` and separate one switch command
-from the next (§5.4).
+from the next (§5.4). The same stop-at-first-positional rule would silently
+ignore a flag placed after a positional in the subcommands that take no trailing
+command, so `serve`, `activate` and `detect` reject any argument past their
+positionals, with a hint when the extra looks like a flag.
 
 **Package layout.** One module, one binary, ten packages under the root `main`:
 `state` (the `/state` wire type and atomic JSON persistence), `model` (§11.3),

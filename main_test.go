@@ -45,6 +45,42 @@ func TestRequireToken(t *testing.T) {
 	})
 }
 
+func TestRejectExtraArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want int
+		// wantErr is a substring of the expected error; empty means success.
+		wantErr string
+	}{
+		{name: "none expected, none given", args: nil, want: 0},
+		{name: "within limit", args: []string{"8700"}, want: 1},
+		{name: "at limit", args: []string{"linux"}, want: 1},
+		{name: "extra positional", args: []string{"8700", "8800"}, want: 1, wantErr: `unexpected extra argument "8800"`},
+		{name: "extra when none expected", args: []string{"8700"}, want: 0, wantErr: `unexpected extra argument "8700"`},
+		{
+			name:    "flag after positional",
+			args:    []string{"8700", "--state", "/tmp/x"},
+			want:    1,
+			wantErr: `"--state" follows a positional argument and would be ignored; flags must come first`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := rejectExtraArgs("cmd", tc.args, tc.want)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("got error %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestSplitSwitchCommands(t *testing.T) {
 	cases := []struct {
 		name    string

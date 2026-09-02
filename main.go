@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -125,6 +126,21 @@ func requireToken() (string, error) {
 	return token, nil
 }
 
+// rejectExtraArgs fails a subcommand that expects at most want positional
+// arguments when Parse left more in args. Stdlib flag stops parsing at the
+// first positional, so a flag placed after one would be silently ignored;
+// a flag-looking extra gets a hint (SPEC §11).
+func rejectExtraArgs(name string, args []string, want int) error {
+	if len(args) <= want {
+		return nil
+	}
+	extra := args[want]
+	if strings.HasPrefix(extra, "-") {
+		return fmt.Errorf("%s: %q follows a positional argument and would be ignored; flags must come first", name, extra)
+	}
+	return fmt.Errorf("%s: unexpected extra argument %q", name, extra)
+}
+
 func serveCmd(ctx context.Context) error {
 	defaultStatePath, err := platform.DefaultServeStatePath()
 	if err != nil {
@@ -139,6 +155,10 @@ func serveCmd(ctx context.Context) error {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[2:]); err != nil {
+		return errUsage
+	}
+	if err := rejectExtraArgs("serve", fs.Args(), 1); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
 	token, err := requireToken()
@@ -196,6 +216,10 @@ func activateCmd(ctx context.Context) error {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[2:]); err != nil {
+		return errUsage
+	}
+	if err := rejectExtraArgs("activate", fs.Args(), 1); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
 	token, err := requireToken()
@@ -394,7 +418,8 @@ func detectCmd(ctx context.Context) error {
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return errUsage
 	}
-	if fs.NArg() > 0 {
+	if err := rejectExtraArgs("detect", fs.Args(), 0); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
 	return detect.Run(ctx, os.Stdout)
