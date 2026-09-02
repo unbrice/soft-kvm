@@ -24,15 +24,15 @@ every host, five subcommands:
 - `serve [IP:]PORT` — the coordinator. Owns `owner/epoch`, serves `GET /state`,
   `POST /claim/{id}` and `GET /wait?epoch=N&id=ME` (long-poll) over mutual TLS:
   the server identity and the required client certificate are both derived from
-  the shared secret. Port defaults to 8700, state to
-  `--state /var/lib/soft-kvm/state.json`, and it advertises itself over mDNS
-  unless `--no-advertise` (SPEC §6.4, §7).
+  the shared secret. Port defaults to 8700; `--state` defaults to
+  `$STATE_DIRECTORY/state.json` under systemd, else `StateDir/state.json`. It
+  advertises itself over mDNS unless `--no-advertise` (SPEC §6.4, §7).
 - `connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]` — the per-host agent. An
   HID attach detector feeds the pure state machine that decides when to claim
   ownership; a run-level action worker runs the switch commands (`ddcutil` on
-  Linux, BetterDisplay on macOS, then e.g. a USB device command after a
-  bare `--`) on the losing host. A command named `hid-switch` is not exec'd — it
-  runs in-process and speaks Logitech HID++ `changeHost` (SPEC §5.5).
+  Linux, BetterDisplay on macOS, then e.g. a USB device command after a bare
+  `--`) on the losing host. A command named `hid-switch` is not exec'd — it runs
+  in-process and speaks Logitech HID++ `changeHost` (SPEC §5.5).
   `--trigger VID:PID[,…]` is required; macOS also gets `--no-guards` and
   `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
@@ -69,7 +69,7 @@ imports `model`, `state`, `client`, `discover` and `hidpp`.
 | `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                              |
 | `identity` | `tls.go`                               | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf` |
 | `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)               |
-| `platform` | `run.go`, `defaults_*`, `guard_*`      | the argv runner and the §11.1 child-process conventions; per-OS defaults; the per-OS `Guard`                    |
+| `platform` | `run.go`, `defaults*`, `guard_*`       | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`                      |
 | `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                                         |
 | `hidpp`    | `hidpp.go`                             | Logitech HID++ `changeHost`: the `hid-switch` virtual command and the `detect` probe (SPEC §5.5)                |
 | `client`   | `client.go`                            | the coordinator's HTTP client                                                                                   |

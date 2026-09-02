@@ -126,8 +126,12 @@ func requireToken() (string, error) {
 }
 
 func serveCmd(ctx context.Context) error {
+	defaultStatePath, err := platform.DefaultServeStatePath()
+	if err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	statePath := fs.String("state", "/var/lib/soft-kvm/state.json", "persisted owner/epoch/since path")
+	statePath := fs.String("state", defaultStatePath, "persisted owner/epoch/since path")
 	instance := fs.String("instance", "", "mDNS instance name (default: hostname)")
 	noAdvertise := fs.Bool("no-advertise", false, "skip mDNS advertisement")
 	fs.Usage = func() {
