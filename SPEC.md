@@ -158,24 +158,28 @@ reach the monitor. Three conditions gate it, all required.
   reports them in `/state` as `live`. The loser refuses to act when the winner
   has no live agent. `soft-kvm activate` against a host with no live agent
   requires `--force`.
-- **DDC veto.** `--check-cmd` must succeed. Non-zero exit means the input is
-  already inactive: skip, and resynchronise `last_owner`.
+- **DDC veto.** When `--check-cmd` is set, it must succeed. Non-zero exit means
+  the input is already inactive: skip, and resynchronise `last_owner`. When
+  `--check-cmd` is empty (the macOS default), the veto is skipped and the switch
+  operates in fire-and-forget mode.
 
 **Circuit breaker:** 5 s cooldown after any switch, and 3 switches within 30 s
 disables switching for 60 s with a log line. A misbehaving detector costs one
 manual OSD press, not a loop.
 
-**Confirming it landed, and what happens when it does not.** The write is
-fire-and-forget (finding 10), so the loser confirms locally, using the probe it
-already has: a switch that worked makes `--check-cmd` start *failing*, because
-this host's input is no longer active. The falling edge is the receipt. The
-switch command is bounded twice: glue-side by `--switch-timeout` (default 30 s,
-SIGTERM then SIGKILL after `WaitDelay`), and machine-side by a 60 s watchdog.
-Either failure feeds the same retry/notify path and counts toward the circuit
-breaker like any other failure. Results are accepted only while their effect is
-outstanding — a late `SwitchExit` or `ProbeExit` is ignored and logged — and a
-confirm window with a probe still in flight waits for it instead of closing on
-absent evidence.
+**Confirming it landed, and what happens when it does not.** When `--check-cmd`
+is set, the write is fire-and-forget (finding 10), so the loser confirms
+locally, using the probe it already has: a switch that worked makes
+`--check-cmd` start *failing*, because this host's input is no longer active.
+The falling edge is the receipt. When `--check-cmd` is empty, exit 0 from the
+switch commands confirms the switch immediately; a non-zero exit retries up to
+`--switch-retries` (1 s apart) and then notifies. The switch command is bounded
+twice: glue-side by `--switch-timeout` (default 30 s, SIGTERM then SIGKILL
+after `WaitDelay`), and machine-side by a 60 s watchdog. Either failure feeds
+the same retry/notify path and counts toward the circuit breaker like any other
+failure. Results are accepted only while their effect is outstanding — a late
+`SwitchExit` or `ProbeExit` is ignored and logged — and a confirm window with a
+probe still in flight waits for it instead of closing on absent evidence.
 
 1. Run the switch commands, in order.
 2. Poll `--check-cmd` every 500 ms for `--confirm 4s`. It goes non-zero ⇒ done.
@@ -300,7 +304,7 @@ no required arguments.
 | ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--id ID`               | `linux`                                                      | `mac`                                                                                              | Claimed identity (from `GOOS`; override for testing)                                                                                                                                                                                                                                           |
 | `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent. Repeat after a bare `--` for each additional command (e.g. display, then a USB device) — they run in order, the display probe stays the receipt. A command named `hid-switch` is built in, not exec'd (§5.5) |
-| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" get -ddc -vcp=inputSelect`                            | Veto before the switch, receipt after it (§4.3)                                                                                                                                                                                                                                                |
+| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | —                                                                                                  | Veto before the switch, receipt after it (§4.3); empty on macOS (fire-and-forget switch)                                                                                                                                                                                                       |
 | `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3)                                                                                                                                                                                                        |
 | `--switch-timeout 30s`  | 30s                                                          | 30s                                                                                                | Bound on one `SWITCH-CMD` run — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                              |
 | `--trigger LIST`        | required                                                     | required                                                                                           | Comma-separated VID:PID filters for the trigger detector — the USB receiver, plus optionally a Bluetooth keyboard (§6.3); `soft-kvm detect` lists candidates                                                                                                                                   |

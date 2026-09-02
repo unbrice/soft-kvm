@@ -302,6 +302,72 @@ func TestAgentSwitchPath(t *testing.T) {
 	}
 }
 
+func TestAgentSwitchPathNoCheck(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+
+	if _, err := client.Claim(context.Background(), base, "mac", true); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	if err := state.Save(statePath, state.AgentState{LastOwner: "mac"}); err != nil {
+		t.Fatalf("save agent state: %v", err)
+	}
+
+	s.SetWaiterCount("other", 1)
+
+	det := newFakeDetector()
+	runner := &recordingRunner{errs: []error{nil}}
+	guard := &fakeGuard{ok: true}
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.ID = "mac"
+	cfg.Machine.ID = "mac"
+	cfg.Machine.NoCheck = true
+	cfg.CheckArgv = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+
+	waitForLive(t, s, "mac")
+
+	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+		t.Fatalf("force claim other: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		calls := runner.Calls()
+		if len(calls) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 1 runner call, got %d: %v", len(calls), calls)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	calls := runner.Calls()
+	if !slices.Equal(calls[0], cfg.SwitchCommands[0]) {
+		t.Errorf("call 0 = %v, want switch %v", calls[0], cfg.SwitchCommands[0])
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		var as state.AgentState
+		if err := state.Load(statePath, &as); err == nil && as.LastOwner == "other" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("agent state not updated to other")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestAgentVetoPath(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()

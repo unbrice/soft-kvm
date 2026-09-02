@@ -43,6 +43,7 @@ type MachineConfig struct {
 	Confirm       time.Duration
 	SwitchRetries int
 	RetrySpacing  time.Duration
+	NoCheck       bool // when true, skip pre-switch veto probe and confirm loop (fire-and-forget switch)
 	// Cooldown, BreakerWindow, BreakerMax and BreakerOpenFor implement the
 	// §4.3 circuit breaker.
 	Cooldown       time.Duration
@@ -196,6 +197,16 @@ func (m *Machine) handleSwitchExit(err error, now time.Time) []Action {
 	if err != nil {
 		status = err.Error()
 	}
+
+	if m.cfg.NoCheck {
+		if err != nil {
+			var actions []Action
+			m.retryOrFail(now, &actions, fmt.Sprintf("switch to %q attempt %d exit: %s", m.reconState.Owner, m.attemptCount, status))
+			return actions
+		}
+		return m.sequenceSuccess(now)
+	}
+
 	m.mode = modeConfirming
 	m.confirmDeadline = now.Add(m.cfg.Confirm)
 	m.nextProbeAt = time.Time{}
@@ -272,6 +283,19 @@ func (m *Machine) reconcile(s *state.ServerState, now time.Time) []Action {
 		m.gateWake = until
 		return []Action{{
 			Log: fmt.Sprintf("deferring switch to %q: %s", s.Owner, reason),
+		}}
+	}
+
+	if m.cfg.NoCheck {
+		m.mode = modeSwitching
+		m.reconState = s
+		m.latestState = s
+		m.switchSentAt = now
+		m.attemptCount = 1
+		m.switchOutstanding = true
+		return []Action{{
+			Switch: true,
+			Log:    fmt.Sprintf("switching to %q attempt 1: ownership transition, winner live, gates clear (no-check mode)", s.Owner),
 		}}
 	}
 

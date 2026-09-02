@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	DefaultID        = "mac"
-	DefaultCheckCmd  = `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" get -ddc -vcp=inputSelect`
+	DefaultID = "mac"
+	// DefaultCheckCmd is empty on macOS: DDC read is unsupported on many monitors
+	// and USB4/Thunderbolt connections (including LG UltraWide). The switch operates
+	// in fire-and-forget mode by default; override via --check-cmd if DDC read works.
+	DefaultCheckCmd  = ""
 	DefaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
 )
 

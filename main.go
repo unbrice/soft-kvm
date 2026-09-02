@@ -321,6 +321,7 @@ func connectCmd(ctx context.Context) error {
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
 		BreakerOpenFor: 60 * time.Second,
+		NoCheck:        *checkCmd == "",
 	}
 
 	stateDir, err := platform.StateDir()
@@ -328,6 +329,11 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
+
+	var checkArgv []string
+	if *checkCmd != "" {
+		checkArgv = platform.ShellArgv(*checkCmd)
+	}
 
 	cfg := agent.Config{
 		ID:             *id,
@@ -340,7 +346,7 @@ func connectCmd(ctx context.Context) error {
 		Machine:        &machineCfg,
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
 		SwitchCommands: switchCommands,
-		CheckArgv:      platform.ShellArgv(*checkCmd),
+		CheckArgv:      checkArgv,
 		NotifyArgv:     platform.ShellArgv(*notifyCmd),
 		CheckTimeout:   *checkTimeout,
 		SwitchTimeout:  *switchTimeout,

@@ -756,6 +756,60 @@ func TestMachineSequenceEndLastOwner(t *testing.T) {
 	})
 }
 
+func TestNoCheck(t *testing.T) {
+	t0 := time.Unix(0, 0)
+
+	t.Run("clean switch directly switches and confirms on exit 0", func(t *testing.T) {
+		cfg := testConfig("mac")
+		cfg.NoCheck = true
+		m := NewMachine(cfg, "mac", true)
+
+		acts := m.Step(Event{Now: t0, State: mkstate("linux", 1, map[string]bool{"linux": true})})
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "switching to \"linux\" attempt 1"},
+			{WakeAt: t0.Add(SwitchDeadline)},
+		})
+
+		switchDone := t0.Add(500 * time.Millisecond)
+		acts = m.Step(Event{Now: switchDone, SwitchExit: exit(nil)})
+		checkActions(t, acts, []Action{
+			{SaveOwner: ptr("linux"), Log: "confirmed"},
+		})
+		if !m.cooldownUntil.Equal(switchDone.Add(cfg.Cooldown)) {
+			t.Fatalf("cooldown = %v, want %v", m.cooldownUntil, switchDone.Add(cfg.Cooldown))
+		}
+	})
+
+	t.Run("switch failure retries and notifies on exhaustion", func(t *testing.T) {
+		cfg := testConfig("mac")
+		cfg.NoCheck = true
+		cfg.SwitchRetries = 1
+		m := NewMachine(cfg, "mac", true)
+
+		m.Step(Event{Now: t0, State: mkstate("linux", 1, map[string]bool{"linux": true})})
+
+		fail1 := t0.Add(200 * time.Millisecond)
+		acts := m.Step(Event{Now: fail1, SwitchExit: exit(errors.New("switch error"))})
+		retryAt := t0.Add(cfg.RetrySpacing)
+		checkActions(t, acts, []Action{
+			{Log: "waiting retry spacing"},
+			{WakeAt: retryAt},
+		})
+
+		acts = m.Step(Event{Now: retryAt})
+		checkActions(t, acts, []Action{
+			{Switch: true, Log: "retry switch to \"linux\" attempt 2"},
+			{WakeAt: retryAt.Add(SwitchDeadline)},
+		})
+
+		fail2 := retryAt.Add(200 * time.Millisecond)
+		acts = m.Step(Event{Now: fail2, SwitchExit: exit(errors.New("switch error 2"))})
+		checkActions(t, acts, []Action{
+			{Notify: true, SaveOwner: ptr("linux"), Log: "failed"},
+		})
+	})
+}
+
 func ExampleMachine_Step() {
 	cfg := MachineConfig{
 		ID:             "linux",
