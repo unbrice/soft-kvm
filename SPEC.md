@@ -459,6 +459,12 @@ monitor hotplug and across reboots**. Do not pin `--bus`; pin `--model` or
 | Packaging          | `~/Library/LaunchAgents/local.soft-kvm.plist` (`RunAtLoad`, `KeepAlive`), token in a `0600` env file, log to `~/Library/Logs/`                                                                                                                                                                  |
 | Installs           | One binary + one plist. `pmset` is stock; BetterDisplay is at `/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay`                                                                                                                                                                    |
 
+- **`hid-switch` needs Input Monitoring** (§5.5). Enumeration and the attach
+  events need no TCC grant, but the virtual command — like `detect`'s scan —
+  opens the keyboard or mouse HID node for the HID++ write, and macOS gates that
+  on the terminal's Input Monitoring permission (System Settings → Privacy &
+  Security → Input Monitoring). `detect` names the setting when a scan is
+  denied.
 - **The display-presence guard is a trap.** With Deep Sleep on, the LG drops the
   link on the input it is not showing, so "LG present" is false exactly when the
   Mac is docked but not active — and the guard would make the Mac permanently
