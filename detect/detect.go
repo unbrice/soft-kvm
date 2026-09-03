@@ -135,11 +135,15 @@ type probedDevice struct {
 	err    error
 }
 
-// scanFailure renders a failed scan for display.
+// scanFailure renders a failed scan for display. A permission fix is only
+// worth spelling out for Logitech devices: HID++ is their protocol, so a
+// denied scan anywhere else found nothing and needs no action.
 func (d probedDevice) scanFailure() string {
 	switch {
+	case errors.Is(d.err, errPermission) && d.key.vid == logitechVID:
+		return "🔒 permission denied — " + permissionRemediation
 	case errors.Is(d.err, errPermission):
-		return "🔒 permission denied — a udev rule for hidraw write access is needed (SPEC §5.5)"
+		return "🔒 permission denied — scan skipped; not a Logitech device, so no HID++ to find"
 	case errors.Is(d.err, errNoAnswer):
 		return "⏳ no answer — the device did not speak HID++"
 	default:

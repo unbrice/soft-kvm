@@ -355,16 +355,19 @@ func TestProbeAllSkipsNonHIDPP(t *testing.T) {
 func TestScanFailure(t *testing.T) {
 	cases := []struct {
 		name string
+		vid  uint16
 		err  error
 		want string
 	}{
-		{"permission", errPermission, "🔒 permission denied"},
-		{"no answer", errNoAnswer, "⏳ no answer"},
-		{"other", errors.New("boom"), "⚠️ boom"},
+		{"permission logitech", logitechVID, errPermission, permissionRemediation},
+		{"permission other", 0x0b05, errPermission, "no HID++ to find"},
+		{"no answer", 0, errNoAnswer, "⏳ no answer"},
+		{"other", 0, errors.New("boom"), "⚠️ boom"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			d := probedDevice{status: probeFailed, err: c.err}
+			d.key.vid = c.vid
 			if got := d.scanFailure(); !strings.Contains(got, c.want) {
 				t.Errorf("scanFailure() = %q, want substring %q", got, c.want)
 			}
