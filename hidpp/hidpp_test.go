@@ -77,17 +77,19 @@ func TestParse(t *testing.T) {
 }
 
 func TestBuildReport(t *testing.T) {
-	long := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
-	if len(long) != 20 {
-		t.Fatalf("long report length = %d, want 20", len(long))
+	// Every request is the 7-byte short report: the long report is a reply
+	// size — receivers STALL the 20-byte SET_REPORT on their control pipe.
+	r := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
+	if len(r) != 7 {
+		t.Fatalf("report length = %d, want 7", len(r))
 	}
-	if long[0] != reportLong || long[1] != 0x02 || long[2] != 0x07 ||
-		long[3] != fnSetHost<<4|swID || long[4] != 0x01 {
-		t.Errorf("long report = %x", long)
+	if r[0] != reportShort || r[1] != 0x02 || r[2] != 0x07 ||
+		r[3] != fnSetHost<<4|swID || r[4] != 0x01 {
+		t.Errorf("report = %x", r)
 	}
-	for i, b := range long[5:] {
+	for i, b := range r[5:] {
 		if b != 0 {
-			t.Errorf("long report padding byte %d = %#x, want 0", i+5, b)
+			t.Errorf("report padding byte %d = %#x, want 0", i+5, b)
 		}
 	}
 }
@@ -102,8 +104,9 @@ func TestMatchReply(t *testing.T) {
 		t.Errorf("data reply = %x, %v; want feature index 5", reply, err)
 	}
 
-	// A matching error reply yields an *Error carrying the code.
-	_, err = matchReply([]byte{reportErrShort, devIdx, featIdx, fnSw, 0x02, 0x00, 0x00}, devIdx, featIdx, fn)
+	// A matching error reply yields an *Error carrying the code. The error
+	// indicator sits in the sub-ID byte of a normal short/long report.
+	_, err = matchReply([]byte{reportShort, devIdx, errSubShort, featIdx, fnSw, 0x02, 0x00}, devIdx, featIdx, fn)
 	var herr *Error
 	if !errors.As(err, &herr) || herr.Code != 0x02 {
 		t.Errorf("error reply = %v, want *Error{Code:2}", err)
@@ -111,12 +114,13 @@ func TestMatchReply(t *testing.T) {
 
 	// Everything else is discarded.
 	noise := [][]byte{
-		{reportShort, 0x01, featIdx, fnSw, 0x05},            // other device index
-		{reportShort, devIdx, 0x07, fnSw, 0x05},             // other feature index
-		{reportShort, devIdx, featIdx, 0x9<<4 | 0x2, 0x05},  // other fn/swID
-		{0x20, devIdx, featIdx, fnSw, 0x05},                 // unknown report ID
-		{reportShort, devIdx, featIdx},                      // truncated
-		{reportErrLong, 0x01, featIdx, fnSw, 0x02, 0, 0, 0}, // error for another device
+		{reportShort, 0x01, featIdx, fnSw, 0x05},                         // other device index
+		{reportShort, devIdx, 0x07, fnSw, 0x05},                          // other feature index
+		{reportShort, devIdx, featIdx, 0x9<<4 | 0x2, 0x05},               // other fn/swID
+		{0x20, devIdx, featIdx, fnSw, 0x05},                              // unknown report ID
+		{reportShort, devIdx, featIdx},                                   // truncated
+		{reportLong, 0x01, errSubLong, featIdx, fnSw, 0x02, 0},           // error for another device
+		{reportLong, devIdx, errSubLong, featIdx, 0x9<<4 | 0x2, 0x02, 0}, // error for another fn
 	}
 	for i, r := range noise {
 		if reply, err := matchReply(r, devIdx, featIdx, fn); reply != nil || err != nil {
@@ -125,7 +129,69 @@ func TestMatchReply(t *testing.T) {
 	}
 }
 
-// reportQueue models a device's inbound report stream: push queues what the
+// regReceiverInfoAddr is the low address byte of the pairing-table register,
+// as it appears on the wire.
+const regReceiverInfoAddr = byte(regReceiverInfo & 0xFF)
+
+func TestMatchRegisterReply(t *testing.T) {
+	devIdx, addr, subreg := uint8(0xFF), regReceiverInfoAddr, uint8(0x20)
+
+	// A matching data reply yields the register data starting at the echoed
+	// sub-register (Solaar's slicing convention).
+	reply, err := matchRegisterReply(
+		[]byte{reportLong, devIdx, subRegReadLong, addr, subreg, 0x04, 0x08}, devIdx, subRegReadLong, addr, subreg)
+	if err != nil || len(reply) < 2 || reply[0] != subreg || reply[1] != 0x04 {
+		t.Errorf("data reply = %x, %v; want sub-reg echo then data", reply, err)
+	}
+
+	// A 1.0 error reply (empty slot) yields an *Error carrying the code.
+	_, err = matchRegisterReply(
+		[]byte{reportShort, devIdx, errSubShort, subRegReadLong, addr, 0x03}, devIdx, subRegReadLong, addr, subreg)
+	var herr *Error
+	if !errors.As(err, &herr) || herr.Code != 0x03 {
+		t.Errorf("error reply = %v, want *Error{Code:3}", err)
+	}
+
+	// Everything else is discarded.
+	noise := [][]byte{
+		{reportLong, 0x01, subRegReadLong, addr, subreg, 0x04}, // other device index
+		{reportLong, devIdx, subRegReadLong, addr, 0x21, 0x04}, // other sub-register
+		{reportLong, devIdx, subRegReadLong, 0xB4, subreg, 0x04},
+		{reportShort, devIdx, subRegReadLong, addr}, // truncated
+	}
+	for i, r := range noise {
+		if reply, err := matchRegisterReply(r, devIdx, subRegReadLong, addr, subreg); reply != nil || err != nil {
+			t.Errorf("noise %d: got (%x, %v), want (nil, nil)", i, reply, err)
+		}
+	}
+}
+
+func TestPairingKind(t *testing.T) {
+	unifying := make([]byte, 17) // data starts at the echoed sub-register
+	unifying[7] = 0x01
+	bolt := make([]byte, 17)
+	bolt[1] = 0x02
+	cases := []struct {
+		name string
+		bolt bool
+		data []byte
+		want Kind
+	}{
+		{"unifying keyboard", false, unifying, KindKeyboard},
+		{"bolt mouse", true, bolt, KindMouse},
+		{"unifying truncated", false, unifying[:7], KindUnknown},
+		{"bolt truncated", true, bolt[:1], KindUnknown},
+		{"unknown nibble", false, make([]byte, 17), KindUnknown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pairingKind(c.bolt, c.data); got != c.want {
+				t.Errorf("pairingKind(%t, %x) = %v, want %v", c.bolt, c.data, got, c.want)
+			}
+		})
+	}
+}
+
 // device would answer, and read returns one queued report — waking a parked
 // read, as a real report does — or parks until ctx is done. A parked read on
 // an empty queue is a silent device; inside a synctest bubble that costs fake
@@ -202,14 +268,14 @@ func TestRequest(t *testing.T) {
 	}
 
 	runSync(t, "answered", func(t *testing.T) {
-		fake := &fakeConn{wantID: reportLong,
-			reply: []byte{reportLong, devIdx, featIdx, fnSw, 0x05}}
+		fake := &fakeConn{wantID: reportShort,
+			reply: []byte{reportShort, devIdx, featIdx, fnSw, 0x05}}
 		reply, err := request(t, &conn{dev: fake})
 		if err != nil || len(reply) == 0 || reply[0] != 0x05 {
 			t.Fatalf("request = %x, %v; want feature index 5", reply, err)
 		}
-		if len(fake.writes) != 1 || fake.writes[0][0] != reportLong {
-			t.Errorf("writes = %x, want one long report", fake.writes)
+		if len(fake.writes) != 1 || fake.writes[0][0] != reportShort {
+			t.Errorf("writes = %x, want one short report", fake.writes)
 		}
 	})
 
@@ -225,8 +291,8 @@ func TestRequest(t *testing.T) {
 	})
 
 	runSync(t, "hid++ error reply", func(t *testing.T) {
-		fake := &fakeConn{wantID: reportLong,
-			reply: []byte{reportErrLong, devIdx, featIdx, fnSw, 0x02}}
+		fake := &fakeConn{wantID: reportShort,
+			reply: []byte{reportShort, devIdx, errSubShort, featIdx, fnSw, 0x02}}
 		_, err := request(t, &conn{dev: fake})
 		var herr *Error
 		if !errors.As(err, &herr) || herr.Code != 0x02 {
@@ -249,7 +315,8 @@ func TestRequest(t *testing.T) {
 // a directly attached device and/or occupied receiver pairing slots, each
 // with a kind and a changeHost capability. Unknown device indexes and
 // requests queue no reply — the read parks on the context, which a synctest
-// bubble resolves in fake time.
+// bubble resolves in fake time. When slots is set, 0xFF also answers HID++
+// 1.0 pairing-table register reads from its local "flash".
 type emuConn struct {
 	reportQueue
 	writes [][]byte
@@ -284,6 +351,9 @@ func (e *emuConn) Write(_ context.Context, p []byte) (int, error) {
 // answer computes the reply the device tree would send for a request report,
 // or nil when it would stay silent.
 func (e *emuConn) answer(report []byte) []byte {
+	if report[2] == subRegReadLong && report[3] == regReceiverInfoAddr {
+		return e.pairingReply(report)
+	}
 	devIdx, featIdx, fnSw := report[1], report[2], report[3]
 	fn := fnSw >> 4
 	dev, ok := e.device(devIdx)
@@ -314,6 +384,46 @@ func (e *emuConn) answer(report []byte) []byte {
 		return nil
 	}
 	return append([]byte{report[0], devIdx, featIdx, fnSw}, params...)
+}
+
+// pairingReply answers a pairing-table register read from the receiver's
+// local "flash": an occupied slot gets a long data reply echoing the
+// sub-register (the kind nibble lands at data[1] on Bolt, data[7] on
+// Unifying, past the echo), an empty slot an immediate 1.0 error. Without
+// slots the interface is not a receiver and stays silent.
+func (e *emuConn) pairingReply(report []byte) []byte {
+	if e.slots == nil {
+		return nil
+	}
+	subreg := report[4]
+	var slot uint8
+	var bolt bool
+	switch {
+	case subreg >= 0x20 && subreg <= 0x25: // Unifying: 0x20+slot-1
+		slot = subreg - 0x20 + 1
+	case subreg >= 0x51 && subreg <= 0x56: // Bolt: 0x50+slot
+		slot, bolt = subreg-0x50, true
+	default:
+		return nil
+	}
+	dev, ok := e.slots[slot]
+	if !ok {
+		return []byte{reportShort, report[1], errSubShort, subRegReadLong, regReceiverInfoAddr, 0x03}
+	}
+	var nibble byte
+	switch dev.kind {
+	case KindKeyboard:
+		nibble = 0x01
+	case KindMouse:
+		nibble = 0x02
+	}
+	data := make([]byte, 16)
+	if bolt {
+		data[0] = nibble
+	} else {
+		data[6] = nibble
+	}
+	return append([]byte{reportLong, report[1], subRegReadLong, regReceiverInfoAddr, subreg}, data...)
 }
 
 func TestRequestLinkDropped(t *testing.T) {
@@ -355,10 +465,9 @@ func TestSetHost(t *testing.T) {
 	})
 
 	runSync(t, "hid++ error reply is failure", func(t *testing.T) {
-		// A short error reply to a long request is still a valid reply.
 		fnSw := uint8(fnSetHost)<<4 | swID
-		c := &conn{dev: &fakeConn{wantID: reportLong,
-			reply: []byte{reportErrShort, devIdx, featIdx, fnSw, 0x06}}}
+		c := &conn{dev: &fakeConn{wantID: reportShort,
+			reply: []byte{reportShort, devIdx, errSubShort, featIdx, fnSw, 0x06}}}
 		var herr *Error
 		if err := c.setHost(t.Context(), featIdx, devIdx, host); !errors.As(err, &herr) {
 			t.Errorf("setHost = %v, want *Error", err)
@@ -375,7 +484,8 @@ func TestResolveKind(t *testing.T) {
 		}
 	})
 
-	// Empty slots each park for one fake probeTimeout.
+	// Empty slots draw an immediate 1.0 error reply from the pairing table;
+	// only matching slots cost a changeHost query over the "air".
 	runSync(t, "receiver slot scan", func(t *testing.T) {
 		c := &conn{dev: &emuConn{
 			direct: &emuDevice{kind: KindReceiver},

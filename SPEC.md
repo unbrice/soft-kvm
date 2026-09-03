@@ -382,18 +382,24 @@ only the primary usage, so interfaces without a vendor page are tried after the
 vendor ones. Each candidate must answer a HID++ `getFeature(IRoot)` before it is
 used; the handshake nudges a few times before giving up, because a dozing
 Bluetooth device can ignore the first requests until its vendor channel wakes.
-Only the 20-byte long report (`0x11`) is sent: every HID++ 2.0 device carries
-it, `changeHost` targets are 2.0 by definition, and short-only HID++ 1.0 devices
-predate Easy-Switch — silence to the long report is logged as a possible
-short-only device. Replies may still arrive short. Kinds come from
-`getDeviceType` (feature `0x0005`, function 2) — one byte, no name reads. A kind
-target resolves to the directly attached device when it matches — a Bluetooth
-device answers pairing-slot scans as itself, once per slot — else to every
-pairing slot of the kind. **No reply to `setHost` counts as success**: a device
-that switched drops the link to this host mid-ACK, which over Bluetooth surfaces
-as a read error (EIO on Linux hidraw), not a timeout; an explicit HID++ error
-reply is the failure. On Linux the agent needs write access to the hidraw node
-(§6.1).
+When the direct index stays silent to HID++ 2.0, one HID++ 1.0 register read
+settles it: receivers speak only 1.0 registers at `0xFF`, answered locally from
+their own flash, so even an error reply proves Logitech framing. Only the 7-byte
+short report (`0x10`) is sent: every HID++ device carries it, our requests never
+exceed its three parameter bytes, and Bolt receivers STALL the 20-byte
+`SET_REPORT` on their control pipe. Replies may still arrive long. Kinds come
+from `getDeviceType` (feature `0x0005`, function 2) — one byte, no name reads. A
+receiver's slot map is its local pairing table (HID++ 1.0 register `0x2B5`,
+sub-registers `0x20+slot-1` on Unifying, `0x50+slot` on Bolt): on-chip flash, no
+RF, so it is right whether a paired device is awake, asleep, off, or switched to
+the other host. A kind target resolves to the directly attached device when it
+matches — a Bluetooth device answers pairing-slot queries as itself, once per
+slot — else to every table slot of the kind, each confirmed with a (nudged)
+changeHost query over the air. **No reply to `setHost` counts as success**: a
+device that switched drops the link to this host mid-ACK, which over Bluetooth
+surfaces as a read error (EIO on Linux hidraw), not a timeout; an explicit HID++
+error reply is the failure. On Linux the agent needs write access to the hidraw
+node (§6.1).
 
 Typical pair — keyboard and mouse on receiver channel 1 and BT channel 2:
 

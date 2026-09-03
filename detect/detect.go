@@ -16,6 +16,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/telesma-app/hid"
@@ -39,6 +40,7 @@ type hidDevice struct {
 	mfr        string
 	product    string
 	interfaces []ifaceUsage
+	shadow     bool // kernel-created virtual node of a receiver-paired peripheral
 }
 
 // probeBudget bounds the whole HID++ scan, all devices together: one shared
@@ -86,6 +88,7 @@ func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
 			groups[key] = dev
 		}
 		dev.interfaces = append(dev.interfaces, ifaceUsage{usagePage: info.UsagePage, usage: info.Usage})
+		dev.shadow = dev.shadow || kernelShadow(info.Path)
 	}
 	devices := make([]*hidDevice, 0, len(groups))
 	for _, dev := range groups {
@@ -109,15 +112,17 @@ func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
 type probeStatus int
 
 const (
-	probeSkipped probeStatus = iota
-	probeOK                  // inv is set
-	probeFailed              // err says why: permission, no answer, ...
+	probeSkipped  probeStatus = iota
+	probeOK                   // inv is set
+	probeFailed               // err says why: permission, no answer, ...
+	probeNotHIDPP             // every interface rejected the report: cannot speak HID++
 )
 
 // The named scan failures, so the display can pick an icon per cause.
 var (
 	errNoAnswer   = errors.New("no answer")
 	errPermission = errors.New("permission denied")
+	errNotHIDPP   = errors.New("no interface carries the HID++ report")
 )
 
 // probedDevice is a hidDevice plus the outcome of its HID++ scan. The
@@ -149,6 +154,10 @@ func classifyProbeErr(err error) error {
 		return errPermission
 	case errors.Is(err, context.DeadlineExceeded):
 		return errNoAnswer
+	case errors.Is(err, syscall.EPIPE), errors.Is(err, syscall.EINVAL):
+		// Every interface rejected the report on write: its report
+		// descriptor has no HID++ report, so the device cannot speak HID++.
+		return errNotHIDPP
 	default:
 		return err
 	}
@@ -187,9 +196,12 @@ func probeAll(ctx context.Context, devices []*hidDevice) []probedDevice {
 	}
 	for ; n > 0; n-- {
 		r := <-ch
-		if r.err != nil {
+		switch {
+		case errors.Is(r.err, errNotHIDPP):
+			out[r.i].status = probeNotHIDPP
+		case r.err != nil:
 			out[r.i].status, out[r.i].err = probeFailed, r.err
-		} else {
+		default:
 			out[r.i].status, out[r.i].inv = probeOK, r.inv
 		}
 	}
@@ -207,6 +219,7 @@ func renderDevices(w io.Writer, devices []probedDevice) error {
 		ifaces   string
 		keyboard bool
 		hidpp    bool
+		shadow   bool
 		dev      probedDevice
 	}
 	rows := make([]row, len(devices))
@@ -217,7 +230,8 @@ func renderDevices(w io.Writer, devices []probedDevice) error {
 			name:     dev.name(),
 			ifaces:   ifaceList(dev.interfaces),
 			keyboard: dev.hasKeyboard(),
-			hidpp:    dev.hasHIDPP() || dev.status == probeOK,
+			hidpp:    dev.status == probeOK || (dev.hasHIDPP() && dev.status != probeNotHIDPP),
+			shadow:   dev.shadow,
 			dev:      dev,
 		}
 		col1Width = max(col1Width, len(rows[i].vidpid))
@@ -229,7 +243,12 @@ func renderDevices(w io.Writer, devices []probedDevice) error {
 		if !r.keyboard {
 			line += " (no keyboard)"
 		}
-		if r.hidpp {
+		switch {
+		case r.shadow:
+			// A kernel shadow of a receiver-paired peripheral: not probed,
+			// the device answers through the receiver's pairing slots.
+			line += " (via receiver)"
+		case r.hidpp:
 			line += " (HID++)"
 		}
 		if _, err := fmt.Fprintln(w, line); err != nil {
@@ -408,8 +427,11 @@ func (d *hidDevice) hasHIDPP() bool {
 // shouldProbe reports whether the device is worth probing for HID++: it either
 // exposes a vendor-defined interface or is a Logitech device (Bluetooth HID++
 // peripherals often flatten the vendor collection into the primary HID node).
+// Kernel shadows of receiver-paired peripherals are never probed: they accept
+// HID++ writes but never relay the replies — the device answers through the
+// receiver's pairing slots.
 func (d *hidDevice) shouldProbe() bool {
-	if d.key.vid == 0 {
+	if d.key.vid == 0 || d.shadow {
 		return false
 	}
 	return d.hasHIDPP() || d.key.vid == logitechVID

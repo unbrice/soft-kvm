@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// hidpp.go: Logitech HID++ 2.0 changeHost (0x1814) host switching — the
-// `hid-switch` virtual switch command (SPEC §5.5). Pure report framing is
-// split from I/O so it can be table-tested without hardware.
+// hidpp.go: Logitech HID++ changeHost (0x1814) host switching — the
+// `hid-switch` virtual switch command (SPEC §5.5) — plus the HID++ 1.0
+// register reads used to inventory receiver pairing tables. Pure report
+// framing is split from I/O so it can be table-tested without hardware.
 
 package hidpp
 
@@ -22,10 +23,25 @@ import (
 )
 
 const (
-	reportShort    = 0x10 // 7-byte HID++ report
-	reportLong     = 0x11 // 20-byte HID++ report
-	reportErrShort = 0x8F // error reply to a short report
-	reportErrLong  = 0xFF // error reply to a long report
+	reportShort = 0x10 // 7-byte HID++ report — all requests are sent short
+	reportLong  = 0x11 // 20-byte HID++ report — a reply size only
+
+	// Error replies arrive in a normal short/long report; the sub-ID byte
+	// (report[2]) carries the error indicator, followed by the request's
+	// feature index, function|swID and the error code.
+	errSubShort = 0x8F // error reply in a short report
+	errSubLong  = 0xFF // error reply in a long report
+
+	// HID++ 1.0 register reads, answered locally by receivers at 0xFF.
+	subRegReadShort = 0x81 // short register read
+	subRegReadLong  = 0x83 // long register read (registers 0x200+)
+
+	regReceiverInfo = 0x2B5 // receiver info register: the pairing table
+
+	// Pairing-info sub-registers per slot: Unifying 0x20+slot-1, Bolt
+	// 0x50+slot (Solaar hidpp10_constants.py InfoSubRegisters).
+	subPairingUnifying = 0x20
+	subPairingBolt     = 0x50
 
 	featRoot       = 0x0000 // IRoot: fn 0 getFeature, always at index 0
 	featFeatureSet = 0x0001 // IFeatureSet: every HID++ 2.0 device has it
@@ -172,9 +188,7 @@ func (s *Switch) Do(ctx context.Context) error {
 
 	var errs []error
 	for _, devIdx := range devIdxs {
-		fctx, cancel := context.WithTimeout(ctx, probeTimeout)
-		feat, err := c.getFeature(fctx, devIdx, featChangeHost)
-		cancel()
+		feat, err := c.getFeatureNudged(ctx, devIdx, featChangeHost)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -191,7 +205,7 @@ func (s *Switch) Do(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Error is a HID++ error reply (report 0x8F/0xFF) from the device.
+// Error is a HID++ error reply (sub-ID 0x8F/0xFF) from the device.
 type Error struct{ Code uint8 }
 
 func (e *Error) Error() string { return fmt.Sprintf("hid++ error 0x%02x", e.Code) }
@@ -232,7 +246,7 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 
 	var tried int
 	var openErrs []error
-	var lastErr error
+	var lastErr, rejectedErr error
 	for _, info := range append(vendor, other...) {
 		tried++
 		slog.Debug("hidpp: trying interface", "path", info.Path,
@@ -246,7 +260,14 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 		}
 		c := &conn{dev: dev}
 		if err := c.speaksHIDPP(ctx); err != nil {
-			lastErr = err
+			// A rejected report means the interface cannot carry HID++ at
+			// all: keep it as a fallback cause, but a timeout ("no answer")
+			// describes the failure better.
+			if isReportRejected(err) {
+				rejectedErr = err
+			} else {
+				lastErr = err
+			}
 			_ = dev.Close()
 			continue
 		}
@@ -260,14 +281,29 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 	if lastErr != nil {
 		return nil, fmt.Errorf("no HID++ interface answered for %04x:%04x (%d tried): %w", vid, pid, tried, lastErr)
 	}
+	if rejectedErr != nil {
+		return nil, fmt.Errorf("no interface for %04x:%04x carries the HID++ report (%d tried): %w", vid, pid, tried, rejectedErr)
+	}
 	return nil, fmt.Errorf("no HID++ interface answered for %04x:%04x (%d tried)", vid, pid, tried)
 }
 
-// speaksHIDPP reports whether the interface answers HID++ requests. Any
-// framed reply counts — even an error reply or "feature unsupported". The
+// isReportRejected reports whether the interface rejected the HID++ report on
+// write: the report ID is not in the interface's report descriptor (EPIPE or
+// EINVAL from a hidraw write), so the interface cannot speak HID++ at all.
+func isReportRejected(err error) bool {
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EINVAL)
+}
+
+// speaksHIDPP reports whether the interface answers Logitech-framed requests.
+// Any framed reply counts — even an error reply or "feature unsupported". The
 // handshake is repeated up to probeAttempts times on silence: a dozing
 // Bluetooth device may ignore the first nudges before its vendor channel
 // wakes. probeTimeout bounds one nudge.
+//
+// When the direct index stays silent to HID++ 2.0, probe the receiver
+// pairing-table register instead: receivers speak only HID++ 1.0 registers at
+// 0xFF, answered locally from their own flash — no RF, sub-millisecond — and
+// even an error reply (wrong layout, empty slot) proves Logitech framing.
 func (c *conn) speaksHIDPP(ctx context.Context) error {
 	var err error
 	for i := 0; i < probeAttempts; i++ {
@@ -279,9 +315,20 @@ func (c *conn) speaksHIDPP(ctx context.Context) error {
 			return nil
 		}
 		if !errors.Is(err, context.DeadlineExceeded) {
-			break // write errors and the like are not sleep — don't retry
+			return err // write errors and the like are not sleep — don't retry
 		}
 		slog.Debug("hidpp: handshake unanswered, nudging again", "attempt", i+1)
+	}
+	rctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	_, rerr := c.readRegister(rctx, DeviceIndexDirect, regReceiverInfo, subPairingUnifying)
+	cancel()
+	var herr *Error
+	if rerr == nil || errors.As(rerr, &herr) {
+		slog.Debug("hidpp: interface answered a HID++ 1.0 register read — a receiver")
+		return nil
+	}
+	if !errors.Is(rerr, context.DeadlineExceeded) {
+		return rerr
 	}
 	return err
 }
@@ -298,6 +345,25 @@ func (c *conn) getFeature(ctx context.Context, devIdx uint8, feature uint16) (ui
 		return 0, errors.New("empty getFeature reply")
 	}
 	return reply[0], nil
+}
+
+// getFeatureNudged retries getFeature on silence: a dozing wireless device
+// wakes on the first request (RF cold wake is ~700ms, past one probeTimeout)
+// and answers a later one. Only deadline misses retry — an error reply or a
+// write failure is an answer, not sleep.
+func (c *conn) getFeatureNudged(ctx context.Context, devIdx uint8, feature uint16) (uint8, error) {
+	var err error
+	for i := 0; i < probeAttempts; i++ {
+		rctx, cancel := context.WithTimeout(ctx, probeTimeout)
+		var feat uint8
+		feat, err = c.getFeature(rctx, devIdx, feature)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return feat, err
+		}
+		slog.Debug("hidpp: no answer, nudging again", "deviceIndex", devIdx, "attempt", i+1)
+	}
+	return 0, err
 }
 
 // getKind reads the device type byte (feature 0x0005, fn 2).
@@ -335,23 +401,24 @@ func (c *conn) resolveKind(ctx context.Context, kind Kind) ([]uint8, error) {
 	return c.findSlots(ctx, kind)
 }
 
-// findSlots scans receiver pairing slots 1-6 for every device of the given
-// kind that supports changeHost. An empty or incapable slot costs one
-// probeTimeout.
+// findSlots finds every paired device of the given kind that supports
+// changeHost. The occupied slots and their kinds come from the receiver's
+// local pairing table — no RF — so only matching slots get a (nudged)
+// wireless changeHost query. resolveKind calls this only when the directly
+// attached device does not match.
 func (c *conn) findSlots(ctx context.Context, kind Kind) ([]uint8, error) {
+	paired, ok := c.pairingTable(ctx)
+	if !ok {
+		return nil, fmt.Errorf("no receiver pairing table for a kind target")
+	}
 	var slots []uint8
-	for slot := uint8(1); slot <= 6; slot++ {
-		sctx, cancel := context.WithTimeout(ctx, probeTimeout)
-		feat, err := c.getFeature(sctx, slot, featChangeHost)
-		cancel()
-		if err != nil || feat == 0 {
+	for _, p := range paired {
+		if p.Kind != kind {
 			continue
 		}
-		sctx, cancel = context.WithTimeout(ctx, probeTimeout)
-		k, err := c.getKind(sctx, slot)
-		cancel()
-		if err == nil && k == kind {
-			slots = append(slots, slot)
+		feat, err := c.getFeatureNudged(ctx, p.Index, featChangeHost)
+		if err == nil && feat != 0 {
+			slots = append(slots, p.Index)
 		}
 	}
 	if len(slots) == 0 {
@@ -382,15 +449,19 @@ func (c *conn) setHost(ctx context.Context, featIdx, devIdx, host uint8) error {
 	return err
 }
 
-// request sends one HID++ request — always the long report: every HID++ 2.0
-// device carries it, and changeHost targets are 2.0 by definition — and waits
-// for its reply, discarding unrelated reports (notifications). Replies may
-// still arrive short. An error reply comes back as *Error. The caller's ctx
-// deadline bounds the single exchange.
+// request sends one HID++ 2.0 request and waits for its reply. An error
+// reply comes back as *Error. The caller's ctx deadline bounds the exchange.
 func (c *conn) request(ctx context.Context, devIdx, featIdx, fn uint8, params ...byte) ([]byte, error) {
-	report := buildReport(devIdx, featIdx, fn, params)
-	slog.Debug("hidpp: request", "deviceIndex", devIdx, "featureIndex", featIdx,
-		"fn", fn, "report", fmt.Sprintf("%x", report))
+	return c.exchange(ctx, buildReport(devIdx, featIdx, fn, params),
+		func(r []byte) ([]byte, error) { return matchReply(r, devIdx, featIdx, fn) })
+}
+
+// exchange writes one report, then reads until match accepts a reply,
+// discarding unrelated reports (notifications). Replies may arrive in either
+// report size. A link drop mid-exchange (EIO on Linux hidraw) comes back
+// wrapped in errLinkDropped. The caller's ctx deadline bounds the exchange.
+func (c *conn) exchange(ctx context.Context, report []byte, match func([]byte) ([]byte, error)) ([]byte, error) {
+	slog.Debug("hidpp: report out", "report", fmt.Sprintf("%x", report))
 	if _, err := c.dev.Write(ctx, report); err != nil {
 		slog.Debug("hidpp: write failed", "error", err)
 		return nil, err
@@ -405,25 +476,27 @@ func (c *conn) request(ctx context.Context, devIdx, featIdx, fn uint8, params ..
 				slog.Debug("hidpp: link dropped mid-exchange")
 				return nil, fmt.Errorf("%w: %w", errLinkDropped, err)
 			case errors.Is(err, context.DeadlineExceeded):
-				slog.Debug("hidpp: no reply (silence, or a short-only HID++ 1.0 device ignoring the long report)")
+				slog.Debug("hidpp: no reply (silence, or a device ignoring the request)")
 			default:
 				slog.Debug("hidpp: read failed", "error", err)
 			}
 			return nil, err
 		}
 		slog.Debug("hidpp: report in", "report", fmt.Sprintf("%x", buf[:n]))
-		reply, herr := matchReply(buf[:n], devIdx, featIdx, fn)
-		if reply != nil || herr != nil {
+		if reply, herr := match(buf[:n]); reply != nil || herr != nil {
 			return reply, herr
 		}
 	}
 }
 
-// buildReport frames a HID++ request: report ID, device index, feature
-// index, function<<4|swID, then the parameters, zero-padded to 20 bytes.
+// buildReport frames a HID++ 2.0 request in the short report: report ID,
+// device index, feature index, function<<4|swID, then the parameters. Every
+// HID++ device carries the 7-byte short report and our requests never exceed
+// its 3 parameter bytes; the 20-byte long report is a reply size here —
+// Logitech receivers STALL the 20-byte SET_REPORT on their control pipe.
 func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
-	r := make([]byte, 20)
-	r[0] = reportLong
+	r := make([]byte, 7)
+	r[0] = reportShort
 	r[1] = devIdx
 	r[2] = featIdx
 	r[3] = fn<<4 | swID
@@ -434,18 +507,66 @@ func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
 // matchReply picks the reply to a request out of the input stream. It
 // returns (params, nil) for a matching data reply, (nil, *Error) for a
 // matching error reply, and (nil, nil) for anything else.
+//
+// Data reply:  reportID, devIdx, featIdx, fn|swID, params...
+// Error reply: reportID, devIdx, errSubShort|errSubLong, featIdx, fn|swID, code
 func matchReply(report []byte, devIdx, featIdx, fn uint8) ([]byte, error) {
-	if len(report) < 5 {
-		return nil, nil
-	}
-	if report[1] != devIdx || report[2] != featIdx || report[3] != fn<<4|swID {
+	if len(report) < 5 || report[1] != devIdx {
 		return nil, nil
 	}
 	switch report[0] {
 	case reportShort, reportLong:
+	default:
+		return nil, nil
+	}
+	fnSw := fn<<4 | swID
+	if report[2] == featIdx && report[3] == fnSw {
 		return report[4:], nil
-	case reportErrShort, reportErrLong:
-		return nil, &Error{Code: report[4]}
+	}
+	if (report[2] == errSubShort || report[2] == errSubLong) && len(report) >= 6 &&
+		report[3] == featIdx && report[4] == fnSw {
+		return nil, &Error{Code: report[5]}
+	}
+	return nil, nil
+}
+
+// readRegister performs a HID++ 1.0 register read — answered locally by
+// receivers at 0xFF, with no RF traffic. Registers below 0x200 are read with
+// sub-command 0x81, long ones with 0x83; long-register replies arrive in a
+// long report. The reply echoes the sub-register before the register data;
+// the return starts at that echo (Solaar's slicing convention). A 1.0 error
+// reply comes back as *Error.
+func (c *conn) readRegister(ctx context.Context, devIdx uint8, register uint16, subreg byte) ([]byte, error) {
+	sub := byte(subRegReadShort)
+	if register >= 0x200 {
+		sub = subRegReadLong
+	}
+	addr := byte(register)
+	report := []byte{reportShort, devIdx, sub, addr, subreg, 0, 0}
+	return c.exchange(ctx, report, func(r []byte) ([]byte, error) {
+		return matchRegisterReply(r, devIdx, sub, addr, subreg)
+	})
+}
+
+// matchRegisterReply picks the reply to a HID++ 1.0 register read out of the
+// input stream, same return contract as matchReply.
+//
+// Data reply:  reportID, devIdx, sub, addr, subreg, data...
+// Error reply: reportID, devIdx, 0x8F, sub, addr, code
+func matchRegisterReply(report []byte, devIdx, sub, addr, subreg byte) ([]byte, error) {
+	if len(report) < 5 || report[1] != devIdx {
+		return nil, nil
+	}
+	switch report[0] {
+	case reportShort, reportLong:
+	default:
+		return nil, nil
+	}
+	if report[2] == errSubShort && len(report) >= 6 && report[3] == sub && report[4] == addr {
+		return nil, &Error{Code: report[5]}
+	}
+	if report[2] == sub && report[3] == addr && report[4] == subreg {
+		return report[4:], nil
 	}
 	return nil, nil
 }
@@ -464,8 +585,8 @@ type Inventory struct {
 }
 
 // Probe opens the first HID++ interface of VID:PID and reports the device
-// kind; for a receiver it also scans pairing slots 1-6. Used by `detect` to
-// draw the slot map (SPEC §5.5).
+// kind; for a receiver it also reports the occupied pairing slots. Used by
+// `detect` to draw the slot map (SPEC §5.5).
 func Probe(ctx context.Context, vid, pid uint16) (*Inventory, error) {
 	c, err := openInterface(ctx, vid, pid)
 	if err != nil {
@@ -474,29 +595,90 @@ func Probe(ctx context.Context, vid, pid uint16) (*Inventory, error) {
 	defer func() { _ = c.dev.Close() }()
 
 	kctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	kind, err := c.getKind(kctx, DeviceIndexDirect)
+	kind, kerr := c.getKind(kctx, DeviceIndexDirect)
 	cancel()
-	if err != nil {
-		kind = KindUnknown
+	if kerr == nil && kind != KindReceiver {
+		// A directly attached device: don't scan slots — a Bluetooth device
+		// answers pairing-slot scans as itself, once per slot.
+		return &Inventory{Kind: kind}, nil
 	}
-	inv := &Inventory{Kind: kind}
-	if kind != KindReceiver {
-		return inv, nil
+	// A receiver speaks only HID++ 1.0 registers at 0xFF. Its pairing table
+	// is local flash: no RF, and no dependence on the paired devices being
+	// awake, on, or switched to this host.
+	if paired, ok := c.pairingTable(ctx); ok {
+		return &Inventory{Kind: KindReceiver, Paired: paired}, nil
 	}
+	if kerr != nil {
+		return nil, fmt.Errorf("answered the handshake but reads fail now: %w", kerr)
+	}
+	return &Inventory{Kind: kind}, nil
+}
+
+// pairingTable reads the receiver's local pairing table (register 0x2B5) and
+// returns the occupied slots. ok is false when nothing answers the register
+// reads at all — the interface is not a receiver.
+func (c *conn) pairingTable(ctx context.Context) (paired []PairedDevice, ok bool) {
 	for slot := uint8(1); slot <= 6; slot++ {
-		sctx, cancel := context.WithTimeout(ctx, probeTimeout)
-		feat, err := c.getFeature(sctx, slot, featFeatureSet)
-		cancel()
-		if err != nil || feat == 0 {
+		data, bolt, answered := c.readPairingInfo(ctx, slot)
+		if !answered {
+			// Silence on the very first read means no receiver; a receiver
+			// that answered before does not go silent mid-table.
+			if slot == 1 {
+				return nil, false
+			}
 			continue
 		}
-		sctx, cancel = context.WithTimeout(ctx, probeTimeout)
-		k, err := c.getKind(sctx, slot)
-		cancel()
-		if err != nil {
-			k = KindUnknown
+		ok = true
+		if data != nil {
+			paired = append(paired, PairedDevice{Index: slot, Kind: pairingKind(bolt, data)})
 		}
-		inv.Paired = append(inv.Paired, PairedDevice{Index: slot, Kind: k})
 	}
-	return inv, nil
+	return paired, ok
+}
+
+// readPairingInfo reads one slot's pairing info, trying the Unifying layout
+// (sub-register 0x20+slot-1) then the Bolt one (0x50+slot). answered is false
+// on silence; data is nil when the slot is empty (error reply on both
+// layouts) — an empty slot and a wrong layout both draw an immediate error,
+// so both layouts are always tried before a slot is declared empty.
+func (c *conn) readPairingInfo(ctx context.Context, slot uint8) (data []byte, bolt, answered bool) {
+	for i, subreg := range []byte{subPairingUnifying + slot - 1, subPairingBolt + slot} {
+		rctx, cancel := context.WithTimeout(ctx, probeTimeout)
+		d, err := c.readRegister(rctx, DeviceIndexDirect, regReceiverInfo, subreg)
+		cancel()
+		if err == nil {
+			return d, i == 1, true
+		}
+		var herr *Error
+		if errors.As(err, &herr) {
+			answered = true
+		}
+	}
+	return nil, false, answered
+}
+
+// pairingKind extracts the device kind from a pairing-info reply. data starts
+// at the echoed sub-register byte (Solaar's slicing convention): the HID++
+// 1.0 kind nibble is at data[7] on Unifying, data[1] on Bolt.
+func pairingKind(bolt bool, data []byte) Kind {
+	var nibble byte
+	if bolt {
+		if len(data) < 2 {
+			return KindUnknown
+		}
+		nibble = data[1] & 0x0F
+	} else {
+		if len(data) < 8 {
+			return KindUnknown
+		}
+		nibble = data[7] & 0x0F
+	}
+	switch nibble {
+	case 0x01:
+		return KindKeyboard
+	case 0x02:
+		return KindMouse
+	default:
+		return KindUnknown
+	}
 }
