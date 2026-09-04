@@ -74,19 +74,19 @@ lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
 `server` those two and `hidpp` (the channel bound it validates on a claim);
 `agent` imports `model`, `state`, `client`, `discover` and `hidpp`.
 
-| Package    | Files                                       | Concern                                                                                                                                          |
-| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)            |
-| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                               |
-| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                               |
-| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                  |
-| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                |
-| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal               |
-| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                     |
-| `hidpp`    | `hidpp.go`                                  | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1) |
-| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                    |
-| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                     |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                            |
+| Package    | Files                                       | Concern                                                                                                                                                                                       |
+| ---------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)                                                         |
+| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                                                                            |
+| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                                                                            |
+| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                                               |
+| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                                                             |
+| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal                                                            |
+| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                                                                  |
+| `hidpp`    | `hidpp.go`, `debug.go`                      | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, the receiver link notifications the slot detector reads, and the hidden `mac-debug` hostsInfo transcript (SPEC §5.5, §6.1) |
+| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                                                                 |
+| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                                                                  |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                                                                         |
 
 The invariants header lives at the top of `agent/agent.go`.
 `platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op

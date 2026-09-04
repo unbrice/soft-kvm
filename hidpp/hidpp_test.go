@@ -82,9 +82,13 @@ func TestParse(t *testing.T) {
 }
 
 func TestBuildReport(t *testing.T) {
-	// Every request is the 7-byte short report: the long report is a reply
-	// size — receivers STALL the 20-byte SET_REPORT on their control pipe.
-	r := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
+	// Requests default to the 7-byte short report: every HID++ device carries
+	// it, and its 3 parameter bytes are enough for everything but a hostsInfo
+	// name chunk. More than 3 is an error, never a silent truncation.
+	r, err := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
+	if err != nil {
+		t.Fatalf("buildReport: %v", err)
+	}
 	if len(r) != 7 {
 		t.Fatalf("report length = %d, want 7", len(r))
 	}
@@ -96,6 +100,31 @@ func TestBuildReport(t *testing.T) {
 		if b != 0 {
 			t.Errorf("report padding byte %d = %#x, want 0", i+5, b)
 		}
+	}
+	if _, err := buildReport(0x02, 0x07, fnSetHost, []byte{1, 2, 3, 4}); err == nil {
+		t.Error("buildReport with 4 parameter bytes succeeded, want an oversize error")
+	}
+}
+
+func TestBuildLongReport(t *testing.T) {
+	// The 20-byte long report fits 16 parameter bytes — a hostsInfo name
+	// chunk is hostIndex + byteIndex + 14 name bytes, exactly the limit.
+	params := append([]byte{0x00, 0x00}, []byte("12345678901234")...)
+	r, err := buildLongReport(0x02, 0x0a, fnHostsSetName, params)
+	if err != nil {
+		t.Fatalf("buildLongReport: %v", err)
+	}
+	if len(r) != 20 {
+		t.Fatalf("report length = %d, want 20", len(r))
+	}
+	if r[0] != reportLong || r[1] != 0x02 || r[2] != 0x0a || r[3] != fnHostsSetName<<4|swID {
+		t.Errorf("report = %x", r)
+	}
+	if !slices.Equal(r[4:], params) {
+		t.Errorf("report params = %x, want %x", r[4:], params)
+	}
+	if _, err := buildLongReport(0x02, 0x0a, fnHostsSetName, append(slices.Clone(params), 0x00)); err == nil {
+		t.Error("buildLongReport with 17 parameter bytes succeeded, want an oversize error")
 	}
 }
 

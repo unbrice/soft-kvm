@@ -171,7 +171,7 @@ type probedDevice struct {
 func (d probedDevice) scanFailure() string {
 	switch {
 	case errors.Is(d.err, errPermission) && d.key.vid == logitechVID:
-		return "🔒 HID++ scan denied — " + permissionRemediation
+		return "🔒 HID++ scan denied — " + PermissionRemediation
 	case errors.Is(d.err, errPermission):
 		return "🔒 HID++ scan denied; not a Logitech device, no HID++ to find"
 	case errors.Is(d.err, errNoAnswer):

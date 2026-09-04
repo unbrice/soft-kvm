@@ -118,6 +118,9 @@ func main() {
 		err = detectCmd(ctx)
 	case "hid-switch":
 		err = hidSwitchCmd(ctx)
+	case "mac-debug":
+		// Hidden hostsInfo diagnostic: no usage-text entry, no token.
+		err = macDebugCmd(ctx)
 	case "service":
 		err = serviceCmd(ctx)
 	default:
@@ -565,4 +568,60 @@ func hidSwitchCmd(ctx context.Context) error {
 	// Run by hand there is no owner to inherit a channel from, so host=N is
 	// not optional here — Do says so if it is missing.
 	return sw.Do(ctx, 0)
+}
+
+// macDebugCmd is the hidden hostsInfo diagnostic. It parses and calls
+// hidpp.HostsDebug, nothing more. The target leads and the flags follow —
+// the order the run table writes them in, the reverse of the other
+// subcommands.
+func macDebugCmd(ctx context.Context) error {
+	fs := flag.NewFlagSet("mac-debug", flag.ContinueOnError)
+	writeBack := fs.Bool("write-back", false, "rewrite the name already stored at the current host, then re-read")
+	set := fs.String("set", "", "write `NAME` at the current host (truncated to the device's maximum), then re-read")
+	long := fs.Bool("long", false, "frame writes as one 0x11 report per 14-byte chunk instead of one 0x10 report per byte")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm mac-debug VID:PID[:SLOT] [--write-back | --set NAME] [--long]")
+		fs.PrintDefaults()
+	}
+	args := os.Args[2:]
+	target, flagArgs := "", args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		target, flagArgs = args[0], args[1:]
+	}
+	if err := parseArgs(fs, flagArgs); err != nil {
+		return err
+	}
+	if target == "" {
+		fs.Usage()
+		return errUsage
+	}
+	if err := rejectExtraArgs("mac-debug", fs.Args(), 0); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return errUsage
+	}
+	vid, pid, slot, err := hidpp.ParseTarget(target)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return errUsage
+	}
+	setGiven := false
+	fs.Visit(func(f *flag.Flag) { setGiven = setGiven || f.Name == "set" })
+	switch {
+	case *writeBack && setGiven:
+		fmt.Fprintln(os.Stderr, "mac-debug: --write-back and --set are mutually exclusive")
+		return errUsage
+	case setGiven && *set == "":
+		// An empty setHostFriendlyName chunk is the wipe.
+		fmt.Fprintln(os.Stderr, "mac-debug: refusing an empty --set")
+		return errUsage
+	}
+	opts := hidpp.HostsDebugOptions{WriteBack: *writeBack, Set: *set, Long: *long}
+	if err := hidpp.HostsDebug(ctx, os.Stdout, vid, pid, slot, opts); err != nil {
+		// An open refusal on macOS is the Input Monitoring TCC gate (§6.2).
+		if errors.Is(err, os.ErrPermission) {
+			fmt.Fprintln(os.Stderr, detect.PermissionRemediation)
+		}
+		return err
+	}
+	return nil
 }

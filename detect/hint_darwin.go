@@ -8,4 +8,7 @@
 
 package detect
 
-const permissionRemediation = "grant this terminal Input Monitoring access (System Settings → Privacy & Security → Input Monitoring)"
+// PermissionRemediation is the fix to print when opening a HID node is
+// refused. detect prints it on a failed HID++ scan, mac-debug when its open
+// is refused.
+const PermissionRemediation = "grant this terminal Input Monitoring access (System Settings → Privacy & Security → Input Monitoring)"

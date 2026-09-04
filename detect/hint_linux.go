@@ -8,4 +8,7 @@
 
 package detect
 
-const permissionRemediation = "grant write access to the hidraw node: a udev rule with TAG+=\"uaccess\", or a group, as Solaar's packaging does"
+// PermissionRemediation is the fix to print when opening a HID node is
+// refused. detect prints it on a failed HID++ scan, mac-debug when its open
+// is refused.
+const PermissionRemediation = "grant write access to the hidraw node: a udev rule with TAG+=\"uaccess\", or a group, as Solaar's packaging does"

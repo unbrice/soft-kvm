@@ -23,8 +23,11 @@ import (
 )
 
 const (
-	reportShort = 0x10 // 7-byte HID++ report — all requests are sent short
-	reportLong  = 0x11 // 20-byte HID++ report — a reply size only
+	reportShort = 0x10 // 7-byte HID++ report — 3 parameter bytes
+	reportLong  = 0x11 // 20-byte HID++ report — 16 parameter bytes
+
+	shortParamsMax = 3
+	longParamsMax  = 16
 
 	// Error replies arrive in a normal short/long report; the sub-ID byte
 	// (report[2]) carries the error indicator, followed by the request's
@@ -47,11 +50,21 @@ const (
 	featFeatureSet = 0x0001 // IFeatureSet: every HID++ 2.0 device has it
 	featDeviceName = 0x0005 // GetDeviceNameType: fn 2 is getDeviceType
 	featChangeHost = 0x1814 // changeHost: fn 1 is setHost
+	featHostsInfo  = 0x1815 // hostsInfo: per-channel friendly host names
 
 	fnGetFeature    = 0
 	fnGetHostInfo   = 0
 	fnSetHost       = 1
 	fnGetDeviceType = 2
+
+	// hostsInfo (0x1815) functions. changeHost already owns fnGetHostInfo
+	// for its fn 0, so the hostsInfo fns carry their own prefix — the two
+	// features name different functions "getHostInfo". Only these four may
+	// be called: fn 2 is unneeded, fn 5 renumbers channels, fn 6 unpairs.
+	fnHostsFeatureInfo = 0
+	fnHostsGetInfo     = 1
+	fnHostsGetName     = 3
+	fnHostsSetName     = 4
 
 	swID = 0x1 // software id nibble, matched against replies
 
@@ -372,9 +385,11 @@ func isReportNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "0xe00002f0")
 }
 
-// conn is an open HID++ interface.
+// conn is an open HID++ interface. info identifies the interface that
+// answered, for the mac-debug transcript; it is nil in tests.
 type conn struct {
-	dev deviceConn
+	dev  deviceConn
+	info *hid.DeviceInfo
 }
 
 // openInterface returns an HID++-answering interface of VID:PID. Vendor-defined
@@ -412,7 +427,7 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 			openErrs = append(openErrs, err)
 			continue
 		}
-		c := &conn{dev: featureWriteFallback{dev}}
+		c := &conn{dev: featureWriteFallback{dev}, info: info}
 		if err := c.speaksHIDPP(ctx); err != nil {
 			// A rejected report means the interface cannot carry HID++ at
 			// all: keep it as a fallback cause, but a timeout ("no answer")
@@ -612,7 +627,11 @@ func (c *conn) setHost(ctx context.Context, featIdx, devIdx, host uint8) error {
 // request sends one HID++ 2.0 request and waits for its reply. An error
 // reply comes back as *Error. The caller's ctx deadline bounds the exchange.
 func (c *conn) request(ctx context.Context, devIdx, featIdx, fn uint8, params ...byte) ([]byte, error) {
-	return c.exchange(ctx, buildReport(devIdx, featIdx, fn, params),
+	report, err := buildReport(devIdx, featIdx, fn, params)
+	if err != nil {
+		return nil, err
+	}
+	return c.exchange(ctx, report,
 		func(r []byte) ([]byte, error) { return matchReply(r, devIdx, featIdx, fn) })
 }
 
@@ -649,19 +668,35 @@ func (c *conn) exchange(ctx context.Context, report []byte, match func([]byte) (
 	}
 }
 
-// buildReport frames a HID++ 2.0 request in the short report: report ID,
-// device index, feature index, function<<4|swID, then the parameters. Every
-// HID++ device carries the 7-byte short report and our requests never exceed
-// its 3 parameter bytes; the 20-byte long report is a reply size here —
-// Logitech receivers STALL the 20-byte SET_REPORT on their control pipe.
-func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
-	r := make([]byte, 7)
-	r[0] = reportShort
+// buildReport frames a HID++ 2.0 request in the 7-byte short report: report
+// ID, device index, feature index, function<<4|swID, then the parameters.
+// Every HID++ device carries the short report, which fits 3 parameter bytes;
+// more is an error, never a silent truncation — a truncated
+// setHostFriendlyName wrote one name byte and reported success.
+func buildReport(devIdx, featIdx, fn uint8, params []byte) ([]byte, error) {
+	return frameReport(reportShort, shortParamsMax, devIdx, featIdx, fn, params)
+}
+
+// buildLongReport frames the same request in the 20-byte long report (16
+// parameter bytes). Only hostsInfo name writes need it, and not on every
+// transport: Bolt receivers STALL the 20-byte SET_REPORT on their control
+// pipe (SPEC §5.5), so the caller picks the framing per transport.
+func buildLongReport(devIdx, featIdx, fn uint8, params []byte) ([]byte, error) {
+	return frameReport(reportLong, longParamsMax, devIdx, featIdx, fn, params)
+}
+
+// frameReport is the shared framing behind buildReport and buildLongReport.
+func frameReport(id byte, maxParams int, devIdx, featIdx, fn uint8, params []byte) ([]byte, error) {
+	if len(params) > maxParams {
+		return nil, fmt.Errorf("hidpp: %d parameter bytes exceed report %#02x's %d", len(params), id, maxParams)
+	}
+	r := make([]byte, maxParams+4)
+	r[0] = id
 	r[1] = devIdx
 	r[2] = featIdx
 	r[3] = fn<<4 | swID
 	copy(r[4:], params)
-	return r
+	return r, nil
 }
 
 // matchReply picks the reply to a request out of the input stream. It

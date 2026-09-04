@@ -392,7 +392,7 @@ func TestScanFailure(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"permission logitech", logitechVID, errPermission, permissionRemediation},
+		{"permission logitech", logitechVID, errPermission, PermissionRemediation},
 		{"permission other", 0x0b05, errPermission, "no HID++ to find"},
 		{"no answer", 0, errNoAnswer, "⏳ no answer"},
 		{"other", 0, errors.New("boom"), "⚠️ boom"},
