@@ -332,6 +332,46 @@ type deviceConn interface {
 	Close() error
 }
 
+// featureReporter is *hid.Device shaped for featureWriteFallback: the
+// regular write plus the feature-report write the fallback uses.
+type featureReporter interface {
+	deviceConn
+	SendFeatureReport(p []byte) error
+}
+
+// featureWriteFallback retries a write as a feature report when the
+// interface's descriptor declares the report ID as Feature rather than
+// Output — Logitech's HID++ collection flattened into a Bluetooth device's
+// primary node on macOS, where IOHIDDeviceSetReport(kIOHIDReportTypeOutput,
+// 0x10) fails with kIOReturnNotFound. Linux's hidraw write() makes this
+// fallback itself, so it never triggers there. When the fallback ran, its
+// error is the one returned: the output-report failure is fully explained,
+// and a feature failure (NotPermitted — the Input Monitoring gate; NotFound
+// again — no such report at all) is the actionable one.
+type featureWriteFallback struct {
+	featureReporter
+}
+
+func (f featureWriteFallback) Write(ctx context.Context, p []byte) (int, error) {
+	n, err := f.featureReporter.Write(ctx, p)
+	if !isReportNotFound(err) {
+		return n, err
+	}
+	slog.Debug("hidpp: no output report with that ID, retrying as a feature report")
+	if err := f.SendFeatureReport(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// isReportNotFound reports whether err is IOHIDDeviceSetReport's
+// kIOReturnNotFound (0xe00002f0): the report ID is not in the interface's
+// descriptor for the report type used. The library renders IOKit errors as
+// plain text, so matching is on the rendered code; Linux never produces it.
+func isReportNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "0xe00002f0")
+}
+
 // conn is an open HID++ interface.
 type conn struct {
 	dev deviceConn
@@ -372,7 +412,7 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 			openErrs = append(openErrs, err)
 			continue
 		}
-		c := &conn{dev: dev}
+		c := &conn{dev: featureWriteFallback{dev}}
 		if err := c.speaksHIDPP(ctx); err != nil {
 			// A rejected report means the interface cannot carry HID++ at
 			// all: keep it as a fallback cause, but a timeout ("no answer")
@@ -402,10 +442,11 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 }
 
 // isReportRejected reports whether the interface rejected the HID++ report on
-// write: the report ID is not in the interface's report descriptor (EPIPE or
-// EINVAL from a hidraw write), so the interface cannot speak HID++ at all.
+// write: the report ID is not in the interface's report descriptor — EPIPE or
+// EINVAL from a hidraw write on Linux, kIOReturnNotFound from
+// IOHIDDeviceSetReport on macOS — so the interface cannot speak HID++ at all.
 func isReportRejected(err error) bool {
-	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EINVAL)
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EINVAL) || isReportNotFound(err)
 }
 
 // speaksHIDPP reports whether the interface answers Logitech-framed requests.

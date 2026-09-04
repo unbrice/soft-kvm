@@ -533,6 +533,88 @@ func (n *nudgeConn) Write(_ context.Context, p []byte) (int, error) {
 	return len(p), nil
 }
 
+// featureWriteEmu fakes a featureReporter: Write fails with writeErr,
+// SendFeatureReport with featureErr; both record their reports.
+type featureWriteEmu struct {
+	reportQueue
+	writeErr, featureErr error
+	writes, features     [][]byte
+}
+
+func (f *featureWriteEmu) Write(_ context.Context, p []byte) (int, error) {
+	f.writes = append(f.writes, slices.Clone(p))
+	return len(p), f.writeErr
+}
+
+func (f *featureWriteEmu) SendFeatureReport(p []byte) error {
+	f.features = append(f.features, slices.Clone(p))
+	return f.featureErr
+}
+
+func TestFeatureWriteFallback(t *testing.T) {
+	notFound := errors.New("IOHIDDeviceSetReport failed: 0xe00002f0")
+	report := []byte{reportShort, DeviceIndexDirect, 0, fnGetFeature<<4 | swID, 0x00, 0x01, 0x00}
+
+	cases := []struct {
+		name         string
+		writeErr     error
+		featureErr   error
+		wantFeatures int
+		wantErr      error // nil means success
+	}{
+		{name: "output report accepted"},
+		{name: "no output report, feature accepted", writeErr: notFound, wantFeatures: 1},
+		{name: "no output report, feature denied", writeErr: notFound,
+			featureErr:   errors.New("IOHIDDeviceSetReport failed: 0xe00002e2"),
+			wantFeatures: 1, wantErr: errors.New("IOHIDDeviceSetReport failed: 0xe00002e2")},
+		{name: "other write error, no fallback", writeErr: syscall.EINVAL, wantErr: syscall.EINVAL},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			emu := &featureWriteEmu{writeErr: c.writeErr, featureErr: c.featureErr}
+			w := featureWriteFallback{emu}
+			n, err := w.Write(t.Context(), report)
+			if c.wantErr == nil {
+				if err != nil || n != len(report) {
+					t.Errorf("Write = %d, %v; want %d, nil", n, err, len(report))
+				}
+			} else if !errors.Is(err, c.wantErr) && err.Error() != c.wantErr.Error() {
+				t.Errorf("Write error = %v, want %v", err, c.wantErr)
+			}
+			if len(emu.features) != c.wantFeatures {
+				t.Errorf("%d feature reports sent, want %d", len(emu.features), c.wantFeatures)
+			}
+			if len(emu.writes) != 1 {
+				t.Errorf("%d output writes, want 1", len(emu.writes))
+			}
+		})
+	}
+}
+
+func TestIsReportRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"linux EPIPE", syscall.EPIPE, true},
+		{"linux EINVAL", syscall.EINVAL, true},
+		{"macOS report not in descriptor", errors.New("IOHIDDeviceSetReport failed: 0xe00002f0"), true},
+		// The Input Monitoring gate is NOT a rejection: it wants the
+		// remediation hint, not a "cannot speak HID++" classification.
+		{"macOS TCC denial", errors.New("IOHIDDeviceSetReport failed: 0xe00002e2"), false},
+		{"timeout", context.DeadlineExceeded, false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isReportRejected(c.err); got != c.want {
+				t.Errorf("isReportRejected(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
 func TestSpeaksHIDPP(t *testing.T) {
 	reply := []byte{reportLong, DeviceIndexDirect, 0x00, fnGetFeature<<4 | swID, 0x01}
 
