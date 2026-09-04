@@ -22,17 +22,25 @@ import (
 	"github.com/grandcat/zeroconf"
 )
 
+// serviceType is the mDNS service type advertiser and browsers must agree on.
+const serviceType = "_soft-kvm._tcp"
+
 // Advertise registers the server under _soft-kvm._tcp.local. with instance
-// name `instance` on `port`. The TXT record carries the protocol version, the
-// instance id and the key fingerprint — NEVER the token, it is broadcast to
-// the whole LAN (SPEC §5.1). The returned func deregisters.
+// name `instance` on `port` and the TXT record from txtRecord. The returned
+// func deregisters.
 func Advertise(instance string, port int, fp string) (stop func(), err error) {
-	txt := []string{"proto=1", "id=" + instance, "kh=" + fp}
-	srv, err := zeroconf.Register(instance, "_soft-kvm._tcp", "local.", port, txt, nil)
+	srv, err := zeroconf.Register(instance, serviceType, "local.", port, txtRecord(instance, fp), nil)
 	if err != nil {
 		return nil, err
 	}
 	return func() { srv.Shutdown() }, nil
+}
+
+// txtRecord builds the advertised TXT record: the protocol version, the
+// instance id and the key fingerprint — NEVER the token, it is broadcast to
+// the whole LAN (SPEC §5.1, §9).
+func txtRecord(instance, fp string) []string {
+	return []string{"proto=1", "id=" + instance, "kh=" + fp}
 }
 
 // browseRound runs one mDNS browse round (the caller supplies the timeout via
@@ -58,7 +66,7 @@ func browseRound(ctx context.Context, wantFP string, yield func(string) bool) er
 	// unbuffered channel would strand that goroutine on a send racing the
 	// round's timeout (SPEC §5.1).
 	entries := make(chan *zeroconf.ServiceEntry, 1)
-	if err := resolver.Browse(ctx, "_soft-kvm._tcp", "local.", entries); err != nil {
+	if err := resolver.Browse(ctx, serviceType, "local.", entries); err != nil {
 		return err
 	}
 

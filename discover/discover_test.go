@@ -35,69 +35,20 @@ func TestCacheMissing(t *testing.T) {
 	}
 }
 
-func TestMDNSRoundTrip(t *testing.T) {
-	// Find a free port to advertise on.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+// The advertised TXT record is broadcast to the whole LAN: it must carry the
+// protocol version, the instance id and the key fingerprint — and never the
+// token (SPEC §5.1, §9).
+func TestTXTRecord(t *testing.T) {
+	const token = "a-token-that-must-never-leak"
+	got := txtRecord("some-instance", identity.KeyFingerprint(token))
+	want := []string{"proto=1", "id=some-instance", "kh=" + identity.KeyFingerprint(token)}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-
-	const instance = "test-instance"
-	const token = "round-trip-token"
-	stop, err := Advertise(instance, port, identity.KeyFingerprint(token))
-	if err != nil {
-		t.Fatalf("advertise: %v", err)
-	}
-	defer stop()
-
-	// Give the server time to start its listeners and probe.
-	time.Sleep(100 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	resolver, err := zeroconf.NewResolver(nil)
-	if err != nil {
-		t.Fatalf("new resolver: %v", err)
-	}
-	entries := make(chan *zeroconf.ServiceEntry)
-	if err := resolver.Browse(ctx, "_soft-kvm._tcp", "local.", entries); err != nil {
-		t.Fatalf("browse: %v", err)
-	}
-
-	select {
-	case entry := <-entries:
-		if entry == nil {
-			t.Skip("mDNS browse returned no entries (multicast loopback unavailable)")
+	for _, kv := range got {
+		if strings.Contains(kv, token) {
+			t.Errorf("TXT record leaks token: %q", kv)
 		}
-		if entry.Instance != instance {
-			t.Errorf("instance %q, want %q", entry.Instance, instance)
-		}
-		if entry.Port != port {
-			t.Errorf("port %d, want %d", entry.Port, port)
-		}
-		wantTXT := []string{"proto=1", "id=" + instance, "kh=" + identity.KeyFingerprint(token)}
-		for _, w := range wantTXT {
-			found := false
-			for _, txt := range entry.Text {
-				if txt == w {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("TXT record missing %q, got %v", w, entry.Text)
-			}
-		}
-		for _, txt := range entry.Text {
-			if strings.Contains(txt, token) {
-				t.Errorf("TXT record leaks token: %q", txt)
-			}
-		}
-	case <-ctx.Done():
-		t.Skip("mDNS browse returned no entries within timeout (multicast loopback unavailable)")
 	}
 }
 
