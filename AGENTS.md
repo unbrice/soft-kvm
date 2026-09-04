@@ -33,16 +33,20 @@ every host, six subcommands:
   Linux, BetterDisplay on macOS, then e.g. a USB device command after a bare
   `--`) on the losing host. A command named `hid-switch` is not exec'd — it runs
   in-process and speaks Logitech HID++ `changeHost` (SPEC §5.5).
-  `--trigger VID:PID[,…]` is required; macOS also gets `--no-guards` and
+  `--trigger VID:PID[:SLOT][,…]` is required — a bare `VID:PID` watches a HID
+  node that comes and goes, `VID:PID:SLOT` watches one pairing slot of a
+  receiver that stays plugged in; macOS also gets `--no-guards` and
   `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
   with a pointer to `--force` when the target has no live agent.
 - `detect` — prints attached HID devices, suggested `--trigger` values
   (keyboards and HID++ mice), and `hid-switch` actions that make the other
   peripheral follow the gesture (SPEC §5.5, §6.1).
-- `hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX` — runs the
-  built-in Logitech HID++ `changeHost` command by hand, without a server or
-  token (SPEC §5.5).
+- `hid-switch VID:PID[:SLOT] host=N` — runs the built-in Logitech HID++
+  `changeHost` command by hand, without a server or token. Without `:SLOT` it
+  moves every peripheral still linked to that device; `host=N` is the target
+  Easy-Switch channel as printed on the key (1-3), required here because there
+  is no owner to inherit it from (SPEC §5.5).
 - `service <install|print|uninstall> [serve|connect] [args]` — Linux only:
   validates with the `serve`/`connect` flag sets and installs, prints or removes
   the canonical systemd units from `units/`, baking the raw argv into
@@ -66,22 +70,23 @@ One module, one binary, ten packages under the root `main` (SPEC §11). Per-OS
 splits use filename build tags (`*_linux.go`, `*_darwin.go`), never `//go:build`
 lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
 `platform`, `hidpp`) import nothing internal; `detect` imports `hidpp` and
-`platform`; `model` imports `state`; `client` and `server` import `state` and
-`identity`; `agent` imports `model`, `state`, `client`, `discover` and `hidpp`.
+`platform`; `model` imports `state`; `client` imports `state` and `identity`;
+`server` those two and `hidpp` (the channel bound it validates on a claim);
+`agent` imports `model`, `state`, `client`, `discover` and `hidpp`.
 
-| Package    | Files                                       | Concern                                                                                                                               |
-| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux) |
-| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                    |
-| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                    |
-| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                       |
-| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                     |
-| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal    |
-| `detect`   | `detect.go`, `detect_hid.go`                | HID enumeration for the subcommand and its shell-transcript output; the attach detector both OSes share                               |
-| `hidpp`    | `hidpp.go`                                  | Logitech HID++ `changeHost`: the `hid-switch` virtual command and the `detect` probe (SPEC §5.5)                                      |
-| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                         |
-| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                          |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                 |
+| Package    | Files                                       | Concern                                                                                                                                          |
+| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)            |
+| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                               |
+| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                               |
+| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                  |
+| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                |
+| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal               |
+| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                     |
+| `hidpp`    | `hidpp.go`                                  | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1) |
+| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                    |
+| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                     |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                            |
 
 The invariants header lives at the top of `agent/agent.go`.
 `platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op

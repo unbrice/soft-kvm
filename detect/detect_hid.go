@@ -14,50 +14,61 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 
 	"github.com/telesma-app/hid"
 )
 
 type vidpid struct{ vid, pid uint16 }
 
-// parseVIDPIDList parses a comma-separated "046d:c548,046d:b35b" list.
-func parseVIDPIDList(list string) ([]vidpid, error) {
-	var out []vidpid
-	for _, s := range strings.Split(list, ",") {
-		parts := strings.Split(strings.TrimSpace(s), ":")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid VID:PID %q", s)
-		}
-		v, err := strconv.ParseUint(parts[0], 16, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid VID %q: %w", parts[0], err)
-		}
-		p, err := strconv.ParseUint(parts[1], 16, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid PID %q: %w", parts[1], err)
-		}
-		out = append(out, vidpid{uint16(v), uint16(p)})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("empty VID:PID list")
-	}
-	return out, nil
+// presence tracks which interface paths of which targets are attached. It
+// answers one question: did this target just go from absent to present?
+//
+// The bookkeeping is per target, not global. The receiver a keyboard is
+// paired through is itself a useful --trigger and stays plugged in for
+// months, so a single global count never returns to zero and would mask
+// every later attach edge (SPEC §6.1).
+type presence struct {
+	paths map[string]vidpid // attached interface path → its target
+	count map[vidpid]int    // interfaces currently attached per target
 }
 
-// NewHIDDetector returns a detector that emits an attach edge whenever any of
-// the configured VID:PID targets becomes present. The list is a comma-separated
-// "VID:PID" string.
-func NewHIDDetector(list string) (*HIDDetector, error) {
-	targets, err := parseVIDPIDList(list)
-	if err != nil {
-		return nil, err
-	}
-	return &HIDDetector{targets: targets}, nil
+func newPresence() *presence {
+	return &presence{paths: map[string]vidpid{}, count: map[vidpid]int{}}
 }
 
-// HIDDetector watches HID device events for the configured targets.
+// add records one interface and reports whether it is the first one of its
+// target — the absent→present edge. Re-adding a known path is not an edge.
+func (p *presence) add(info *hid.DeviceInfo) bool {
+	if info == nil {
+		return false
+	}
+	if _, dup := p.paths[info.Path]; dup {
+		return false
+	}
+	t := vidpid{info.VendorID, info.ProductID}
+	p.paths[info.Path] = t
+	p.count[t]++
+	return p.count[t] == 1
+}
+
+// remove drops one interface, keyed by path: the disconnect event is the one
+// place VID:PID may be missing, and the path alone identifies the interface.
+func (p *presence) remove(info *hid.DeviceInfo) {
+	if info == nil {
+		return
+	}
+	t, ok := p.paths[info.Path]
+	if !ok {
+		return
+	}
+	delete(p.paths, info.Path)
+	if p.count[t]--; p.count[t] <= 0 {
+		delete(p.count, t)
+	}
+}
+
+// HIDDetector watches HID device events for the configured targets. It is
+// built by NewDetector from the slotless --trigger entries.
 type HIDDetector struct {
 	targets []vidpid
 }
@@ -90,28 +101,23 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 		}
 	}()
 
-	// Each target exposes several HID interfaces (keyboard, mouse, raw),
-	// each reported as a separate device with the same VID:PID. Track the
-	// present interface paths so one physical attach yields exactly one edge.
-	present := map[string]bool{}
+	// Each target exposes several HID interfaces (keyboard, mouse, raw), each
+	// reported as a separate device with the same VID:PID, so presence is
+	// tracked per target and one physical attach yields exactly one edge.
+	p := newPresence()
 
-	// Non-blocking and coalescing: an edge already queued makes this one
-	// redundant — attach edges are idempotent triggers (agent invariant 3).
 	emit := func(info *hid.DeviceInfo) {
 		slog.Info("hid target attached",
 			"vid", fmt.Sprintf("%04x", info.VendorID),
 			"pid", fmt.Sprintf("%04x", info.ProductID))
-		select {
-		case attach <- struct{}{}:
-		default:
-		}
+		emitAttach(attach)
 	}
 
-	// A target already attached at startup counts as an attach edge.
+	// A target already attached at startup counts as one attach edge.
 	var first *hid.DeviceInfo
 	for _, dev := range w.Snapshot().Devices {
 		if d.matches(dev.DeviceInfo) {
-			present[dev.DeviceInfo.Path] = true
+			p.add(dev.DeviceInfo)
 			if first == nil {
 				first = dev.DeviceInfo
 			}
@@ -134,16 +140,14 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 			}
 			switch ev.Type {
 			case hid.DeviceEventConnected:
-				if d.matches(ev.DeviceInfo) {
-					present[ev.DeviceInfo.Path] = true
-					if len(present) == 1 {
-						emit(ev.DeviceInfo)
-					}
+				if d.matches(ev.DeviceInfo) && p.add(ev.DeviceInfo) {
+					emit(ev.DeviceInfo)
 				}
 			case hid.DeviceEventDisconnected:
-				if d.matches(ev.DeviceInfo) {
-					delete(present, ev.DeviceInfo.Path)
-				}
+				// Not gated on matches: a disconnect can arrive without
+				// VID:PID once the node is gone from sysfs, and remove
+				// ignores paths it never tracked anyway.
+				p.remove(ev.DeviceInfo)
 			}
 		}
 	}

@@ -51,7 +51,7 @@ func (a *agent) actionLoop(ctx context.Context) error {
 // distinguishes a hung child from a spontaneous non-zero exit.
 func (a *agent) runSwitch(ctx context.Context, argv []string) error {
 	sctx, cancel := context.WithTimeout(ctx, a.cfg.switchTimeoutOrDefault())
-	err := runSwitchCommand(sctx, a.cfg.Runner, argv)
+	err := runSwitchCommand(sctx, a.cfg.Runner, argv, uint8(a.ownerChannel.Load()))
 	cancel()
 	if errors.Is(sctx.Err(), context.DeadlineExceeded) {
 		if err == nil {
@@ -64,13 +64,15 @@ func (a *agent) runSwitch(ctx context.Context, argv []string) error {
 
 // runSwitchCommand runs one switch command: the built-in hid-switch virtual
 // command in-process (SPEC §5.5), anything else as an external argv.
-func runSwitchCommand(ctx context.Context, runner Runner, argv []string) error {
+// fallbackChannel is the owner's published Easy-Switch channel, used when the
+// command carries no explicit host=N.
+func runSwitchCommand(ctx context.Context, runner Runner, argv []string, fallbackChannel uint8) error {
 	if argv[0] == "hid-switch" {
 		sw, err := hidpp.Parse(argv[1:])
 		if err != nil {
 			return err
 		}
-		return sw.Do(ctx)
+		return sw.Do(ctx, fallbackChannel)
 	}
 	return runner(ctx, argv)
 }

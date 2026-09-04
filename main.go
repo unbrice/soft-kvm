@@ -149,7 +149,7 @@ func usageTo(w io.Writer) {
   activate ID [--server HOST:PORT] [--force]
   connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]
   detect
-  hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX
+  hid-switch VID:PID[:SLOT] host=N
   service <install|print|uninstall> [serve|connect] [args]
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
@@ -344,7 +344,7 @@ func activateCmd(ctx context.Context) error {
 	var lastErr error
 	for candidate := range resolver.Resolve(ctx, *serverFlag, identity.KeyFingerprint(token)) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ch, err := c.Claim(cctx, candidate, id, *force)
+		ch, err := c.Claim(cctx, candidate, id, *force, 0)
 		cancel()
 		if err != nil {
 			if errors.Is(err, client.ErrNoLiveAgent) && !*force {
@@ -398,7 +398,7 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	v := &connectFlags{
 		id:            fs.String("id", platform.DefaultID, "claimed identity"),
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
-		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID` filters — run soft-kvm detect to list them"),
+		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID[:SLOT]` filters — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
 		confirm:       fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch has failed"),
 		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch command before giving up"),
@@ -432,7 +432,7 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 
-	detector, err := detect.NewHIDDetector(*flags.trigger)
+	detector, err := detect.NewDetector(*flags.trigger)
 	if err != nil {
 		return err
 	}
@@ -480,6 +480,11 @@ func connectCmd(ctx context.Context) error {
 		checkArgv = platform.ShellArgv(*flags.checkCmd)
 	}
 
+	// The winner publishes which Easy-Switch channel it is on, read off the
+	// trigger peripheral. Only a HID++ trigger can answer, so a plain HID
+	// trigger leaves it nil and the peer needs an explicit host=N (SPEC §5.5).
+	ownChannel := detector.OwnChannelFunc()
+
 	cfg := agent.Config{
 		ID:             *flags.id,
 		ExplicitServer: *flags.serverFlag,
@@ -496,6 +501,7 @@ func connectCmd(ctx context.Context) error {
 		CheckTimeout:   *flags.checkTimeout,
 		SwitchTimeout:  *flags.switchTimeout,
 		Resolver:       resolver,
+		OwnChannel:     ownChannel,
 	}
 
 	return agent.Run(ctx, cfg)
@@ -545,7 +551,7 @@ func detectCmd(ctx context.Context) error {
 func hidSwitchCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("hid-switch", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX")
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID[:SLOT] host=N")
 		fs.PrintDefaults()
 	}
 	if err := parseArgs(fs, os.Args[2:]); err != nil {
@@ -556,5 +562,7 @@ func hidSwitchCmd(ctx context.Context) error {
 		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
-	return sw.Do(ctx)
+	// Run by hand there is no owner to inherit a channel from, so host=N is
+	// not optional here — Do says so if it is missing.
+	return sw.Do(ctx, 0)
 }

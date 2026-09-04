@@ -80,7 +80,7 @@ func TestRenderDevices(t *testing.T) {
 			inv: &hidpp.Inventory{
 				Kind: hidpp.KindReceiver,
 				Paired: []hidpp.PairedDevice{
-					{Index: 1, Kind: hidpp.KindKeyboard},
+					{Index: 1, Kind: hidpp.KindKeyboard, Online: true},
 					{Index: 2, Kind: hidpp.KindMouse},
 				},
 			},
@@ -108,10 +108,12 @@ func TestRenderDevices(t *testing.T) {
 		t.Error("missing interface list and HID++ tag")
 	}
 	if !strings.Contains(out, triggerMark+"046d:c548") {
-		t.Error("keyboard-capable device is not marked as a trigger candidate")
+		t.Error("receiver with a linked peripheral is not marked as a trigger candidate")
 	}
-	if !strings.Contains(out, "paired: 1 keyboard, 2 mouse") {
-		t.Error("missing receiver slot map")
+	// Slot 1 holds the link and is worth naming; slot 2 is a stale pairing
+	// whose device is talking to another host.
+	if !strings.Contains(out, "paired: 1 keyboard linked; 2 not linked") {
+		t.Error("missing receiver slot map with link state")
 	}
 	if !strings.Contains(out, "🔒 HID++ scan denied") {
 		t.Error("missing scan failure reason")
@@ -233,7 +235,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		interfaces: []ifaceUsage{{0x01, 0x06}, {0xFF43, 0x02}},
 	}}
 
-	// A directly attached HID++ mouse: two-argument form.
+	// A directly attached HID++ mouse: named on its own, no slot.
 	direct := probedDevice{
 		hidDevice: hidDevice{
 			key:        deviceKey{vid: 0x046d, pid: 0xb034},
@@ -248,38 +250,51 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	if err := renderSuggestions(&buf, []probedDevice{keyboard, direct}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 HOST") {
+	out := buf.String()
+	if !strings.Contains(out, "--trigger 046d:b35b") || !strings.Contains(out, "-- hid-switch 046d:b034") {
 		t.Errorf("missing direct-mouse hid-switch suggestion:\n%s", out)
 	}
+	// No host index on the command itself: the winner publishes its channel
+	// (SPEC §5.5). The prose below it still documents the host=N override.
+	for line := range strings.Lines(out) {
+		if !strings.HasPrefix(line, "soft-kvm") {
+			continue
+		}
+		if strings.Contains(line, "HOST") || strings.Contains(line, "host=") {
+			t.Errorf("suggested command still asks for a host index: %q", line)
+		}
+	}
+	// The old kind form must be gone.
+	if strings.Contains(out, "hid-switch 046d:b034 mouse") {
+		t.Errorf("suggestion still uses the kind form:\n%s", out)
+	}
 
-	// A receiver with a paired mouse: kind form through the receiver.
+	// A receiver with paired devices is named as a whole: it moves whatever
+	// is still linked to it.
 	withMouse := receiver
 	withMouse.status = probeOK
 	withMouse.inv = &hidpp.Inventory{
 		Kind:   hidpp.KindReceiver,
-		Paired: []hidpp.PairedDevice{{Index: 1, Kind: hidpp.KindKeyboard}, {Index: 2, Kind: hidpp.KindMouse}},
+		Paired: []hidpp.PairedDevice{{Index: 1, Kind: hidpp.KindKeyboard}, {Index: 2, Kind: hidpp.KindMouse, Online: true}},
 	}
 	buf.Reset()
 	if err := renderSuggestions(&buf, []probedDevice{keyboard, withMouse}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548 mouse HOST") {
-		t.Errorf("missing receiver-mouse hid-switch suggestion:\n%s", out)
+	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548") {
+		t.Errorf("missing receiver hid-switch suggestion:\n%s", out)
 	}
 
-	// A receiver with only a keyboard paired suggests nothing.
-	kbdOnly := receiver
-	kbdOnly.status = probeOK
-	kbdOnly.inv = &hidpp.Inventory{
-		Kind:   hidpp.KindReceiver,
-		Paired: []hidpp.PairedDevice{{Index: 1, Kind: hidpp.KindKeyboard}},
-	}
+	// A receiver with nothing paired has nothing to move.
+	empty := receiver
+	empty.status = probeOK
+	empty.inv = &hidpp.Inventory{Kind: hidpp.KindReceiver}
 	buf.Reset()
-	if err := renderSuggestions(&buf, []probedDevice{keyboard, kbdOnly}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{keyboard, empty}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	if out := buf.String(); strings.Contains(out, "hid-switch") {
-		t.Errorf("unexpected hid-switch suggestion without a mouse:\n%s", out)
+		t.Errorf("unexpected hid-switch suggestion for an empty receiver:\n%s", out)
 	}
 
 	// A failed probe suggests nothing either.
@@ -295,7 +310,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	}
 
 	// Both peripherals probed and directly attached: both gestures are
-	// suggested, each moving the other device.
+	// suggested, and both carry the same action — move what is still here.
 	probedKeyboard := keyboard
 	probedKeyboard.status = probeOK
 	probedKeyboard.inv = &hidpp.Inventory{Kind: hidpp.KindKeyboard}
@@ -303,14 +318,16 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	if err := renderSuggestions(&buf, []probedDevice{probedKeyboard, direct}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	out := buf.String()
-	if !strings.Contains(out, "# FOLLOW THE KEYBOARD") ||
-		!strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 HOST") {
+	out = buf.String()
+	action := "-- hid-switch 046d:b034 -- hid-switch 046d:b35b"
+	if !strings.Contains(out, "# FOLLOW THE KEYBOARD") || !strings.Contains(out, "--trigger 046d:b35b") {
 		t.Errorf("missing keyboard-led suggestion:\n%s", out)
 	}
-	if !strings.Contains(out, "# FOLLOW THE MOUSE") ||
-		!strings.Contains(out, "soft-kvm connect --trigger 046d:b034 -- hid-switch 046d:b35b HOST") {
+	if !strings.Contains(out, "# FOLLOW THE MOUSE") || !strings.Contains(out, "--trigger 046d:b034") {
 		t.Errorf("missing mouse-led suggestion:\n%s", out)
+	}
+	if strings.Count(out, action) != 2 {
+		t.Errorf("both gestures must carry the same action %q:\n%s", action, out)
 	}
 }
 
@@ -427,5 +444,63 @@ func TestDimComments(t *testing.T) {
 func TestDimNonTerminal(t *testing.T) {
 	if got := Dim(&bytes.Buffer{}, "# a comment\n"); got != "# a comment\n" {
 		t.Errorf("a bytes.Buffer must not be styled, got %q", got)
+	}
+}
+
+// A receiver-paired peripheral is addressed by its receiver's pairing slot,
+// never by its own VID:PID: its HID node lives as long as the pairing, so it
+// never attaches. Only the slot holding the link is offered.
+func TestRenderSuggestionsReceiverSlots(t *testing.T) {
+	shadowKbd := probedDevice{hidDevice: hidDevice{
+		key:        deviceKey{vid: 0x046d, pid: 0x4088},
+		mfr:        "Logitech",
+		product:    "ERGO K860",
+		interfaces: []ifaceUsage{{0x01, 0x06}},
+		shadow:     true,
+	}}
+	receiver := probedDevice{
+		hidDevice: hidDevice{
+			key:        deviceKey{vid: 0x046d, pid: 0xc52b},
+			mfr:        "Logitech",
+			product:    "USB Receiver",
+			interfaces: []ifaceUsage{{0xFF00, 0x01}},
+		},
+		status: probeOK,
+		inv: &hidpp.Inventory{
+			Kind: hidpp.KindReceiver,
+			Paired: []hidpp.PairedDevice{
+				{Index: 1, Kind: hidpp.KindMouse},                  // paired, on another host
+				{Index: 2, Kind: hidpp.KindKeyboard, Online: true}, // holds the link
+			},
+		},
+	}
+	var buf bytes.Buffer
+	if err := renderSuggestions(&buf, []probedDevice{shadowKbd, receiver}); err != nil {
+		t.Fatalf("renderSuggestions: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "--trigger 046d:c52b:2") {
+		t.Errorf("missing linked keyboard slot trigger:\n%s", out)
+	}
+	if strings.Contains(out, "046d:4088") {
+		t.Errorf("receiver-shadowed node offered as a trigger:\n%s", out)
+	}
+	if strings.Contains(out, "046d:c52b:1") {
+		t.Errorf("unlinked slot offered as a trigger:\n%s", out)
+	}
+}
+
+func TestIsTriggerExcludesShadow(t *testing.T) {
+	kbd := hidDevice{
+		key:        deviceKey{vid: 0x046d, pid: 0x4088},
+		interfaces: []ifaceUsage{{0x01, 0x06}},
+	}
+	if !(probedDevice{hidDevice: kbd}).isTrigger() {
+		t.Error("a real keyboard node must be a trigger candidate")
+	}
+	shadowed := kbd
+	shadowed.shadow = true
+	if (probedDevice{hidDevice: shadowed}).isTrigger() {
+		t.Error("a receiver-shadowed node must not be a trigger candidate")
 	}
 }

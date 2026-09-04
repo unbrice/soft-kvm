@@ -31,6 +31,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/unbrice/soft-kvm/client"
@@ -134,6 +135,10 @@ type Config struct {
 	GuardPoll      time.Duration
 	BackoffBase    time.Duration
 	Resolver       *discover.Resolver
+	// OwnChannel reports the Easy-Switch channel (1-3) this host occupies on
+	// the trigger peripheral, so a claim can publish it for the loser to
+	// switch towards (SPEC §5.5). nil when there is nothing to ask.
+	OwnChannel func(context.Context) (uint8, error)
 }
 
 func (c Config) switchTimeoutOrDefault() time.Duration {
@@ -163,6 +168,15 @@ type agent struct {
 	claims   errgroup.Group
 	actionCh chan effect
 	results  chan model.Event
+
+	// ownChannel caches this host's own Easy-Switch channel: it is a property
+	// of how the peripheral was paired, so it is read once and kept.
+	ownChannel atomic.Uint32
+	// ownerChannel is the channel last published by whoever owns the display.
+	// Written by the loop as states arrive, read by the action worker when a
+	// hid-switch command carries no explicit host=N — the two run on
+	// different goroutines, so it is atomic rather than a plain field.
+	ownerChannel atomic.Uint32
 }
 
 // newBackoff returns a backoff using the configured base.
@@ -377,6 +391,9 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 		case <-attachCh:
 			ev = model.Event{Attach: true}
 		case s := <-stateCh:
+			// Record before stepping: a state that makes this host the loser
+			// can emit a Switch in the same step, and the worker reads this.
+			a.ownerChannel.Store(uint32(s.OwnerChannel))
 			ev = model.Event{State: s}
 		case r := <-a.results:
 			ev = r
@@ -409,8 +426,9 @@ func (a *agent) claim(ctx context.Context, id string) {
 
 		cctx, cancel := context.WithTimeout(ctx, stateTimeout)
 		claimed := false
+		channel := a.resolveOwnChannel(cctx)
 		for base := range a.cfg.Resolver.Resolve(cctx, a.cfg.ExplicitServer, a.cfg.KeyFP) {
-			changed, err := a.cfg.Client.Claim(cctx, base, id, false)
+			changed, err := a.cfg.Client.Claim(cctx, base, id, false, channel)
 			if err != nil {
 				slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
 				continue
@@ -430,4 +448,25 @@ func (a *agent) claim(ctx context.Context, id string) {
 			slog.Error("claim: no candidate answered", "attempt", attempt+1)
 		}
 	}
+}
+
+// resolveOwnChannel returns this host's Easy-Switch channel, reading it once
+// and caching it. A failure is logged and returns 0: the claim still goes
+// through, and the peer falls back to an explicit host=N. The read costs one
+// RF round trip, which is why it does not repeat on every claim.
+func (a *agent) resolveOwnChannel(ctx context.Context) uint8 {
+	if v := a.ownChannel.Load(); v != 0 {
+		return uint8(v)
+	}
+	if a.cfg.OwnChannel == nil {
+		return 0
+	}
+	ch, err := a.cfg.OwnChannel(ctx)
+	if err != nil || ch == 0 {
+		slog.Debug("could not read this host's Easy-Switch channel", "error", err)
+		return 0
+	}
+	slog.Info("this host is on Easy-Switch channel", "channel", ch)
+	a.ownChannel.Store(uint32(ch))
+	return ch
 }

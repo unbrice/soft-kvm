@@ -236,7 +236,7 @@ func TestAgentSwitchPath(t *testing.T) {
 	client := newTestClient(t, testToken)
 
 	// Seed the server so the agent starts with last_owner == me.
-	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestAgentSwitchPath(t *testing.T) {
 
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
@@ -308,7 +308,7 @@ func TestAgentSwitchPathNoCheck(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "mac", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "mac", true, 0); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
 
@@ -334,7 +334,7 @@ func TestAgentSwitchPathNoCheck(t *testing.T) {
 
 	waitForLive(t, s, "mac")
 
-	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
@@ -374,7 +374,7 @@ func TestAgentVetoPath(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
 
@@ -397,7 +397,7 @@ func TestAgentVetoPath(t *testing.T) {
 
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
@@ -439,7 +439,7 @@ func TestAgentGuardsDown(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
 		t.Fatalf("seed claim other: %v", err)
 	}
 
@@ -482,7 +482,7 @@ func TestAgentSwitchTimeout(t *testing.T) {
 	client := newTestClient(t, testToken)
 
 	// Seed the server so the agent starts with last_owner == me.
-	if _, err := client.Claim(context.Background(), base, "linux", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
 
@@ -506,7 +506,7 @@ func TestAgentSwitchTimeout(t *testing.T) {
 
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
@@ -632,5 +632,97 @@ func waitForLive(t *testing.T, s *server.Server, id string) {
 			t.Fatalf("waiter %q never registered", id)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The winner publishes the Easy-Switch channel it occupies, so the losing
+// host knows where to send the peripherals it still holds (SPEC §5.5).
+func TestAgentClaimPublishesOwnChannel(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+
+	det := newFakeDetector()
+	runner := &recordingRunner{}
+	guard := &fakeGuard{ok: true}
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+
+	// Count the reads: the channel is a property of the pairing, so it must
+	// be read once and cached, not on every claim.
+	var reads atomic.Int32
+	cfg.OwnChannel = func(context.Context) (uint8, error) {
+		reads.Add(1)
+		return 2, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+
+	waitForLive(t, s, "linux")
+	det.attach()
+
+	client := newTestClient(t, testToken)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st, err := client.State(ctx, base)
+		if err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		if st.Owner == "linux" && st.OwnerChannel == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("owner channel not published: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	det.attach()
+	time.Sleep(100 * time.Millisecond)
+	if n := reads.Load(); n != 1 {
+		t.Errorf("OwnChannel read %d times, want 1 (cached)", n)
+	}
+}
+
+// A nil OwnChannel — a trigger that cannot answer HID++ — must not break the
+// claim; it just publishes nothing.
+func TestAgentClaimWithoutOwnChannel(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+
+	det := newFakeDetector()
+	runner := &recordingRunner{}
+	guard := &fakeGuard{ok: true}
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.OwnChannel = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+
+	waitForLive(t, s, "linux")
+	det.attach()
+
+	client := newTestClient(t, testToken)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st, err := client.State(ctx, base)
+		if err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		if st.Owner == "linux" {
+			if st.OwnerChannel != 0 {
+				t.Fatalf("OwnerChannel = %d, want 0", st.OwnerChannel)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("claim did not land: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

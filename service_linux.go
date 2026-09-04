@@ -218,7 +218,7 @@ func validateConnectArgs(args []string) error {
 	if *v.trigger == "" {
 		return errors.New("connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
 	}
-	if _, err := detect.NewHIDDetector(*v.trigger); err != nil {
+	if _, err := detect.NewDetector(*v.trigger); err != nil {
 		return err
 	}
 	_, err := splitSwitchCommands(fs.Args())

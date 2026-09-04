@@ -459,3 +459,62 @@ func TestServerRunShutdown(t *testing.T) {
 		t.Fatal("Run did not shut down in time")
 	}
 }
+
+// The winner's Easy-Switch channel travels with the claim and comes back on
+// /state: the losing host cannot work it out locally (SPEC §5.5).
+func TestServerClaimPublishesChannel(t *testing.T) {
+	_, srv := testServer(t)
+	defer srv.Close()
+
+	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true&channel=2", nil)
+	mustStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
+	mustStatus(t, resp, http.StatusOK)
+	var st state.ServerState
+	readJSON(t, resp, &st)
+	if st.OwnerChannel != 2 {
+		t.Fatalf("OwnerChannel = %d, want 2", st.OwnerChannel)
+	}
+
+	// A re-claim by the same owner is idempotent on the epoch but still
+	// refreshes the channel: the agent may learn it only after winning.
+	resp = doReq(t, http.MethodPost, srv.URL+"/claim/linux?channel=3", nil)
+	mustStatus(t, resp, http.StatusOK)
+	var claim map[string]any
+	readJSON(t, resp, &claim)
+	if claim["changed"] != false {
+		t.Fatalf("re-claim changed the owner: %+v", claim)
+	}
+	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
+	mustStatus(t, resp, http.StatusOK)
+	readJSON(t, resp, &st)
+	if st.OwnerChannel != 3 {
+		t.Fatalf("OwnerChannel after re-claim = %d, want 3", st.OwnerChannel)
+	}
+
+	// A claim with no channel leaves the owner's channel unknown rather than
+	// inheriting the previous owner's.
+	resp = doReq(t, http.MethodPost, srv.URL+"/claim/mac?force=true", nil)
+	mustStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
+	mustStatus(t, resp, http.StatusOK)
+	st = state.ServerState{}
+	readJSON(t, resp, &st)
+	if st.OwnerChannel != 0 {
+		t.Fatalf("OwnerChannel = %d, want 0 for an owner that published none", st.OwnerChannel)
+	}
+}
+
+func TestServerClaimRejectsBadChannel(t *testing.T) {
+	_, srv := testServer(t)
+	defer srv.Close()
+
+	for _, q := range []string{"channel=0", "channel=4", "channel=x"} {
+		resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true&"+q, nil)
+		mustStatus(t, resp, http.StatusBadRequest)
+		_ = resp.Body.Close()
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/state"
 )
@@ -33,16 +34,17 @@ const DefaultWaitTimeout = 50 * time.Second
 
 // Server carries the display bit and serves the /claim /state /wait API.
 type Server struct {
-	mu          sync.Mutex
-	token       string
-	statePath   string
-	owner       string
-	epoch       int64
-	since       time.Time
-	serverID    string
-	waiters     map[string]int
-	broadcast   chan struct{}
-	waitTimeout time.Duration
+	mu           sync.Mutex
+	token        string
+	statePath    string
+	owner        string
+	epoch        int64
+	since        time.Time
+	ownerChannel uint8
+	serverID     string
+	waiters      map[string]int
+	broadcast    chan struct{}
+	waitTimeout  time.Duration
 }
 
 // NewServer loads the persisted ownerState from statePath. A missing file is
@@ -56,15 +58,16 @@ func NewServer(statePath, token string) *Server {
 	}
 
 	s := &Server{
-		token:       token,
-		statePath:   statePath,
-		owner:       persisted.Owner,
-		epoch:       persisted.Epoch,
-		since:       persisted.Since,
-		serverID:    newUUID(),
-		waiters:     make(map[string]int),
-		broadcast:   make(chan struct{}),
-		waitTimeout: DefaultWaitTimeout,
+		token:        token,
+		statePath:    statePath,
+		owner:        persisted.Owner,
+		epoch:        persisted.Epoch,
+		since:        persisted.Since,
+		ownerChannel: persisted.OwnerChannel,
+		serverID:     newUUID(),
+		waiters:      make(map[string]int),
+		broadcast:    make(chan struct{}),
+		waitTimeout:  DefaultWaitTimeout,
 	}
 	return s
 }
@@ -143,7 +146,20 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A re-claim by the current owner is idempotent on owner/epoch, but it
+	// still refreshes the published channel: the owner may have learned it
+	// only after the claim that made it owner.
+	channel, cerr := claimChannel(r)
+	if cerr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		maybeWriteJSON(w, map[string]string{"error": cerr.Error()})
+		return
+	}
 	if id == s.owner {
+		if channel != 0 && channel != s.ownerChannel {
+			s.ownerChannel = channel
+			s.persist()
+		}
 		maybeWriteJSON(w, map[string]any{
 			"owner":   s.owner,
 			"epoch":   s.epoch,
@@ -163,11 +179,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	s.owner = id
 	s.epoch++
 	s.since = time.Now().UTC()
-	if err := state.Save(s.statePath, state.OwnerState{Owner: s.owner, Epoch: s.epoch, Since: s.since}); err != nil {
-		// Persist failure is logged but does not block the in-memory bit.
-		slog.Error("failed to persist state", "path", s.statePath, "error", err)
-	}
-	slog.Info("owner changed", "from", old, "to", s.owner, "epoch", s.epoch)
+	s.ownerChannel = channel
+	s.persist()
+	slog.Info("owner changed", "from", old, "to", s.owner,
+		"epoch", s.epoch, "channel", s.ownerChannel)
 	s.wake()
 
 	maybeWriteJSON(w, map[string]any{
@@ -197,11 +212,12 @@ func (s *Server) CurrentState() state.ServerState {
 	}
 
 	return state.ServerState{
-		Owner:    s.owner,
-		Epoch:    s.epoch,
-		Since:    s.since,
-		Live:     live,
-		ServerID: s.serverID,
+		Owner:        s.owner,
+		Epoch:        s.epoch,
+		Since:        s.since,
+		OwnerChannel: s.ownerChannel,
+		Live:         live,
+		ServerID:     s.serverID,
 	}
 }
 
@@ -340,4 +356,33 @@ func maybeWriteJSON(w http.ResponseWriter, v any) {
 		panic(err)
 	}
 	_, _ = w.Write(data)
+}
+
+// persist writes the owner bit. A failure is logged but does not block the
+// in-memory state (SPEC §6.4).
+func (s *Server) persist() {
+	err := state.Save(s.statePath, state.OwnerState{
+		Owner:        s.owner,
+		Epoch:        s.epoch,
+		Since:        s.since,
+		OwnerChannel: s.ownerChannel,
+	})
+	if err != nil {
+		slog.Error("failed to persist state", "path", s.statePath, "error", err)
+	}
+}
+
+// claimChannel reads the optional ?channel=N on a claim: the Easy-Switch
+// channel the claimant occupies on its peripherals. Absent means "unknown",
+// which is not an error — a host with no HID++ peripheral has none to report.
+func claimChannel(r *http.Request) (uint8, error) {
+	raw := r.URL.Query().Get("channel")
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(raw, 10, 8)
+	if err != nil || n < 1 || n > hidpp.MaxChannel {
+		return 0, fmt.Errorf("invalid channel %q (1-%d)", raw, hidpp.MaxChannel)
+	}
+	return uint8(n), nil
 }

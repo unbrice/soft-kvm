@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -27,35 +28,39 @@ func TestParse(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "direct device",
-			args: []string{"046d:b35b", "1"},
-			want: &Switch{VID: 0x046d, PID: 0xb35b, Target: TargetDirect, DeviceIndex: DeviceIndexDirect, HostIndex: 1},
+			name: "device, channel from the owner",
+			args: []string{"046d:c52b"},
+			want: &Switch{VID: 0x046d, PID: 0xc52b},
 		},
 		{
-			name: "receiver kind mouse",
-			args: []string{"046d:c548", "mouse", "0"},
-			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetKind, DeviceIndex: DeviceIndexDirect, Kind: KindMouse, HostIndex: 0},
+			name: "device with explicit channel",
+			args: []string{"046d:b35b", "host=2"},
+			want: &Switch{VID: 0x046d, PID: 0xb35b, Channel: 2},
 		},
 		{
-			name: "receiver kind keyboard",
-			args: []string{"046d:c548", "keyboard", "2"},
-			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetKind, DeviceIndex: DeviceIndexDirect, Kind: KindKeyboard, HostIndex: 2},
+			name: "receiver pairing slot",
+			args: []string{"046d:c548:3"},
+			want: &Switch{VID: 0x046d, PID: 0xc548, Slot: 3},
 		},
 		{
-			name: "receiver explicit slot",
-			args: []string{"046d:c548", "3", "1"},
-			want: &Switch{VID: 0x046d, PID: 0xc548, Target: TargetSlot, DeviceIndex: 3, HostIndex: 1},
+			name: "receiver pairing slot with channel",
+			args: []string{"046d:c548:3", "host=1"},
+			want: &Switch{VID: 0x046d, PID: 0xc548, Slot: 3, Channel: 1},
 		},
-		{name: "too few args", args: []string{"046d:b35b"}, wantErr: true},
-		{name: "too many args", args: []string{"046d:b35b", "1", "1", "1"}, wantErr: true},
-		{name: "bad separator", args: []string{"046db35b", "1"}, wantErr: true},
-		{name: "bad vid", args: []string{"zzzz:b35b", "1"}, wantErr: true},
-		{name: "bad pid", args: []string{"046d:b35bb", "1"}, wantErr: true},
-		{name: "host index too high", args: []string{"046d:b35b", "3"}, wantErr: true},
-		{name: "host index not a number", args: []string{"046d:b35b", "mac"}, wantErr: true},
-		{name: "slot zero", args: []string{"046d:c548", "0", "1"}, wantErr: true},
-		{name: "slot too high", args: []string{"046d:c548", "7", "1"}, wantErr: true},
-		{name: "unknown kind", args: []string{"046d:c548", "trackball", "1"}, wantErr: true},
+		{name: "no args", args: nil, wantErr: true},
+		{name: "too many args", args: []string{"046d:b35b", "host=1", "1"}, wantErr: true},
+		{name: "bad separator", args: []string{"046db35b"}, wantErr: true},
+		{name: "bad vid", args: []string{"zzzz:b35b"}, wantErr: true},
+		{name: "bad pid", args: []string{"046d:b35bb"}, wantErr: true},
+		{name: "slot zero", args: []string{"046d:c548:0"}, wantErr: true},
+		{name: "slot too high", args: []string{"046d:c548:7"}, wantErr: true},
+		{name: "channel zero", args: []string{"046d:b35b", "host=0"}, wantErr: true},
+		{name: "channel too high", args: []string{"046d:b35b", "host=4"}, wantErr: true},
+		{name: "channel not a number", args: []string{"046d:b35b", "host=mac"}, wantErr: true},
+		// The old grammar must fail loudly, never be reinterpreted: a bare
+		// trailing number used to be a 0-based host index.
+		{name: "old bare host index", args: []string{"046d:b35b", "1"}, wantErr: true},
+		{name: "old kind form", args: []string{"046d:c548", "mouse", "0"}, wantErr: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -553,4 +558,46 @@ func TestSpeaksHIDPP(t *testing.T) {
 			t.Errorf("speaksHIDPP = %v, want %v", err, werr)
 		}
 	})
+}
+
+// Without an explicit host=N and without a channel published by the owner
+// there is nowhere safe to send a peripheral, so Do must refuse rather than
+// guess — and it must refuse before touching any hardware.
+func TestSwitchNeedsAChannel(t *testing.T) {
+	sw := &Switch{VID: 0x046d, PID: 0xc52b}
+	err := sw.Do(context.Background(), 0)
+	if err == nil {
+		t.Fatal("Do with no channel succeeded, want an error")
+	}
+	if !strings.Contains(err.Error(), "no target host channel") {
+		t.Errorf("Do error = %v, want it to name the missing channel", err)
+	}
+}
+
+func TestParseTarget(t *testing.T) {
+	cases := []struct {
+		in       string
+		vid, pid uint16
+		slot     uint8
+	}{
+		{"046d:c52b", 0x046d, 0xc52b, 0},
+		{"046d:c52b:2", 0x046d, 0xc52b, 2},
+		{" 046d:c52b:6 ", 0x046d, 0xc52b, 6},
+	}
+	for _, c := range cases {
+		vid, pid, slot, err := ParseTarget(c.in)
+		if err != nil {
+			t.Errorf("ParseTarget(%q): %v", c.in, err)
+			continue
+		}
+		if vid != c.vid || pid != c.pid || slot != c.slot {
+			t.Errorf("ParseTarget(%q) = %04x:%04x:%d, want %04x:%04x:%d",
+				c.in, vid, pid, slot, c.vid, c.pid, c.slot)
+		}
+	}
+	for _, in := range []string{"", "046d", "046d:c52b:2:3", "zz:c52b", "046d:c52b:0", "046d:c52b:7"} {
+		if _, _, _, err := ParseTarget(in); err == nil {
+			t.Errorf("ParseTarget(%q) succeeded, want error", in)
+		}
+	}
 }

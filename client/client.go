@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,10 +49,20 @@ func NewClient(token string) (*Client, error) {
 // server's owner changed. A 400 whose body reports no live agent becomes
 // ErrNoLiveAgent (SPEC §5.3: activate needs --force). Any other non-2xx
 // returns an error that includes the response body.
-func (c *Client) Claim(ctx context.Context, base, id string, force bool) (bool, error) {
+// channel is the claimant's Easy-Switch channel (1-3) on its peripherals, or
+// 0 when it has none to report; the loser needs it to send the peripherals it
+// still holds to the winner (SPEC §5.5).
+func (c *Client) Claim(ctx context.Context, base, id string, force bool, channel uint8) (bool, error) {
 	url := "https://" + base + "/claim/" + id
+	q := make([]string, 0, 2)
 	if force {
-		url += "?force=true"
+		q = append(q, "force=true")
+	}
+	if channel != 0 {
+		q = append(q, "channel="+strconv.Itoa(int(channel)))
+	}
+	if len(q) > 0 {
+		url += "?" + strings.Join(q, "&")
 	}
 	status, body, err := c.request(ctx, http.MethodPost, url, 5*time.Second)
 	if err != nil {

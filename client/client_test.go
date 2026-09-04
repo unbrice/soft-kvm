@@ -66,7 +66,7 @@ func TestClientClaimForce(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, clientTestToken)
-	changed, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", true)
+	changed, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", true, 0)
 	if err != nil {
 		t.Fatalf("claim force: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestClientClaimNoLiveAgent(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, clientTestToken)
-	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false)
+	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false, 0)
 	if !errors.Is(err, client.ErrNoLiveAgent) {
 		t.Fatalf("expected ErrNoLiveAgent, got %v", err)
 	}
@@ -125,7 +125,7 @@ func TestClientWaitWakesOnClaim(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	changed, err := c.Claim(context.Background(), base, "mac", false)
+	changed, err := c.Claim(context.Background(), base, "mac", false, 0)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestClientWrongSecret(t *testing.T) {
 	// (SPEC §9).
 	c := newTestClient(t, "wrong-token")
 
-	if _, err := c.Claim(context.Background(), base, "mac", true); err == nil {
+	if _, err := c.Claim(context.Background(), base, "mac", true, 0); err == nil {
 		t.Fatal("claim: expected TLS failure")
 	} else if !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("claim: expected certificate error, got %v", err)
@@ -248,7 +248,7 @@ func TestClientNonJSONErrorBody(t *testing.T) {
 	defer server.Close()
 
 	c := newTestClient(t, clientTestToken)
-	_, err = c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false)
+	_, err = c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false, 0)
 	if err == nil {
 		t.Fatal("expected error")
 	}

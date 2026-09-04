@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -260,16 +261,53 @@ const (
 	contWidth  = 76 - len(contIndent)
 )
 
-// isTrigger reports whether an attach of this device can mean "the user
-// switched input to this host": keyboard-capable devices and probed HID++
-// mice, whose host-switch button is the same gesture. renderDevices marks
-// these and renderSuggestions lists them, both from here, so the legend
-// cannot drift from the suggestion.
+// isTrigger reports whether this device can carry "the user switched input to
+// this host". renderDevices marks these and renderSuggestions lists them, both
+// from here, so the legend cannot drift from the suggestion.
 func (d probedDevice) isTrigger() bool {
 	if d.key.vid == 0 {
 		return false
 	}
+	// A receiver carries the gesture for the peripherals linked to it, one
+	// --trigger entry per pairing slot.
+	if d.isReceiver() {
+		return len(d.triggerSlots()) > 0
+	}
+	// A receiver-paired node is not a trigger of its own: hid-logitech-dj
+	// keeps it alive for as long as the *pairing* lasts, so it never attaches
+	// or detaches when the device moves between hosts (SPEC §6.1). The
+	// receiver's link notification is the signal instead.
+	if d.shadow {
+		return false
+	}
 	return d.hasKeyboard() || (d.status == probeOK && d.inv.Kind == hidpp.KindMouse)
+}
+
+// isReceiver reports whether the probe identified this device as a receiver.
+func (d probedDevice) isReceiver() bool {
+	return d.status == probeOK && d.inv != nil && d.inv.Kind == hidpp.KindReceiver
+}
+
+// triggerSlots returns the pairing slots that can carry the gesture: linked
+// right now, and holding a keyboard or a mouse. A slot whose device is paired
+// but talking to another host is not offered — its link notification would
+// never arrive here.
+func (d probedDevice) triggerSlots() []hidpp.PairedDevice {
+	if !d.isReceiver() {
+		return nil
+	}
+	var out []hidpp.PairedDevice
+	for _, p := range d.inv.Paired {
+		if p.Online && (p.Kind == hidpp.KindKeyboard || p.Kind == hidpp.KindMouse) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// triggerString renders one --trigger entry for a receiver pairing slot.
+func triggerString(vid, pid uint16, slot uint8) string {
+	return fmt.Sprintf("%s:%d", vidpidString(vid, pid), slot)
 }
 
 // tags renders a device row's trailing descriptor: its interface usages,
@@ -323,7 +361,7 @@ func renderDevices(w io.Writer, devices []probedDevice) error {
 		nameWidth = max(nameWidth, len(dev.name()))
 	}
 	nameWidth = min(nameWidth, nameColMax)
-	if _, err := fmt.Fprintf(w, "Devices seen (%s= usable as --trigger):\n\n", triggerMark); err != nil {
+	if _, err := fmt.Fprintf(w, "Devices seen (%s= usable as --trigger and connected):\n\n", triggerMark); err != nil {
 		return err
 	}
 	for _, dev := range devices {
@@ -355,11 +393,25 @@ func deviceDetail(dev probedDevice) []string {
 		if len(dev.inv.Paired) == 0 {
 			return nil
 		}
-		slots := make([]string, len(dev.inv.Paired))
-		for i, p := range dev.inv.Paired {
-			slots[i] = fmt.Sprintf("%d %s", p.Index, p.Kind)
+		// Linked slots carry their kind — they are the ones worth naming in a
+		// --trigger. The rest collapse into a trailing group: a receiver keeps
+		// stale pairings for devices that now live on another host.
+		var linked, idle []string
+		for _, p := range dev.inv.Paired {
+			if p.Online {
+				linked = append(linked, fmt.Sprintf("%d %s", p.Index, p.Kind))
+			} else {
+				idle = append(idle, strconv.Itoa(int(p.Index)))
+			}
 		}
-		return wrapAt("paired: "+strings.Join(slots, ", "), contWidth)
+		var parts []string
+		if len(linked) > 0 {
+			parts = append(parts, strings.Join(linked, ", ")+" linked")
+		}
+		if len(idle) > 0 {
+			parts = append(parts, strings.Join(idle, ", ")+" not linked")
+		}
+		return wrapAt("paired: "+strings.Join(parts, "; "), contWidth)
 	default:
 		return nil
 	}
@@ -392,6 +444,20 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		if !dev.isTrigger() {
 			continue
 		}
+		// A receiver is addressed per pairing slot; everything else by its
+		// own VID:PID, whose HID node really does come and go.
+		if dev.isReceiver() {
+			for _, p := range dev.triggerSlots() {
+				t := triggerString(dev.key.vid, dev.key.pid, p.Index)
+				switch p.Kind {
+				case hidpp.KindKeyboard:
+					kbdTriggers = append(kbdTriggers, t)
+				case hidpp.KindMouse:
+					mouseTriggers = append(mouseTriggers, t)
+				}
+			}
+			continue
+		}
 		vidpid := vidpidString(dev.key.vid, dev.key.pid)
 		if dev.hasKeyboard() {
 			kbdTriggers = append(kbdTriggers, vidpid)
@@ -413,20 +479,24 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		return err
 	}
 
-	// One suggestion per device that can carry the gesture: the others
-	// follow it via hid-switch.
+	// The action is the same either way — move whatever is still linked here
+	// — so the two suggestions differ only in what leads the gesture.
+	action := ""
+	if cmds := switchCommands(devices); len(cmds) > 0 {
+		action = " -- " + strings.Join(cmds, " -- ")
+	}
 	type suggestion struct{ comment, cmd string }
 	var suggestions []suggestion
-	if t := switchTarget(devices, hidpp.KindMouse); len(kbdTriggers) > 0 && t != "" {
+	if len(kbdTriggers) > 0 && action != "" {
 		suggestions = append(suggestions, suggestion{
-			"# FOLLOW THE KEYBOARD — switch when a keyboard attaches here,\n# and send the mouse along.\n",
-			"soft-kvm connect --trigger " + strings.Join(kbdTriggers, ",") + " -- " + t,
+			"# FOLLOW THE KEYBOARD — switch when the keyboard takes the link\n# here, and send the other peripherals along.\n",
+			"soft-kvm connect --trigger " + strings.Join(kbdTriggers, ",") + action,
 		})
 	}
-	if t := switchTarget(devices, hidpp.KindKeyboard); len(mouseTriggers) > 0 && t != "" {
+	if len(mouseTriggers) > 0 && action != "" {
 		suggestions = append(suggestions, suggestion{
-			"# FOLLOW THE MOUSE — switch when a mouse attaches here, and\n# send the keyboard along. Install one gesture, not both.\n",
-			"soft-kvm connect --trigger " + strings.Join(mouseTriggers, ",") + " -- " + t,
+			"# FOLLOW THE MOUSE — switch when the mouse takes the link here,\n# and send the other peripherals along. Install one, not both.\n",
+			"soft-kvm connect --trigger " + strings.Join(mouseTriggers, ",") + action,
 		})
 	}
 	if len(suggestions) == 0 {
@@ -458,36 +528,40 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		return nil
 	}
 	_, err := io.WriteString(w, dim(`
-# HOST is the other host's Easy-Switch slot minus one (0-2). hid-switch
-# is built in, not a program: it moves every paired device of the named
-# kind — give a pairing slot number (1-6) instead of the kind to move
-# just one.
+# hid-switch is built in, not a program. Named without a slot it moves
+# every peripheral still linked to that device — the one that carried
+# the gesture has already left, so it is skipped. The target channel
+# comes from the winning host, which publishes its own with its claim.
+# Append host=N (1-3, as printed on the key) to pin it, or address one
+# peripheral as VID:PID:SLOT.
 `))
 	return err
 }
 
-// switchTarget renders the hid-switch action that moves devices of the given
-// kind: the directly attached device if the probe identified one, else the
-// kind form through a receiver that has one paired. "" when no target was
-// probed.
-func switchTarget(devices []probedDevice, kind hidpp.Kind) string {
+// switchCommands renders the hid-switch actions the losing host runs: one per
+// local device that can carry a peripheral. Each moves whatever is still
+// linked to it, so the same list serves whichever peripheral led the gesture
+// — the one that led has already left, and its entry is a no-op. Keyboard and
+// mouse often sit on different receivers, so this is a list, not one command.
+func switchCommands(devices []probedDevice) []string {
+	var out []string
 	for _, dev := range devices {
-		if dev.status == probeOK && dev.inv.Kind == kind {
-			return fmt.Sprintf("hid-switch %s HOST", vidpidString(dev.key.vid, dev.key.pid))
-		}
-	}
-	for _, dev := range devices {
-		if dev.status != probeOK || dev.inv.Kind != hidpp.KindReceiver {
+		if dev.status != probeOK || dev.inv == nil {
 			continue
 		}
-		for _, p := range dev.inv.Paired {
-			if p.Kind == kind {
-				return fmt.Sprintf("hid-switch %s %s HOST",
-					vidpidString(dev.key.vid, dev.key.pid), kind)
+		switch dev.inv.Kind {
+		case hidpp.KindReceiver:
+			if len(dev.inv.Paired) == 0 {
+				continue
 			}
+		case hidpp.KindKeyboard, hidpp.KindMouse:
+		default:
+			continue
 		}
+		out = append(out, "hid-switch "+vidpidString(dev.key.vid, dev.key.pid))
 	}
-	return ""
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func (d *hidDevice) name() string {

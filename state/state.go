@@ -24,13 +24,20 @@ type ServerState struct {
 	Since    time.Time       `json:"since"`
 	Live     map[string]bool `json:"live"`
 	ServerID string          `json:"server_id"`
+	// OwnerChannel is the Easy-Switch channel (1-3) the owner occupies on its
+	// peripherals, 0 when it published none. The losing host switches the
+	// peripherals it still holds to this channel: a host can read its own
+	// channel off a device but never the peer's, so the winner has to say
+	// (SPEC §5.5).
+	OwnerChannel uint8 `json:"owner_channel"`
 }
 
 // OwnerState is the persisted subset of ServerState (SPEC §5.2 --state).
 type OwnerState struct {
-	Owner string    `json:"owner"`
-	Epoch int64     `json:"epoch"`
-	Since time.Time `json:"since"`
+	Owner        string    `json:"owner"`
+	Epoch        int64     `json:"epoch"`
+	Since        time.Time `json:"since"`
+	OwnerChannel uint8     `json:"owner_channel"`
 }
 
 // AgentState is the agent's persisted record (SPEC §4.3 agent.json).

@@ -306,20 +306,20 @@ The host agent: detector, claimer, watcher, and the switch commands, in one
 long-running process. Everything has a per-OS default; with discovery there are
 no required arguments.
 
-| Flag / arg              | Default (Linux)                                              | Default (macOS)                                                                                                      | Meaning                                                                                                                                                                                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--id ID`               | `linux`                                                      | `mac`                                                                                                                | Claimed identity (from `GOOS`; override for testing)                                                                                                                                                                                                                                           |
-| `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent. Repeat after a bare `--` for each additional command (e.g. display, then a USB device) — they run in order, the display probe stays the receipt. A command named `hid-switch` is built in, not exec'd (§5.5) |
-| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | —                                                                                                                    | Veto before the switch, receipt after it (§4.3); empty on macOS (fire-and-forget switch)                                                                                                                                                                                                       |
-| `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                                  | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3)                                                                                                                                                                                                        |
-| `--switch-timeout 30s`  | 30s                                                          | 30s                                                                                                                  | Bound on one `SWITCH-CMD` run — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                              |
-| `--trigger LIST`        | required                                                     | required                                                                                                             | Comma-separated VID:PID filters for the trigger detector — the USB receiver, plus optionally a Bluetooth keyboard (§6.3); `soft-kvm detect` lists candidates                                                                                                                                   |
-| `--settle 2s`           | 2s                                                           | 2s                                                                                                                   | Attach must persist this long before claiming                                                                                                                                                                                                                                                  |
-| `--confirm 4s`          | 4s                                                           | 4s                                                                                                                   | How long `--check-cmd` may keep succeeding before the switch counts as failed                                                                                                                                                                                                                  |
-| `--switch-retries 3`    | 3                                                            | 3                                                                                                                    | Re-runs of the switch commands, 1 s apart, before giving up                                                                                                                                                                                                                                    |
-| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'`        | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`                             | Run when the switch cannot be confirmed after the last retry                                                                                                                                                                                                                                   |
-| `--no-guards`           | implicit                                                     | —                                                                                                                    | macOS guards: AC power + dock present (§6.2)                                                                                                                                                                                                                                                   |
-| `SOFTKVM_TOKEN`         | required                                                     | required                                                                                                             | Shared secret                                                                                                                                                                                                                                                                                  |
+| Flag / arg              | Default (Linux)                                              | Default (macOS)                                                                                                      | Meaning                                                                                                                                                                                                                                                                                                                            |
+| ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--id ID`               | `linux`                                                      | `mac`                                                                                                                | Claimed identity (from `GOOS`; override for testing)                                                                                                                                                                                                                                                                               |
+| `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent. Repeat after a bare `--` for each additional command (e.g. display, then a USB device) — they run in order, the display probe stays the receipt. A command named `hid-switch` is built in, not exec'd (§5.5)                                     |
+| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | —                                                                                                                    | Veto before the switch, receipt after it (§4.3); empty on macOS (fire-and-forget switch)                                                                                                                                                                                                                                           |
+| `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                                  | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3)                                                                                                                                                                                                                                            |
+| `--switch-timeout 30s`  | 30s                                                          | 30s                                                                                                                  | Bound on one `SWITCH-CMD` run — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                  |
+| `--trigger LIST`        | required                                                     | required                                                                                                             | Comma-separated `VID:PID` or `VID:PID:SLOT` filters for the trigger detector. `VID:PID` watches a HID node that genuinely comes and goes — a moved receiver, a Bluetooth keyboard (§6.3). `VID:PID:SLOT` watches one pairing slot of a receiver that stays plugged in (§6.1). `soft-kvm detect` lists candidates in the right form |
+| `--settle 2s`           | 2s                                                           | 2s                                                                                                                   | Attach must persist this long before claiming                                                                                                                                                                                                                                                                                      |
+| `--confirm 4s`          | 4s                                                           | 4s                                                                                                                   | How long `--check-cmd` may keep succeeding before the switch counts as failed                                                                                                                                                                                                                                                      |
+| `--switch-retries 3`    | 3                                                            | 3                                                                                                                    | Re-runs of the switch commands, 1 s apart, before giving up                                                                                                                                                                                                                                                                        |
+| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'`        | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`                             | Run when the switch cannot be confirmed after the last retry                                                                                                                                                                                                                                                                       |
+| `--no-guards`           | implicit                                                     | —                                                                                                                    | macOS guards: AC power + dock present (§6.2)                                                                                                                                                                                                                                                                                       |
+| `SOFTKVM_TOKEN`         | required                                                     | required                                                                                                             | Shared secret                                                                                                                                                                                                                                                                                                                      |
 
 `-productNameLike=<name>` (or the monitor's actual name substring) can be added
 to `-- SWITCH-CMD` if multiple external displays are attached. The two switch
@@ -359,19 +359,35 @@ the gesture (the moved device's attach is the §6.1 trigger) and the losing
 host's action makes the other peripheral follow.
 
 ```
-hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX
+hid-switch VID:PID[:SLOT] [host=N]
 ```
 
-- `HOST_INDEX` is the target's Easy-Switch slot minus one (0-2).
-- Two arguments address the directly attached device (Bluetooth pairing or its
-  own dongle) — device index `0xFF`.
-- Behind a Bolt/Unifying receiver the host only sees the receiver, so give the
-  receiver's VID:PID and either the device's pairing slot (1-6) or a kind. The
-  kind form moves **every** paired device of that kind that supports changeHost.
-  Slots persist in the receiver's flash until re-pairing, so a hardcoded slot is
-  stable — but re-pairing can renumber, and the command then silently addresses
-  the wrong slot. The §4.3 retry/notify path absorbs it, and `detect` prints the
-  current slot map.
+The device address is `hidpp.ParseTarget`, the same grammar `--trigger` uses
+(§5.4): one spelling for a device across the whole tool.
+
+- **No `:SLOT`** means *every peripheral still linked to this device*. On the
+  losing host that is exactly the set that has to follow: the peripheral that
+  carried the gesture already left on its own, so it is skipped, and the same
+  argv serves follow-the-keyboard and follow-the-mouse. A device that is not on
+  this host at all is a no-op, not a failure — otherwise the loser would trip
+  the §4.3 breaker on every switch.
+- **`:SLOT`** (1-6) addresses one receiver pairing slot. Slots persist in the
+  receiver's flash until re-pairing, so a hardcoded slot is stable — but
+  re-pairing can renumber, and the command then silently addresses the wrong
+  slot. The §4.3 retry/notify path absorbs it, and `detect` prints the current
+  slot map. Behind a receiver the host only sees the receiver, so the VID:PID is
+  the receiver's.
+- **`host=N`** pins the target Easy-Switch channel, `N` as printed on the key
+  (1-3), matching the 1-based pairing slots. It is normally omitted: the winning
+  host publishes its own channel with its claim (§7) and the loser switches to
+  that. **The target cannot be derived locally** — `changeHost` reports how many
+  hosts a device supports and which one it is on, never which of the others is
+  the peer, and a device may report three paired hosts for two machines. So the
+  host that *is* the target is the only one that can say. With neither a
+  published channel nor `host=N`, the command fails rather than guessing: a
+  wrong guess moves a peripheral somewhere the user cannot reach it.
+- Running `soft-kvm hid-switch` by hand there is no owner to inherit from, so
+  `host=N` is required.
 
 Mechanics: the command probes the device's HID interfaces for one that answers
 HID++. Vendor-defined interfaces are tried first (usage page `0xFF43` on
@@ -401,10 +417,11 @@ surfaces as a read error (EIO on Linux hidraw), not a timeout; an explicit HID++
 error reply is the failure. On Linux the agent needs write access to the hidraw
 node (§6.1).
 
-Typical pair — keyboard and mouse on receiver channel 1 and BT channel 2:
+Typical pair — the peripherals may sit on different receivers, so the action is
+a list, one entry per device that can carry one:
 
-- macOS, mouse over BT: `-- hid-switch 046d:b034 0`
-- Linux, through the Bolt receiver: `-- hid-switch 046d:c548 mouse 1`
+- `-- hid-switch 046d:c52b -- hid-switch 046d:c548`
+- By hand, with an explicit target: `soft-kvm hid-switch 046d:c548:3 host=2`
 
 ### 5.6 `soft-kvm service <install|print|uninstall> [serve|connect] [args]`
 
@@ -449,12 +466,12 @@ unit; the env files and `/usr/local/bin/soft-kvm` stay.
 
 ### 6.1 Linux host
 
-| Component          | Spec                                                                                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Detector (primary) | HID device add/remove events via `telesma-app/hid` (netlink kernel uevents on `hidraw`, VID:PID from sysfs) — the same library and code path as macOS (§6.2). No udev rule, no forked processes, no cgo |
-| Guards             | None (always-on desktop)                                                                                                                                                                                |
-| Switch command     | Baked-in `ddcutil` default; user in `i2c` group — no sudo                                                                                                                                               |
-| Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.6); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                       |
+| Component          | Spec                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Detector (primary) | Two sources, fanned into one attach channel. `VID:PID`: HID device add/remove events via `telesma-app/hid` (netlink kernel uevents on `hidraw`, VID:PID from sysfs) — the same library and code path as macOS (§6.2). `VID:PID:SLOT`: the receiver's own device-connection notifications, read from its HID++ interface (needs the §5.5 hidraw rule) |
+| Guards             | None (always-on desktop)                                                                                                                                                                                                                                                                                                                             |
+| Switch command     | Baked-in `ddcutil` default; user in `i2c` group — no sudo                                                                                                                                                                                                                                                                                            |
+| Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.6); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                                                                                                                                                                    |
 
 **Detector specifics** — the parts that are easy to get wrong:
 
@@ -463,6 +480,28 @@ unit; the env files and `/usr/local/bin/soft-kvm` stay.
   (hidraw node on Linux, IOHIDDevice on macOS) with the same VID:PID. The
   detector deduplicates by device path and emits a single attach edge
   (`detect_hid.go`); `--settle` covers the rest.
+- **A permanently attached target must not mask the others.** The receiver is
+  itself a useful `--trigger` and stays plugged in for months, so presence is
+  tracked per target: one global count of attached interfaces would never return
+  to zero, and every attach edge after the first would be lost.
+- **Easy-Switch through a plugged-in receiver produces no HID event at all**, so
+  `VID:PID` cannot express it. `hid-logitech-dj` creates one child HID node per
+  *pairing slot*, and that node lives as long as the pairing does, not as long
+  as the device is linked: Easy-Switch moves the radio link, never the pairing,
+  so nothing is added or removed. Measured on an ERGO K860 through a
+  `046d:c52b`: switching hosts and back produced zero `hidraw` uevents while
+  `/dev/hidraw3` stayed put. Use `VID:PID:SLOT` for this topology — the receiver
+  announces the link change itself.
+- **A receiver cannot be polled for link state.** Register `0x02` returns the
+  paired-device *count*, and the "announce every device" write (`0x02` ← `0x02`)
+  replays a fabricated arrival whose link bit does not track reality — it
+  reported a keyboard as linked while that keyboard was demonstrably on another
+  host. Two things do tell the truth: the unsolicited `0x41` notification the
+  receiver sends the instant a link changes (this is where the kernel's own
+  `hidpp_battery_*/online` view comes from, ~160 ms later), and a HID++ request
+  addressed to a slot, which an unlinked slot refuses locally in about 2 ms with
+  no RF. The detector listens for the first; `detect` uses the second to show
+  which slots hold the link.
 - **Unprivileged operation.** On Linux the library binds netlink multicast group
   1 (raw kernel uevents) — readable without root on current kernels, so a
   systemd *user* unit suffices. VID:PID metadata comes from
@@ -535,7 +574,8 @@ For environments without the USB switch, a keyboard paired directly over
 Bluetooth works as a trigger on **both** OSes: BT HID surfaces like any HID
 device (a `hidraw` node on Linux, an `IOHIDDevice` on macOS), so the §6.1-6.2
 detector sees it — add the keyboard's own VID:PID to `--trigger`. Only
-**connect** events are used (finding 2); disconnects are ignored. Two caveats:
+**connect** events trigger anything (finding 2); a disconnect never does, it
+only re-arms that target's attach edge. Two caveats:
 
 - The identity is VID:PID, not a MAC address: two keyboards of the same model
   are indistinguishable.
@@ -585,11 +625,11 @@ hold `SOFTKVM_TOKEN`: the server identity and the client certificate are both
 derived from it (§9). The secret is scoped by construction: it can read/flip one
 display bit and nothing else.
 
-| Endpoint                    | Behavior                                                                                                                         |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /claim/{id}`          | Idempotent. Increments `epoch` and wakes waiters **only on actual change**. → `200 {owner, epoch, changed}` · `400` unknown host |
-| `GET /state`                | → `200 {owner, epoch, since, live, server_id}`                                                                                   |
-| `GET /wait?epoch=N&id=<me>` | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration  |
+| Endpoint                     | Behavior                                                                                                                                                                                                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /claim/{id}?channel=N` | Idempotent. Increments `epoch` and wakes waiters **only on actual change**; `channel` (1-3, optional) is the claimant's own Easy-Switch channel and is refreshed even on an unchanged claim. → `200 {owner, epoch, changed}` · `400` unknown host or bad channel |
+| `GET /state`                 | → `200 {owner, epoch, since, live, server_id, owner_channel}`. `owner_channel` is 0 when the owner published none; it is always present, never omitted, so a client decoding into a reused struct cannot keep a stale one                                        |
+| `GET /wait?epoch=N&id=<me>`  | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration                                                                                                                                  |
 
 - `since` is RFC 3339. `live` is `{"linux": true, "mac": false}`, derived from
   currently-open `/wait` connections. `server_id` is a UUID regenerated on every
@@ -602,27 +642,29 @@ display bit and nothing else.
 
 ## 8. Edge cases
 
-| Case                                                              | Behavior                                                                                                                                                                                                                                                                                                                                                   |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claimant executes no display command                              | By design — DDC unreachable from inactive input                                                                                                                                                                                                                                                                                                            |
-| Simultaneous claims                                               | Serialized; last wins; both agents reconcile                                                                                                                                                                                                                                                                                                               |
-| Loser asleep/off at claim                                         | Nobody switches; loser self-heals at resume, but only if it was the owner (§4.3)                                                                                                                                                                                                                                                                           |
-| Agent starts with no local `last_owner`                           | Adopts the server's owner, switches nothing                                                                                                                                                                                                                                                                                                                |
-| Coordinator unreachable                                           | Claims logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the two agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                                                        |
-| Mac away / on battery / undocked                                  | Guards suppress everything; bit may change without the Mac — harmless, because the loser also requires the winner to be live                                                                                                                                                                                                                               |
-| Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                                                |
-| Monitor already on claimant's input                               | Loser's `--check-cmd` fails → no-op, `last_owner` resynced                                                                                                                                                                                                                                                                                                 |
-| Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                    |
-| Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                            |
-| **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable |
-| Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                               |
-| Switch command hangs / `SwitchExit` is lost                       | `--switch-timeout` SIGTERMs the child; if the result still never arrives, the 60 s machine watchdog counts the attempt as failed, retries, then notifies and logs "no SwitchExit within …" (§4.3)                                                                                                                                                          |
-| Effect result arrives after its sequence ended                    | Ignored and logged as "ignoring late SwitchExit/ProbeExit"; the machine only accepts results while the matching effect is outstanding (§4.3)                                                                                                                                                                                                               |
-| Switch fails while the monitor is in standby                      | Same path, and the retries usually cover it — a monitor waking from standby answers DDC a second or two late                                                                                                                                                                                                                                               |
-| Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the losing host: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                                                  |
-| mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                                          |
-| mDNS returns a stale or rogue record                              | Connection fails TLS verification — a rogue record points at a host that does not hold the secret and cannot present the derived certificate (§5.1, §9). Agents re-browse on any connection error rather than pinning the first answer                                                                                                                     |
-| Server moves host                                                 | Nothing is reconfigured; the new instance advertises, caches expire on first failure                                                                                                                                                                                                                                                                       |
+| Case                                                              | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claimant executes no display command                              | By design — DDC unreachable from inactive input                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Simultaneous claims                                               | Serialized; last wins; both agents reconcile                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Loser asleep/off at claim                                         | Nobody switches; loser self-heals at resume, but only if it was the owner (§4.3)                                                                                                                                                                                                                                                                                                                                                                                               |
+| Agent starts with no local `last_owner`                           | Adopts the server's owner, switches nothing                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Winner could not read its own Easy-Switch channel                 | It claims anyway and publishes 0. The loser's `hid-switch` then has no target: it fails, exhausts `--switch-retries` and notifies (§4.3) rather than guessing a channel. A later re-claim refreshes the channel but does **not** wake waiters — the epoch is unchanged — so the loser keeps reading 0 until the next real owner change, which self-heals it. The read almost never fails: the attach edge that triggers the claim means the peripheral is linked and answering |
+| Receiver unplugged while `connect` runs                           | `watchReceiver` fails, which returns from `Detector.Run`; `detectorLoop` restarts every source on backoff. The HID detector's startup snapshot then re-fires one attach edge for targets that were already present, so a receiver flap costs one extra claim — idempotent and coalesced, so it changes no owner                                                                                                                                                                |
+| Coordinator unreachable                                           | Claims logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the two agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                                                                                                                                                                            |
+| Mac away / on battery / undocked                                  | Guards suppress everything; bit may change without the Mac — harmless, because the loser also requires the winner to be live                                                                                                                                                                                                                                                                                                                                                   |
+| Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Monitor already on claimant's input                               | Loser's `--check-cmd` fails → no-op, `last_owner` resynced                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                                                                                                                                        |
+| Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                                                                                                                                                |
+| **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable                                                                                                                     |
+| Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                                                                                                                                                   |
+| Switch command hangs / `SwitchExit` is lost                       | `--switch-timeout` SIGTERMs the child; if the result still never arrives, the 60 s machine watchdog counts the attempt as failed, retries, then notifies and logs "no SwitchExit within …" (§4.3)                                                                                                                                                                                                                                                                              |
+| Effect result arrives after its sequence ended                    | Ignored and logged as "ignoring late SwitchExit/ProbeExit"; the machine only accepts results while the matching effect is outstanding (§4.3)                                                                                                                                                                                                                                                                                                                                   |
+| Switch fails while the monitor is in standby                      | Same path, and the retries usually cover it — a monitor waking from standby answers DDC a second or two late                                                                                                                                                                                                                                                                                                                                                                   |
+| Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the losing host: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                                                                                                                                                                      |
+| mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                                                                                                                                                              |
+| mDNS returns a stale or rogue record                              | Connection fails TLS verification — a rogue record points at a host that does not hold the secret and cannot present the derived certificate (§5.1, §9). Agents re-browse on any connection error rather than pinning the first answer                                                                                                                                                                                                                                         |
+| Server moves host                                                 | Nothing is reconfigured; the new instance advertises, caches expire on first failure                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## 9. Security notes
 
@@ -693,6 +735,8 @@ binary that does not exist yet.
       display connected after a switch (no Hyprland workspace collapse)
 - [ ] USB detector fires once per physical attach, not once per HID interface,
       and does not fire for the Unifying receiver `046d:c52b`
+- [ ] `VID:PID:SLOT` trigger: Easy-Switch away and back fires an attach edge
+      every time, not only on the first, with the receiver left plugged in
 - [ ] `hid-switch` (§5.5) moves the mouse from each host: over Bluetooth from
       the Mac (two-argument form), through the Bolt receiver from Linux (kind
       form and an explicit slot). `detect`'s slot map matches `solaar show`
@@ -746,16 +790,17 @@ positionals, with a hint when the extra looks like a flag.
 `discover` (mDNS advertise/browse; the address cache sits behind a `Resolver`
 whose cache path is injected), `platform` (the argv runner, the per-OS defaults,
 and the per-OS `Guard` — a concrete type: no-op on Linux, pmset+display on
-macOS), `detect` (HID enumeration for the subcommand and the attach detector
-both OSes share), `hidpp` (Logitech HID++ changeHost — the `hid-switch` virtual
-command, §5.5), `client`, `server`, and `agent` (supervisor, generations,
-decision loop, claims; the `Detector`, `Guard` and `Runner` seams live here, in
-their only consumer). `main` keeps flag parsing and wiring. Layering is a DAG:
-the leaves (`state`, `identity`, `discover`, `platform`, `hidpp`) import nothing
-internal; `detect` imports `hidpp`; `model` imports `state`; `client` and
-`server` import `state` and `identity`; `agent` imports `model`, `state`,
-`client`, `discover` and `hidpp`. Build tags in filenames, not in `//go:build`
-lines, wherever the split is per-OS (`platform`).
+macOS), `detect` (HID enumeration for the subcommand, and the two attach
+detectors both OSes share), `hidpp` (Logitech HID++ changeHost — the
+`hid-switch` virtual command, §5.5), `client`, `server`, and `agent`
+(supervisor, generations, decision loop, claims; the `Detector`, `Guard` and
+`Runner` seams live here, in their only consumer). `main` keeps flag parsing and
+wiring. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
+`platform`, `hidpp`) import nothing internal; `detect` imports `hidpp`; `model`
+imports `state`; `client` imports `state` and `identity`; `server` those two and
+`hidpp` (the channel bound it validates on a claim); `agent` imports `model`,
+`state`, `client`, `discover` and `hidpp`. Build tags in filenames, not in
+`//go:build` lines, wherever the split is per-OS (`platform`).
 
 **Logging is `log/slog`** to stderr, text handler — journald on Linux, the
 LaunchAgent log file on macOS. Every switch decision logs at Info with the

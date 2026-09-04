@@ -49,10 +49,18 @@ const (
 	featChangeHost = 0x1814 // changeHost: fn 1 is setHost
 
 	fnGetFeature    = 0
+	fnGetHostInfo   = 0
 	fnSetHost       = 1
 	fnGetDeviceType = 2
 
 	swID = 0x1 // software id nibble, matched against replies
+
+	// subDeviceConnection is the HID++ 1.0 device-connection notification a
+	// receiver sends, unprompted, whenever a paired device's radio link comes
+	// up or goes down. Bit 0x40 of its first parameter is set when the link is
+	// NOT established (Solaar notifications.py).
+	subDeviceConnection = 0x41
+	linkNotEstablished  = 0x40
 
 	// DeviceIndexDirect addresses the device the HID interface belongs to
 	// (Bluetooth pairing or own dongle). Devices behind a Bolt/Unifying
@@ -62,6 +70,10 @@ const (
 
 	probeTimeout   = 500 * time.Millisecond // per request while probing
 	setHostTimeout = 1 * time.Second        // waiting for the setHost ACK
+
+	// linkReadTimeout bounds one WatchLinks read so cancellation stays
+	// responsive. Expiry is the normal case: links change rarely.
+	linkReadTimeout = 500 * time.Millisecond
 
 	probeAttempts = 3 // handshake nudges for a dozing Bluetooth device
 )
@@ -89,86 +101,109 @@ func (k Kind) String() string {
 	}
 }
 
-// Target says how the Switch selects the device to move.
-type Target int
+// MaxPairingSlot is the highest addressable receiver pairing slot.
+const MaxPairingSlot = 6
 
-const (
-	TargetDirect Target = iota // DeviceIndexDirect
-	TargetSlot                 // an explicit receiver pairing slot
-	TargetKind                 // scan receiver slots for the first of Kind
-)
+// MaxChannel is the highest Easy-Switch channel, as printed on the key.
+const MaxChannel = 3
 
-// Switch is a parsed `hid-switch VID:PID [DEVICE_INDEX|KIND] HOST_INDEX`
-// command (SPEC §5.5).
+// ParseTarget parses the one device address this tool uses everywhere:
+// "VID:PID" or "VID:PID:SLOT", hex VID and PID, decimal 1-based pairing slot.
+// slot is 0 when none was given. --trigger and hid-switch share it so the two
+// can never drift into different spellings of the same device.
+func ParseTarget(s string) (vid, pid uint16, slot uint8, err error) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("invalid device %q: want VID:PID or VID:PID:SLOT", s)
+	}
+	v, err := strconv.ParseUint(parts[0], 16, 16)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid VID %q: %w", parts[0], err)
+	}
+	p, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid PID %q: %w", parts[1], err)
+	}
+	if len(parts) == 3 {
+		n, err := strconv.ParseUint(parts[2], 10, 8)
+		if err != nil || n < 1 || n > MaxPairingSlot {
+			return 0, 0, 0, fmt.Errorf("invalid pairing slot %q in %q: want 1-%d", parts[2], s, MaxPairingSlot)
+		}
+		slot = uint8(n)
+	}
+	return uint16(v), uint16(p), slot, nil
+}
+
+// Switch is a parsed `hid-switch VID:PID[:SLOT] [host=N]` command (SPEC §5.5).
 type Switch struct {
-	VID, PID    uint16
-	Target      Target
-	DeviceIndex uint8 // TargetSlot only
-	Kind        Kind  // TargetKind only
-	HostIndex   uint8 // 0-2, the Easy-Switch slot minus one
+	VID, PID uint16
+	// Slot 0 means "every device linked to this receiver right now" — on the
+	// losing host that is exactly the set that should follow the one that
+	// already left. A direct device is addressed as slot 0 too.
+	Slot uint8
+	// Channel is an explicit Easy-Switch channel (1-MaxChannel); 0 means take
+	// the winner's channel from the server state at run time.
+	Channel uint8
 }
 
 // Parse validates a hid-switch argv (without the "hid-switch" word itself).
-// Two arguments address the directly attached device; three address devices
-// behind a receiver, by pairing slot (1-6) or by kind (keyboard|mouse) —
-// the kind form moves every paired device of that kind.
+//
+// The target host is normally omitted: the winning host publishes its own
+// Easy-Switch channel with its claim, and the loser switches the peripherals
+// to that. It cannot be worked out locally — a device reports how many hosts
+// it supports and which one it is on, but not which of the others is the peer
+// (SPEC §5.5). "host=N" overrides it, and N is the channel as printed on the
+// key (1-MaxChannel), matching the 1-based pairing slots.
 func Parse(args []string) (*Switch, error) {
-	if len(args) != 2 && len(args) != 3 {
-		return nil, errors.New("usage: hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX")
+	if len(args) != 1 && len(args) != 2 {
+		return nil, errors.New("usage: hid-switch VID:PID[:SLOT] [host=N]")
 	}
-	vid, pid, err := parseVIDPID(args[0])
+	vid, pid, slot, err := ParseTarget(args[0])
 	if err != nil {
 		return nil, err
 	}
-	host, err := strconv.ParseUint(args[len(args)-1], 10, 8)
-	if err != nil || host > 2 {
-		return nil, fmt.Errorf("invalid host index %q (0-2)", args[len(args)-1])
-	}
-	s := &Switch{
-		VID:         vid,
-		PID:         pid,
-		Target:      TargetDirect,
-		DeviceIndex: DeviceIndexDirect,
-		HostIndex:   uint8(host),
-	}
+	s := &Switch{VID: vid, PID: pid, Slot: slot}
 	if len(args) == 2 {
-		return s, nil
-	}
-	switch args[1] {
-	case "keyboard":
-		s.Target, s.Kind = TargetKind, KindKeyboard
-	case "mouse":
-		s.Target, s.Kind = TargetKind, KindMouse
-	default:
-		slot, err := strconv.ParseUint(args[1], 10, 8)
-		if err != nil || slot < 1 || slot > 6 {
-			return nil, fmt.Errorf("invalid device selector %q (pairing slot 1-6, keyboard or mouse)", args[1])
+		spec, ok := strings.CutPrefix(args[1], "host=")
+		if !ok {
+			return nil, fmt.Errorf("invalid argument %q: want host=N (channel 1-%d)", args[1], MaxChannel)
 		}
-		s.Target, s.DeviceIndex = TargetSlot, uint8(slot)
+		n, err := strconv.ParseUint(spec, 10, 8)
+		if err != nil || n < 1 || n > MaxChannel {
+			return nil, fmt.Errorf("invalid host channel %q: want 1-%d, as printed on the key", spec, MaxChannel)
+		}
+		s.Channel = uint8(n)
 	}
 	return s, nil
 }
 
-func parseVIDPID(s string) (uint16, uint16, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid VID:PID %q", s)
+// Do switches the selected devices to a host channel. fallbackChannel is used
+// when the command carried no explicit host=N; it is the winner's channel,
+// taken from the server state. Both being zero is a configuration error, not a
+// silent no-op — switching to a guessed host moves a peripheral somewhere the
+// user cannot reach it.
+func (s *Switch) Do(ctx context.Context, fallbackChannel uint8) error {
+	channel := s.Channel
+	if channel == 0 {
+		channel = fallbackChannel
 	}
-	vid, err := strconv.ParseUint(parts[0], 16, 16)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid VID %q: %w", parts[0], err)
+	if channel < 1 || channel > MaxChannel {
+		return fmt.Errorf("hid-switch %04x:%04x: no target host channel: the owner "+
+			"published none and the command has no host=N (SPEC §5.5)", s.VID, s.PID)
 	}
-	pid, err := strconv.ParseUint(parts[1], 16, 16)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid PID %q: %w", parts[1], err)
-	}
-	return uint16(vid), uint16(pid), nil
-}
+	// The wire and the key legend are off by one: changeHost takes 0-2.
+	hostIndex := channel - 1
 
-// Do switches the selected device to HostIndex.
-func (s *Switch) Do(ctx context.Context) error {
 	c, err := openInterface(ctx, s.VID, s.PID)
 	if err != nil {
+		// A named device that is simply not here has nothing to move, and
+		// the losing host runs this on every switch: failing would trip the
+		// §4.3 breaker for a peripheral the user already moved by hand.
+		if s.Slot == 0 && errors.Is(err, ErrNoInterface) {
+			slog.Info("hid-switch: device not on this host, nothing to move",
+				"device", fmt.Sprintf("%04x:%04x", s.VID, s.PID))
+			return nil
+		}
 		return err
 	}
 	defer func() {
@@ -177,13 +212,22 @@ func (s *Switch) Do(ctx context.Context) error {
 		}
 	}()
 
-	devIdxs := []uint8{s.DeviceIndex}
-	if s.Target == TargetKind {
-		slots, err := c.resolveKind(ctx, s.Kind)
+	var devIdxs []uint8
+	switch {
+	case s.Slot != 0:
+		devIdxs = []uint8{s.Slot}
+	default:
+		devIdxs, err = c.resolveLinked(ctx)
 		if err != nil {
 			return err
 		}
-		devIdxs = slots
+		if len(devIdxs) == 0 {
+			// Nothing is linked here, so nothing needs moving. That is the
+			// normal outcome when the user switched every peripheral by hand.
+			slog.Info("hid-switch: nothing linked here, nothing to move",
+				"device", fmt.Sprintf("%04x:%04x", s.VID, s.PID))
+			return nil
+		}
 	}
 
 	var errs []error
@@ -199,10 +243,80 @@ func (s *Switch) Do(ctx context.Context) error {
 		}
 		slog.Info("hid-switch: switching host",
 			"device", fmt.Sprintf("%04x:%04x", s.VID, s.PID),
-			"deviceIndex", devIdx, "host", s.HostIndex)
-		errs = append(errs, c.setHost(ctx, feat, devIdx, s.HostIndex))
+			"deviceIndex", devIdx, "channel", channel)
+		errs = append(errs, c.setHost(ctx, feat, devIdx, hostIndex))
 	}
 	return errors.Join(errs...)
+}
+
+// resolveLinked returns the device indexes to move when no slot was given:
+// the directly attached device when this interface is one, else every pairing
+// slot of the receiver whose device holds the link right now.
+//
+// On the losing host that set is exactly right: the peripheral that carried
+// the gesture has already left on its own, so what remains linked is what has
+// to follow it. It makes the command symmetric — the same argv serves
+// follow-the-keyboard and follow-the-mouse.
+func (c *conn) resolveLinked(ctx context.Context) ([]uint8, error) {
+	kctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	kind, err := c.getKind(kctx, DeviceIndexDirect)
+	cancel()
+	if err == nil && kind != KindReceiver {
+		return []uint8{DeviceIndexDirect}, nil
+	}
+	paired, ok := c.pairingTable(ctx)
+	if !ok {
+		if err != nil {
+			return nil, fmt.Errorf("neither a directly attached device nor a receiver: %w", err)
+		}
+		return nil, errors.New("no pairing table and no directly attached device")
+	}
+	var out []uint8
+	for _, p := range paired {
+		if p.Online {
+			out = append(out, p.Index)
+		}
+	}
+	return out, nil
+}
+
+// CurrentChannel reports which Easy-Switch channel (1-MaxChannel) this host
+// occupies on the given device — changeHost's getHostInfo, which returns the
+// host count and the current host index. slot 0 addresses a directly attached
+// device.
+//
+// This is the winner's half of the host-channel problem: a host can always
+// learn its *own* channel, never the peer's, so the winner publishes it.
+func CurrentChannel(ctx context.Context, vid, pid uint16, slot uint8) (uint8, error) {
+	c, err := openInterface(ctx, vid, pid)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = c.dev.Close() }()
+
+	devIdx := uint8(DeviceIndexDirect)
+	if slot != 0 {
+		devIdx = slot
+	}
+	feat, err := c.getFeatureNudged(ctx, devIdx, featChangeHost)
+	if err != nil {
+		return 0, err
+	}
+	if feat == 0 {
+		return 0, fmt.Errorf("device %04x:%04x index %d does not support changeHost (0x1814)", vid, pid, devIdx)
+	}
+	reply, err := c.request(ctx, devIdx, feat, fnGetHostInfo)
+	if err != nil {
+		return 0, err
+	}
+	if len(reply) < 2 {
+		return 0, errors.New("short getHostInfo reply")
+	}
+	// reply[0] is the host count, reply[1] the current host index (0-based).
+	if reply[1] >= reply[0] {
+		return 0, fmt.Errorf("getHostInfo: current host %d outside the %d it reports", reply[1], reply[0])
+	}
+	return reply[1] + 1, nil
 }
 
 // Error is a HID++ error reply (sub-ID 0x8F/0xFF) from the device.
@@ -241,7 +355,7 @@ func openInterface(ctx context.Context, vid, pid uint16) (*conn, error) {
 		}
 	}
 	if len(vendor)+len(other) == 0 {
-		return nil, fmt.Errorf("no HID interface for %04x:%04x", vid, pid)
+		return nil, fmt.Errorf("%w for %04x:%04x", ErrNoInterface, vid, pid)
 	}
 
 	var tried int
@@ -432,6 +546,11 @@ func (c *conn) findSlots(ctx context.Context, kind Kind) ([]uint8, error) {
 // switching hosts mid-ACK — a success, not a failure (SPEC §5.5).
 var errLinkDropped = errors.New("hidpp: link dropped")
 
+// ErrNoInterface means the device is not present on this host at all. For the
+// automatic hid-switch form that is not a failure: a peripheral that already
+// left has nothing left to move.
+var ErrNoInterface = errors.New("no HID interface")
+
 // setHost sends changeHost's fn 1, waiting up to setHostTimeout for the ACK.
 // A matching ACK is success; an error reply is a failure; no reply at all is
 // also success, because a device that switched drops the link to this host
@@ -573,8 +692,9 @@ func matchRegisterReply(report []byte, devIdx, sub, addr, subreg byte) ([]byte, 
 
 // PairedDevice is one occupied receiver slot.
 type PairedDevice struct {
-	Index uint8
-	Kind  Kind
+	Index  uint8
+	Kind   Kind
+	Online bool // the device is linked to this receiver right now
 }
 
 // Inventory is what Probe learned about one VID:PID: the kind of the device
@@ -630,7 +750,11 @@ func (c *conn) pairingTable(ctx context.Context) (paired []PairedDevice, ok bool
 		}
 		ok = true
 		if data != nil {
-			paired = append(paired, PairedDevice{Index: slot, Kind: pairingKind(bolt, data)})
+			paired = append(paired, PairedDevice{
+				Index:  slot,
+				Kind:   pairingKind(bolt, data),
+				Online: c.slotOnline(ctx, slot),
+			})
 		}
 	}
 	return paired, ok
@@ -680,5 +804,91 @@ func pairingKind(bolt bool, data []byte) Kind {
 		return KindMouse
 	default:
 		return KindUnknown
+	}
+}
+
+// slotOnline reports whether the device in a receiver pairing slot is linked
+// right now. The probe is one HID++ 2.0 request addressed to the slot: an
+// unlinked slot is refused locally by the receiver in about 2ms, while a
+// linked device answers over RF — so a scan of six slots costs milliseconds
+// per dead slot and one round trip per live one.
+//
+// Any error is "not linked": an error reply is the receiver refusing to
+// route, and silence is a device that would not answer a trigger either.
+func (c *conn) slotOnline(ctx context.Context, slot uint8) bool {
+	_, err := c.getFeatureNudged(ctx, slot, featRoot)
+	return err == nil
+}
+
+// SlotOnline reports whether the device paired in slot is linked to the
+// receiver at VID:PID right now.
+func SlotOnline(ctx context.Context, vid, pid uint16, slot uint8) (bool, error) {
+	c, err := openInterface(ctx, vid, pid)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = c.dev.Close() }()
+	return c.slotOnline(ctx, slot), nil
+}
+
+// LinkEvent is one receiver device-connection notification: a paired device's
+// radio link came up or went down.
+type LinkEvent struct {
+	Slot        uint8
+	Established bool
+}
+
+// WatchLinks sends one LinkEvent per device-connection notification from the
+// receiver at VID:PID until ctx is done, then returns nil.
+//
+// This is a passive tap, not a poll. A receiver cannot be asked for live link
+// state: register 0x02 returns the paired-device count, and the "announce
+// every device" write (0x02 <- 0x02) replays a fabricated arrival whose link
+// bit does not track reality. The receiver does volunteer the truth the
+// instant a link changes, which is where the kernel's own view comes from
+// (SPEC §6.1).
+func WatchLinks(ctx context.Context, vid, pid uint16, events chan<- LinkEvent) error {
+	c, err := openInterface(ctx, vid, pid)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.dev.Close() }()
+
+	buf := make([]byte, 64)
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		// A bounded read keeps ctx cancellation responsive; the deadline
+		// expiring just means no notification arrived, which is the norm.
+		rctx, cancel := context.WithTimeout(ctx, linkReadTimeout)
+		n, rerr := c.dev.Read(rctx, buf)
+		cancel()
+		if rerr != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if errors.Is(rerr, context.DeadlineExceeded) {
+				continue
+			}
+			return fmt.Errorf("hidpp: receiver %04x:%04x read: %w", vid, pid, rerr)
+		}
+		r := buf[:n]
+		// The report ID is checked too: r[2] alone is a sub-ID in a 1.0
+		// notification but a feature index in a 2.0 reply, and only a
+		// HID++-framed report may be read with the 1.0 layout.
+		if len(r) < 5 || (r[0] != reportShort && r[0] != reportLong) ||
+			r[2] != subDeviceConnection {
+			continue
+		}
+		ev := LinkEvent{Slot: r[1], Established: r[4]&linkNotEstablished == 0}
+		slog.Debug("hidpp: link notification",
+			"slot", ev.Slot, "established", ev.Established,
+			"report", fmt.Sprintf("%x", r))
+		select {
+		case events <- ev:
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
