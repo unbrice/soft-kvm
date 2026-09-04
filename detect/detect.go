@@ -22,6 +22,7 @@ import (
 
 	"github.com/telesma-app/hid"
 	"github.com/unbrice/soft-kvm/hidpp"
+	"github.com/unbrice/soft-kvm/platform"
 )
 
 const logitechVID = 0x046d
@@ -31,24 +32,7 @@ const logitechVID = 0x046d
 // installer both print shell transcripts — prose as #-comments, commands
 // at column 0 — and this is how both grey the prose.
 func Dim(w io.Writer, s string) string {
-	return dimComments(s, wantsColor(w))
-}
-
-// wantsColor reports whether w is a terminal that wants escape codes: an
-// *os.File on a character device, NO_COLOR unset, TERM not "dumb". Asking
-// the writer rather than os.Stdout is what keeps this honest — a
-// bytes.Buffer or a redirect into a file gets plain text without the
-// caller having to say so.
-func wantsColor(w io.Writer) bool {
-	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
-		return false
-	}
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return dimComments(s, platform.WantsColor(w))
 }
 
 // dimComments dims the #-comment lines, leaving the commands as the only

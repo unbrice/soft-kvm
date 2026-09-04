@@ -9,11 +9,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -323,5 +325,35 @@ func TestInstallGuidanceIsShellShaped(t *testing.T) {
 			t.Errorf("line is neither comment, command nor continuation: %q", line)
 		}
 		prev = line
+	}
+}
+
+// TestVerifyUnit pins the install's last step: an active unit is a success,
+// anything else is an error naming what systemctl reported.
+func TestVerifyUnit(t *testing.T) {
+	saved, savedSettle, savedTail := runSystemctl, unitSettle, journalTail
+	t.Cleanup(func() { runSystemctl, unitSettle, journalTail = saved, savedSettle, savedTail })
+	unitSettle = 0
+	journalTail = func(context.Context, []string, string) string { return "(journal)" }
+
+	var got []string
+	runSystemctl = func(_ context.Context, args ...string) (string, error) {
+		got = args
+		return "active\n", nil
+	}
+	if err := verifyUnit(t.Context(), []string{"--user"}, "soft-kvm"); err != nil {
+		t.Errorf("an active unit reported %v", err)
+	}
+	want := []string{"--user", "is-active", "soft-kvm"}
+	if !slices.Equal(got, want) {
+		t.Errorf("systemctl called with %v, want %v", got, want)
+	}
+
+	runSystemctl = func(_ context.Context, _ ...string) (string, error) {
+		return "failed\n", errors.New("exit status 3")
+	}
+	err := verifyUnit(t.Context(), nil, "soft-kvm-serve")
+	if err == nil || !strings.Contains(err.Error(), `"failed"`) {
+		t.Errorf("a dead unit reported %v, want an error naming the state", err)
 	}
 }

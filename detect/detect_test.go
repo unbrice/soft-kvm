@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -423,19 +422,10 @@ func TestDimComments(t *testing.T) {
 	}
 }
 
-// TestWantsColorNonFile pins that a writer that is not a terminal — every
+// TestDimNonTerminal pins that a writer that is not a terminal — every
 // test's bytes.Buffer, and `soft-kvm detect > file` — renders plain.
-func TestWantsColorNonFile(t *testing.T) {
-	if wantsColor(&bytes.Buffer{}) {
-		t.Error("a bytes.Buffer must not be styled")
-	}
-	f, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	t.Setenv("NO_COLOR", "1")
-	if wantsColor(f) {
-		t.Error("NO_COLOR must disable styling")
+func TestDimNonTerminal(t *testing.T) {
+	if got := Dim(&bytes.Buffer{}, "# a comment\n"); got != "# a comment\n" {
+		t.Errorf("a bytes.Buffer must not be styled, got %q", got)
 	}
 }

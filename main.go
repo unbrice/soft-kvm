@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -40,6 +41,52 @@ var errUsage = errors.New("usage")
 // errToken marks the missing-or-weak-SOFTKVM_TOKEN configuration error.
 var errToken = errors.New("SOFTKVM_TOKEN is required")
 
+// errHelp marks -h/--help. The FlagSet has printed the usage, and asking
+// for help is not a failure: main exits 0.
+var errHelp = errors.New("help requested")
+
+// parseArgs parses with fs, separating a help request from a real usage
+// error — flag.Parse reports both as an error, and only one of them is one.
+func parseArgs(fs *flag.FlagSet, args []string) error {
+	err := fs.Parse(args)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, flag.ErrHelp):
+		return errHelp
+	default:
+		return errUsage
+	}
+}
+
+// newLogHandler picks the log format for w: the console format when a
+// person is watching, logfmt otherwise, so a pipe and journald keep the
+// machine-readable form (SPEC §11).
+func newLogHandler(w *os.File, level slog.Leveler) slog.Handler {
+	if platform.IsTerminal(w) {
+		return newConsoleHandler(w, level, platform.WantsColor(w))
+	}
+	return slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})
+}
+
+// printFlags renders a FlagSet's flags with the double-dash spelling every
+// example uses; flag.PrintDefaults prints a single dash and disagrees with
+// the documentation.
+func printFlags(fs *flag.FlagSet, w io.Writer) {
+	fs.VisitAll(func(f *flag.Flag) {
+		name, usage := flag.UnquoteUsage(f)
+		decl := "  --" + f.Name
+		if name != "" {
+			decl += " " + name
+		}
+		_, _ = fmt.Fprintln(w, decl)
+		if f.DefValue != "" && f.DefValue != "false" {
+			usage += fmt.Sprintf(" (default %s)", f.DefValue)
+		}
+		_, _ = fmt.Fprintln(w, "        "+usage)
+	})
+}
+
 func main() {
 	var level slog.LevelVar // Info by default
 	if s := os.Getenv("SOFTKVM_LOG"); s != "" {
@@ -47,7 +94,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "soft-kvm: unknown SOFTKVM_LOG level %q (debug, info, warn, error)\n", s)
 		}
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &level})))
+	slog.SetDefault(slog.New(newLogHandler(os.Stderr, &level)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -59,6 +106,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "help", "--help", "-h":
+		usageTo(os.Stdout)
 	case "serve":
 		err = serveCmd(ctx)
 	case "activate":
@@ -77,6 +126,9 @@ func main() {
 	}
 
 	if err != nil {
+		if errors.Is(err, errHelp) {
+			return
+		}
 		if errors.Is(err, errUsage) {
 			os.Exit(2)
 		}
@@ -88,8 +140,10 @@ func main() {
 	}
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage: soft-kvm <command> [args]
+func usage() { usageTo(os.Stderr) }
+
+func usageTo(w io.Writer) {
+	_, _ = fmt.Fprintln(w, `usage: soft-kvm <command> [args]
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
@@ -172,8 +226,8 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags, error) {
 		noAdvertise: fs.Bool("no-advertise", false, "skip mDNS advertisement"),
 	}
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]")
-		fs.PrintDefaults()
+		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]")
+		printFlags(fs, fs.Output())
 	}
 	return fs, v, nil
 }
@@ -208,8 +262,8 @@ func serveCmd(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
 	}
 	if err := rejectExtraArgs("serve", fs.Args(), 1); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -255,8 +309,8 @@ func activateCmd(ctx context.Context) error {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm activate ID [--server HOST:PORT] [--force]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
 	}
 	if err := rejectExtraArgs("activate", fs.Args(), 1); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -344,30 +398,30 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	v := &connectFlags{
 		id:            fs.String("id", platform.DefaultID, "claimed identity"),
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
-		trigger:       fs.String("trigger", "", "comma-separated VID:PID filters for the trigger detector (USB receiver, optional Bluetooth keyboard); required — run `soft-kvm detect` to list VID:PIDs"),
+		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID` filters — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
-		confirm:       fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed"),
+		confirm:       fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch has failed"),
 		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch command before giving up"),
 		checkTimeout:  fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run"),
-		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)"),
+		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run, so a hung I²C write cannot freeze the agent"),
 		checkCmd:      fs.String("check-cmd", platform.DefaultCheckCmd, "veto before the switch, receipt after it"),
 		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch cannot be confirmed"),
 	}
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")
-		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: match any external display)")
+		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: any external)")
 	}
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]")
-		fs.PrintDefaults()
+		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]")
+		printFlags(fs, fs.Output())
 	}
 	return fs, v
 }
 
 func connectCmd(ctx context.Context) error {
 	fs, flags := newConnectFlagSet()
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
 	}
 	if *flags.trigger == "" {
 		fmt.Fprintln(os.Stderr, "connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
@@ -478,8 +532,8 @@ func detectCmd(ctx context.Context) error {
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm detect")
 	}
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
 	}
 	if err := rejectExtraArgs("detect", fs.Args(), 0); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -494,8 +548,8 @@ func hidSwitchCmd(ctx context.Context) error {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(os.Args[2:]); err != nil {
-		return errUsage
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
 	}
 	sw, err := hidpp.Parse(fs.Args())
 	if err != nil {

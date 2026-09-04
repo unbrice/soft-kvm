@@ -16,7 +16,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/unbrice/soft-kvm/detect"
 )
@@ -39,14 +41,54 @@ const (
 )
 
 // runSystemctl is the systemctl seam: every install/uninstall path
-// validates before calling it, so the tests never fork it.
-var runSystemctl = func(ctx context.Context, args ...string) error {
+// validates before calling it, so the tests never fork it. It returns the
+// output as well as the error because the install verification reads what
+// `is-active` printed, which is a word, not an exit status.
+var runSystemctl = func(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "systemctl", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return string(out), fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return string(out), nil
+}
+
+// unitSettle is how long install waits before asking whether the unit is
+// still up. `systemctl start` returns as soon as a Type=simple service has
+// forked, so a unit that exits immediately — a rejected token, a device
+// that is not there — reports success and only then starts crash-looping
+// against Restart=always. A variable so the tests need not wait it out.
+var unitSettle = 2 * time.Second
+
+// verifyUnit reports whether the unit is running, and prints the tail of
+// its journal when it is not: the moment the person who typed install is
+// still watching is the moment to tell them.
+func verifyUnit(ctx context.Context, scope []string, unit string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(unitSettle):
+	}
+	out, _ := runSystemctl(ctx, append(slices.Clone(scope), "is-active", unit)...)
+	state := strings.TrimSpace(out)
+	if state == "active" {
+		slog.Info("service is running", "unit", unit)
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, journalTail(ctx, scope, unit))
+	return fmt.Errorf("%s is %q, not active — the log above says why", unit, state)
+}
+
+// journalTail is the unit's last log lines, for an install that did not
+// take. journalctl takes --user in the same spelling systemctl does. A seam
+// like runSystemctl, so the tests fork nothing.
+var journalTail = func(ctx context.Context, scope []string, unit string) string {
+	args := append(slices.Clone(scope), "--no-pager", "-n", "20", "-u", unit)
+	out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return fmt.Sprintf("(journalctl -u %s failed: %v)", unit, err)
+	}
+	return strings.TrimRight(string(out), "\n")
 }
 
 func serviceCmd(ctx context.Context) error {
@@ -146,7 +188,7 @@ func validateServeArgs(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
 	rest := fs.Args()
@@ -170,7 +212,7 @@ func validateServeArgs(args []string) error {
 // chunks.
 func validateConnectArgs(args []string) error {
 	fs, v := newConnectFlagSet()
-	if err := fs.Parse(args); err != nil {
+	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
 	if *v.trigger == "" {
@@ -322,10 +364,13 @@ func installServe(ctx context.Context, rawArgs []string) error {
 		return err
 	}
 
-	if err := runSystemctl(ctx, "daemon-reload"); err != nil {
+	if _, err := runSystemctl(ctx, "daemon-reload"); err != nil {
 		return err
 	}
-	return runSystemctl(ctx, "enable", "--now", "soft-kvm-serve")
+	if _, err := runSystemctl(ctx, "enable", "--now", "soft-kvm-serve"); err != nil {
+		return err
+	}
+	return verifyUnit(ctx, nil, "soft-kvm-serve")
 }
 
 func installConnect(ctx context.Context, rawArgs []string) error {
@@ -375,10 +420,13 @@ func installConnect(ctx context.Context, rawArgs []string) error {
 		return err
 	}
 
-	if err := runSystemctl(ctx, "--user", "daemon-reload"); err != nil {
+	if _, err := runSystemctl(ctx, "--user", "daemon-reload"); err != nil {
 		return err
 	}
-	if err := runSystemctl(ctx, "--user", "enable", "--now", "soft-kvm"); err != nil {
+	if _, err := runSystemctl(ctx, "--user", "enable", "--now", "soft-kvm"); err != nil {
+		return err
+	}
+	if err := verifyUnit(ctx, []string{"--user"}, "soft-kvm"); err != nil {
 		return err
 	}
 	fmt.Println("To start the agent at boot without logging in: loginctl enable-linger")
@@ -444,21 +492,23 @@ func serviceUninstall(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "serve":
-		if err := runSystemctl(ctx, "disable", "--now", "soft-kvm-serve"); err != nil {
+		if _, err := runSystemctl(ctx, "disable", "--now", "soft-kvm-serve"); err != nil {
 			return err
 		}
 		if err := removeIfExists(serveUnitPath); err != nil {
 			return err
 		}
-		return runSystemctl(ctx, "daemon-reload")
+		_, err := runSystemctl(ctx, "daemon-reload")
+		return err
 	case "connect":
-		if err := runSystemctl(ctx, "--user", "disable", "--now", "soft-kvm"); err != nil {
+		if _, err := runSystemctl(ctx, "--user", "disable", "--now", "soft-kvm"); err != nil {
 			return err
 		}
 		if err := removeIfExists(filepath.Join(home, connectUnitPath)); err != nil {
 			return err
 		}
-		return runSystemctl(ctx, "--user", "daemon-reload")
+		_, err := runSystemctl(ctx, "--user", "daemon-reload")
+		return err
 	default:
 		serviceUsage()
 		return errUsage

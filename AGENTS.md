@@ -65,23 +65,23 @@ owner) and `server` (last address that answered, the discovery cache).
 One module, one binary, ten packages under the root `main` (SPEC §11). Per-OS
 splits use filename build tags (`*_linux.go`, `*_darwin.go`), never `//go:build`
 lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
-`platform`, `hidpp`) import nothing internal; `detect` imports `hidpp`; `model`
-imports `state`; `client` and `server` import `state` and `identity`; `agent`
-imports `model`, `state`, `client`, `discover` and `hidpp`.
+`platform`, `hidpp`) import nothing internal; `detect` imports `hidpp` and
+`platform`; `model` imports `state`; `client` and `server` import `state` and
+`identity`; `agent` imports `model`, `state`, `client`, `discover` and `hidpp`.
 
-| Package    | Files                                  | Concern                                                                                                         |
-| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| (root)     | `main.go`, `service_*.go`              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the systemd service installer (Linux)    |
-| `state`    | `state.go`                             | the `/state` wire type and atomic JSON persistence                                                              |
-| `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                              |
-| `identity` | `tls.go`                               | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf` |
-| `discover` | `discover.go`                          | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)               |
-| `platform` | `run.go`, `defaults*`, `guard_*`       | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`                      |
-| `detect`   | `detect.go`, `detect_hid.go`           | HID enumeration for the subcommand; the attach detector both OSes share                                         |
-| `hidpp`    | `hidpp.go`                             | Logitech HID++ `changeHost`: the `hid-switch` virtual command and the `detect` probe (SPEC §5.5)                |
-| `client`   | `client.go`                            | the coordinator's HTTP client                                                                                   |
-| `server`   | `server.go`                            | the coordinator HTTP service                                                                                    |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go` | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy           |
+| Package    | Files                                       | Concern                                                                                                                               |
+| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux) |
+| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                    |
+| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                    |
+| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                       |
+| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                     |
+| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal    |
+| `detect`   | `detect.go`, `detect_hid.go`                | HID enumeration for the subcommand and its shell-transcript output; the attach detector both OSes share                               |
+| `hidpp`    | `hidpp.go`                                  | Logitech HID++ `changeHost`: the `hid-switch` virtual command and the `detect` probe (SPEC §5.5)                                      |
+| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                         |
+| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                          |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                 |
 
 The invariants header lives at the top of `agent/agent.go`.
 `platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op
@@ -97,7 +97,10 @@ Go ≥ 1.25 (`go.mod` is the language floor), `CGO_ENABLED=0`, stdlib +
 FFI: HID attach events on both OSes, SPEC §6.1-6.2). No CLI framework: stdlib
 `flag`, one `FlagSet` per subcommand, because pflag's interspersed parsing eats
 the trailing `-- SWITCH-CMD ARGS...` (SPEC §11). Logging is `log/slog` to
-stderr; `SOFTKVM_LOG=debug` lowers the level.
+stderr; `SOFTKVM_LOG=debug` lowers the level. The handler depends on who is
+reading: a clock, a level and dimmed attributes when stderr is a terminal, the
+stdlib logfmt `TextHandler` everywhere else, so journald and pipes keep the
+machine-readable form.
 
 ## Toolchain
 
