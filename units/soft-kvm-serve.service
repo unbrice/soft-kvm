@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[Unit]
+Description=soft-kvm coordinator
+Documentation=https://github.com/unbrice/soft-kvm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/soft-kvm/env
+ExecStart=__SOFTKVM_BIN__ serve __ARGS__
+Restart=always
+RestartSec=5s
+
+# State storage provisioned automatically under /var/lib/soft-kvm.
+StateDirectory=soft-kvm
+
+# Privilege dropping
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+
+# Filesystem isolation
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

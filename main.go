@@ -69,6 +69,8 @@ func main() {
 		err = detectCmd(ctx)
 	case "hid-switch":
 		err = hidSwitchCmd(ctx)
+	case "service":
+		err = serviceCmd(ctx)
 	default:
 		usage()
 		os.Exit(2)
@@ -94,6 +96,7 @@ func usage() {
   connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]
   detect
   hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX
+  service <install|print|uninstall> [serve|connect] [args]
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
 serve, activate and connect; detect and hid-switch need no token.
@@ -102,18 +105,18 @@ on debug logs. A connect switch command named "hid-switch" is built in, not
 exec'd (SPEC §5.5).`)
 }
 
-// requireToken reads the shared secret from the environment — never a flag
-// (SPEC §5). The TLS identity and the mDNS kh= fingerprint are both
-// deterministic, salt-free functions of the token, so a weak token is one
-// offline dictionary pass away from compromise (SPEC §9): refuse clearly
-// weak ones, warn on short ones.
+// checkToken applies the shared-secret length rules. The TLS identity and
+// the mDNS kh= fingerprint are both deterministic, salt-free functions of
+// the token, so a weak token is one offline dictionary pass away from
+// compromise (SPEC §9): refuse clearly weak ones, warn on short ones.
+// Kept pure — no environment reads — so the service-install validators and
+// their tests can call it directly.
 const (
 	tokenMinLen  = 16
 	tokenGoodLen = 32
 )
 
-func requireToken() (string, error) {
-	token := os.Getenv("SOFTKVM_TOKEN")
+func checkToken(token string) (string, error) {
 	if token == "" {
 		return "", errToken
 	}
@@ -124,6 +127,12 @@ func requireToken() (string, error) {
 		slog.Warn("SOFTKVM_TOKEN is short; prefer a generated token of 32+ chars (SPEC §9)", "length", len(token))
 	}
 	return token, nil
+}
+
+// requireToken reads the shared secret from the environment — never a flag
+// (SPEC §5).
+func requireToken() (string, error) {
+	return checkToken(os.Getenv("SOFTKVM_TOKEN"))
 }
 
 // rejectExtraArgs fails a subcommand that expects at most want positional
@@ -141,18 +150,63 @@ func rejectExtraArgs(name string, args []string, want int) error {
 	return fmt.Errorf("%s: unexpected extra argument %q", name, extra)
 }
 
-func serveCmd(ctx context.Context) error {
+// serveFlags holds the values bound by newServeFlagSet.
+type serveFlags struct {
+	statePath   *string
+	instance    *string
+	noAdvertise *bool
+}
+
+// newServeFlagSet builds serve's FlagSet and its bound values. serveCmd and
+// the service-install validator share it, so install never accepts a syntax
+// the runtime would reject.
+func newServeFlagSet() (*flag.FlagSet, *serveFlags, error) {
 	defaultStatePath, err := platform.DefaultServeStatePath()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	statePath := fs.String("state", defaultStatePath, "persisted owner/epoch/since path")
-	instance := fs.String("instance", "", "mDNS instance name (default: hostname)")
-	noAdvertise := fs.Bool("no-advertise", false, "skip mDNS advertisement")
+	v := &serveFlags{
+		statePath:   fs.String("state", defaultStatePath, "persisted owner/epoch/since path"),
+		instance:    fs.String("instance", "", "mDNS instance name (default: hostname)"),
+		noAdvertise: fs.Bool("no-advertise", false, "skip mDNS advertisement"),
+	}
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]")
 		fs.PrintDefaults()
+	}
+	return fs, v, nil
+}
+
+// serveListenAddr normalises serve's positional address: empty means the
+// default port, a bare port or an empty host binds all interfaces. serveCmd
+// and the service-install validator share it.
+func serveListenAddr(arg string) (addr string, port int, err error) {
+	addr = arg
+	if addr == "" {
+		addr = "8700"
+	}
+	if _, err := strconv.Atoi(addr); err == nil {
+		addr = ":" + addr
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("invalid port %q", portStr)
+	}
+	if host == "" {
+		addr = ":" + portStr
+	}
+	return addr, port, nil
+}
+
+func serveCmd(ctx context.Context) error {
+	fs, flags, err := newServeFlagSet()
+	if err != nil {
+		return err
 	}
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return errUsage
@@ -166,36 +220,22 @@ func serveCmd(ctx context.Context) error {
 		return err
 	}
 
-	addr := fs.Arg(0)
-	if addr == "" {
-		addr = "8700"
-	}
-	if _, err := strconv.Atoi(addr); err == nil {
-		addr = ":" + addr
-	}
-	host, portStr, err := net.SplitHostPort(addr)
+	addr, port, err := serveListenAddr(fs.Arg(0))
 	if err != nil {
-		return fmt.Errorf("invalid address %q: %w", addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid port %q", portStr)
-	}
-	if host == "" {
-		addr = ":" + portStr
+		return err
 	}
 
-	if *instance == "" {
+	if *flags.instance == "" {
 		hn, err := os.Hostname()
 		if err != nil {
 			return fmt.Errorf("hostname: %w", err)
 		}
-		*instance = hn
+		*flags.instance = hn
 	}
 
-	srv := server.NewServer(*statePath, token)
-	if !*noAdvertise {
-		stopAdv, err := discover.Advertise(*instance, port, identity.KeyFingerprint(token))
+	srv := server.NewServer(*flags.statePath, token)
+	if !*flags.noAdvertise {
+		stopAdv, err := discover.Advertise(*flags.instance, port, identity.KeyFingerprint(token))
 		if err != nil {
 			// e.g. Avahi owning UDP 5353 despite SO_REUSEPORT (SPEC §6.4).
 			slog.Warn("mDNS advertisement failed, continuing without it", "error", err)
@@ -203,7 +243,7 @@ func serveCmd(ctx context.Context) error {
 			defer stopAdv()
 		}
 	}
-	slog.Info("serving", "addr", addr, "instance", *instance, "state", *statePath)
+	slog.Info("serving", "addr", addr, "instance", *flags.instance, "state", *flags.statePath)
 	return srv.Run(ctx, addr)
 }
 
@@ -279,34 +319,57 @@ func activateCmd(ctx context.Context) error {
 	return nil
 }
 
-func connectCmd(ctx context.Context) error {
+// connectFlags holds the values bound by newConnectFlagSet.
+type connectFlags struct {
+	id            *string
+	serverFlag    *string
+	trigger       *string
+	settle        *time.Duration
+	confirm       *time.Duration
+	switchRetries *int
+	checkTimeout  *time.Duration
+	switchTimeout *time.Duration
+	checkCmd      *string
+	notifyCmd     *string
+	noGuards      bool
+	displayMatch  string
+}
+
+// newConnectFlagSet builds connect's FlagSet and its bound values. connectCmd
+// and the service-install validator share it, so install never accepts a
+// syntax the runtime would reject. The darwin-only guard flags are gated on
+// runtime.GOOS, as before.
+func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	fs := flag.NewFlagSet("connect", flag.ContinueOnError)
-	id := fs.String("id", platform.DefaultID, "claimed identity")
-	serverFlag := fs.String("server", "", "server address HOST:PORT")
-	trigger := fs.String("trigger", "", "comma-separated VID:PID filters for the trigger detector (USB receiver, optional Bluetooth keyboard); required — run `soft-kvm detect` to list VID:PIDs")
-	settle := fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming")
-	confirm := fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed")
-	switchRetries := fs.Int("switch-retries", 3, "re-runs of the switch command before giving up")
-	checkTimeout := fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run")
-	switchTimeout := fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)")
-	checkCmd := fs.String("check-cmd", platform.DefaultCheckCmd, "veto before the switch, receipt after it")
-	notifyCmd := fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch cannot be confirmed")
-
-	var noGuards bool
-	var displayMatch string
-	if runtime.GOOS == "darwin" {
-		fs.BoolVar(&noGuards, "no-guards", false, "disable macOS AC-power and display guards")
-		fs.StringVar(&displayMatch, "display-match", "", "display name substring for the macOS guard (default: match any external display)")
+	v := &connectFlags{
+		id:            fs.String("id", platform.DefaultID, "claimed identity"),
+		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
+		trigger:       fs.String("trigger", "", "comma-separated VID:PID filters for the trigger detector (USB receiver, optional Bluetooth keyboard); required — run `soft-kvm detect` to list VID:PIDs"),
+		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
+		confirm:       fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch counts as failed"),
+		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch command before giving up"),
+		checkTimeout:  fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run"),
+		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run — a hung I²C write must not freeze the agent (§4.3)"),
+		checkCmd:      fs.String("check-cmd", platform.DefaultCheckCmd, "veto before the switch, receipt after it"),
+		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch cannot be confirmed"),
 	}
-
+	if runtime.GOOS == "darwin" {
+		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")
+		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: match any external display)")
+	}
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]")
 		fs.PrintDefaults()
 	}
+	return fs, v
+}
+
+func connectCmd(ctx context.Context) error {
+	fs, flags := newConnectFlagSet()
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return errUsage
 	}
-	if *trigger == "" {
+	if *flags.trigger == "" {
 		fmt.Fprintln(os.Stderr, "connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
 		return errUsage
 	}
@@ -315,14 +378,14 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 
-	detector, err := detect.NewHIDDetector(*trigger)
+	detector, err := detect.NewHIDDetector(*flags.trigger)
 	if err != nil {
 		return err
 	}
 
 	// The Linux desktop has no guards: NewGuard there ignores displayMatch and
 	// is always ok (SPEC §6.1-6.2).
-	guard := platform.NewGuard(displayMatch, noGuards)
+	guard := platform.NewGuard(flags.displayMatch, flags.noGuards)
 
 	// The trailing commands are argv slices, never shell strings (SPEC §9).
 	switchCommands, err := splitSwitchCommands(fs.Args())
@@ -340,16 +403,16 @@ func connectCmd(ctx context.Context) error {
 	}
 
 	machineCfg := model.MachineConfig{
-		ID:             *id,
-		Settle:         *settle,
-		Confirm:        *confirm,
-		SwitchRetries:  *switchRetries,
+		ID:             *flags.id,
+		Settle:         *flags.settle,
+		Confirm:        *flags.confirm,
+		SwitchRetries:  *flags.switchRetries,
 		RetrySpacing:   1 * time.Second,
 		Cooldown:       5 * time.Second,
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
 		BreakerOpenFor: 60 * time.Second,
-		NoCheck:        *checkCmd == "",
+		NoCheck:        *flags.checkCmd == "",
 	}
 
 	stateDir, err := platform.StateDir()
@@ -359,13 +422,13 @@ func connectCmd(ctx context.Context) error {
 	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
 
 	var checkArgv []string
-	if *checkCmd != "" {
-		checkArgv = platform.ShellArgv(*checkCmd)
+	if *flags.checkCmd != "" {
+		checkArgv = platform.ShellArgv(*flags.checkCmd)
 	}
 
 	cfg := agent.Config{
-		ID:             *id,
-		ExplicitServer: *serverFlag,
+		ID:             *flags.id,
+		ExplicitServer: *flags.serverFlag,
 		KeyFP:          identity.KeyFingerprint(token),
 		Detector:       detector,
 		Guard:          guard,
@@ -375,9 +438,9 @@ func connectCmd(ctx context.Context) error {
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
 		SwitchCommands: switchCommands,
 		CheckArgv:      checkArgv,
-		NotifyArgv:     platform.ShellArgv(*notifyCmd),
-		CheckTimeout:   *checkTimeout,
-		SwitchTimeout:  *switchTimeout,
+		NotifyArgv:     platform.ShellArgv(*flags.notifyCmd),
+		CheckTimeout:   *flags.checkTimeout,
+		SwitchTimeout:  *flags.switchTimeout,
 		Resolver:       resolver,
 	}
 

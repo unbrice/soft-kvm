@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[Unit]
+Description=soft-kvm agent (Display-Follows-Keyboard)
+Documentation=https://github.com/unbrice/soft-kvm
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/soft-kvm/env
+ExecStart=__SOFTKVM_BIN__ connect __ARGS__
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

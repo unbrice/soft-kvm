@@ -18,12 +18,55 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/telesma-app/hid"
 	"github.com/unbrice/soft-kvm/hidpp"
 )
 
 const logitechVID = 0x046d
+
+// Dim renders a #-comment block for w: dimmed when w is a terminal that
+// wants escape codes, unchanged otherwise. detect and the service
+// installer both print shell transcripts — prose as #-comments, commands
+// at column 0 — and this is how both grey the prose.
+func Dim(w io.Writer, s string) string {
+	return dimComments(s, wantsColor(w))
+}
+
+// wantsColor reports whether w is a terminal that wants escape codes: an
+// *os.File on a character device, NO_COLOR unset, TERM not "dumb". Asking
+// the writer rather than os.Stdout is what keeps this honest — a
+// bytes.Buffer or a redirect into a file gets plain text without the
+// caller having to say so.
+func wantsColor(w io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// dimComments dims the #-comment lines, leaving the commands as the only
+// unstyled lines. Each line carries its own reset, so a line-oriented pipe
+// never leaks the attribute. color is a parameter, not a wantsColor call,
+// so the tests exercise both renderings.
+func dimComments(s string, color bool) string {
+	if !color {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		if strings.HasPrefix(l, "#") {
+			lines[i] = "\x1b[2m" + l + "\x1b[0m"
+		}
+	}
+	return strings.Join(lines, "\n")
+}
 
 type deviceKey struct {
 	vid, pid uint16
@@ -47,20 +90,22 @@ type hidDevice struct {
 // context, so a slow receiver cannot stretch detect linearly.
 const probeBudget = 15 * time.Second
 
-// Run enumerates HID devices and prints how to set --trigger for connect.
+// Run enumerates HID devices and prints how to set --trigger for connect:
+// the suggested invocations first, as a shell transcript, then the device
+// list they were drawn from.
 func Run(ctx context.Context, w io.Writer) error {
 	devices, err := enumerateHIDDevices(ctx)
 	if err != nil {
 		return fmt.Errorf("enumerate HID devices: %w", err)
 	}
 	probed := probeAll(ctx, devices)
-	if err := renderDevices(w, probed); err != nil {
-		return err
-	}
 	if err := renderSuggestions(w, probed); err != nil {
 		return err
 	}
-	return nil
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
+	return renderDevices(w, probed)
 }
 
 func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
@@ -141,9 +186,9 @@ type probedDevice struct {
 func (d probedDevice) scanFailure() string {
 	switch {
 	case errors.Is(d.err, errPermission) && d.key.vid == logitechVID:
-		return "🔒 permission denied — " + permissionRemediation
+		return "🔒 HID++ scan denied — " + permissionRemediation
 	case errors.Is(d.err, errPermission):
-		return "🔒 permission denied — scan skipped; not a Logitech device, so no HID++ to find"
+		return "🔒 HID++ scan denied; not a Logitech device, no HID++ to find"
 	case errors.Is(d.err, errNoAnswer):
 		return "⏳ no answer — the device did not speak HID++"
 	default:
@@ -212,76 +257,159 @@ func probeAll(ctx context.Context, devices []*hidDevice) []probedDevice {
 	return out
 }
 
+// triggerMark flags a --trigger candidate. It is a wide emoji, so an
+// unmarked row pads to the same three cells; variation-selector emoji
+// (⌨️, ✔️) are avoided because terminals disagree on their width and the
+// column would tear.
+const (
+	triggerMark = "✅ "
+	plainMark   = "   "
+)
+
+// Layout of the device list: a marker column, the vid:pid, then the name
+// padded to the widest name up to nameColMax — a longer product string
+// overflows into the tags instead of padding every other row to its width.
+// Continuations (pairing slots, scan failures) line up under the name.
+const (
+	nameColMax = 24
+	contIndent = "              "
+	contWidth  = 76 - len(contIndent)
+)
+
+// isTrigger reports whether an attach of this device can mean "the user
+// switched input to this host": keyboard-capable devices and probed HID++
+// mice, whose host-switch button is the same gesture. renderDevices marks
+// these and renderSuggestions lists them, both from here, so the legend
+// cannot drift from the suggestion.
+func (d probedDevice) isTrigger() bool {
+	if d.key.vid == 0 {
+		return false
+	}
+	return d.hasKeyboard() || (d.status == probeOK && d.inv.Kind == hidpp.KindMouse)
+}
+
+// tags renders a device row's trailing descriptor: its interface usages,
+// deduplicated, then what the probe established. HID++ is claimed only for
+// a device that answered one — a failed scan says so on its own line
+// rather than tagging the row with a capability it could not confirm.
+func (d probedDevice) tags() string {
+	names := make([]string, 0, len(d.interfaces)+1)
+	for _, u := range d.interfaces {
+		if name := usageName(u.usagePage, u.usage); !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		names = append(names, "no interfaces")
+	}
+	switch {
+	case d.shadow:
+		names = append(names, "via receiver")
+	case d.status == probeOK:
+		names = append(names, "HID++")
+	}
+	return strings.Join(names, ", ")
+}
+
+// wrapAt greedily wraps text to width columns for a continuation line.
+func wrapAt(text string, width int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	lines := []string{words[0]}
+	for _, word := range words[1:] {
+		last := len(lines) - 1
+		if utf8.RuneCountInString(lines[last])+1+utf8.RuneCountInString(word) <= width {
+			lines[last] += " " + word
+			continue
+		}
+		lines = append(lines, word)
+	}
+	return lines
+}
+
 func renderDevices(w io.Writer, devices []probedDevice) error {
 	if len(devices) == 0 {
 		_, err := fmt.Fprintln(w, "No HID devices detected.")
 		return err
 	}
-	type row struct {
-		vidpid   string
-		name     string
-		ifaces   string
-		keyboard bool
-		hidpp    bool
-		shadow   bool
-		dev      probedDevice
+	nameWidth := 0
+	for _, dev := range devices {
+		nameWidth = max(nameWidth, len(dev.name()))
 	}
-	rows := make([]row, len(devices))
-	col1Width, col2Width, col3Width := 0, 0, 0
-	for i, dev := range devices {
-		rows[i] = row{
-			vidpid:   vidpidString(dev.key.vid, dev.key.pid),
-			name:     dev.name(),
-			ifaces:   ifaceList(dev.interfaces),
-			keyboard: dev.hasKeyboard(),
-			hidpp:    dev.status == probeOK || (dev.hasHIDPP() && dev.status != probeNotHIDPP),
-			shadow:   dev.shadow,
-			dev:      dev,
-		}
-		col1Width = max(col1Width, len(rows[i].vidpid))
-		col2Width = max(col2Width, len(rows[i].name))
-		col3Width = max(col3Width, len(rows[i].ifaces))
+	nameWidth = min(nameWidth, nameColMax)
+	if _, err := fmt.Fprintf(w, "Devices seen (%s= usable as --trigger):\n\n", triggerMark); err != nil {
+		return err
 	}
-	for _, r := range rows {
-		line := fmt.Sprintf("%-*s  %-*s  %-*s", col1Width, r.vidpid, col2Width, r.name, col3Width, r.ifaces)
-		if !r.keyboard {
-			line += " (no keyboard)"
+	for _, dev := range devices {
+		marker := plainMark
+		if dev.isTrigger() {
+			marker = triggerMark
 		}
-		switch {
-		case r.shadow:
-			// A kernel shadow of a receiver-paired peripheral: not probed,
-			// the device answers through the receiver's pairing slots.
-			line += " (via receiver)"
-		case r.hidpp:
-			line += " (HID++)"
-		}
-		if _, err := fmt.Fprintln(w, line); err != nil {
+		line := fmt.Sprintf("%s%s  %-*s  %s",
+			marker, vidpidString(dev.key.vid, dev.key.pid), nameWidth, dev.name(), dev.tags())
+		if _, err := fmt.Fprintln(w, strings.TrimRight(line, " ")); err != nil {
 			return err
 		}
-		switch r.dev.status {
-		case probeFailed:
-			if _, err := fmt.Fprintf(w, "  HID++ scan failed: %s\n", r.dev.scanFailure()); err != nil {
+		for _, cont := range deviceDetail(dev) {
+			if _, err := fmt.Fprintln(w, contIndent+cont); err != nil {
 				return err
-			}
-		case probeOK:
-			for _, p := range r.dev.inv.Paired {
-				if _, err := fmt.Fprintf(w, "  slot %d: %s\n", p.Index, p.Kind); err != nil {
-					return err
-				}
 			}
 		}
 	}
 	return nil
 }
 
+// deviceDetail is what a device row says on its continuation lines: the
+// receiver's pairing slots, or why its HID++ scan failed.
+func deviceDetail(dev probedDevice) []string {
+	switch dev.status {
+	case probeFailed:
+		return wrapAt(dev.scanFailure(), contWidth)
+	case probeOK:
+		if len(dev.inv.Paired) == 0 {
+			return nil
+		}
+		slots := make([]string, len(dev.inv.Paired))
+		for i, p := range dev.inv.Paired {
+			slots[i] = fmt.Sprintf("%d %s", p.Index, p.Kind)
+		}
+		return wrapAt("paired: "+strings.Join(slots, ", "), contWidth)
+	default:
+		return nil
+	}
+}
+
+// cmdWidth is the column budget a suggested command must fit, before it is
+// broken across a shell continuation.
+const cmdWidth = 76
+
+// wrapCommand keeps a suggestion inside the budget: the one-line form when
+// it fits, else a continuation before the -- that introduces the switch
+// command.
+func wrapCommand(cmd string) string {
+	if utf8.RuneCountInString(cmd) <= cmdWidth {
+		return cmd
+	}
+	if head, tail, ok := strings.Cut(cmd, " -- "); ok {
+		return head + " \\\n  -- " + tail
+	}
+	return cmd
+}
+
+// renderSuggestions prints the invocations as a shell transcript — prose as
+// #-comments, commands at column 0 — so the block reads like the one
+// `service install` prints and survives a pipe into a file.
 func renderSuggestions(w io.Writer, devices []probedDevice) error {
-	// Trigger candidates are devices whose attach can mean "the user switched
-	// input here": keyboard-capable devices (usage page 0x01, usage 0x06) and
-	// probed HID++ mice, whose host-switch button is the same gesture.
+	dim := func(s string) string { return Dim(w, s) }
 	var kbdTriggers, mouseTriggers []string
 	for _, dev := range devices {
+		if !dev.isTrigger() {
+			continue
+		}
 		vidpid := vidpidString(dev.key.vid, dev.key.pid)
-		if dev.hasKeyboard() && dev.key.vid != 0 {
+		if dev.hasKeyboard() {
 			kbdTriggers = append(kbdTriggers, vidpid)
 		}
 		if dev.status == probeOK && dev.inv.Kind == hidpp.KindMouse {
@@ -293,16 +421,6 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 	slices.Sort(kbdTriggers)
 	slices.Sort(mouseTriggers)
 
-	if _, err := fmt.Fprintln(w); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintln(w, "Trigger candidates are keyboard-capable devices (usage page 0x01, usage 0x06) and HID++ mice."); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintln(w); err != nil {
-		return err
-	}
-
 	if len(kbdTriggers) == 0 && len(mouseTriggers) == 0 {
 		if _, err := fmt.Fprintln(w, "No trigger candidates detected."); err != nil {
 			return err
@@ -311,47 +429,56 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		return err
 	}
 
-	// One suggestion per device that can carry the gesture: the others follow
-	// it via hid-switch.
-	var labelled [][2]string
+	// One suggestion per device that can carry the gesture: the others
+	// follow it via hid-switch.
+	type suggestion struct{ comment, cmd string }
+	var suggestions []suggestion
 	if t := switchTarget(devices, hidpp.KindMouse); len(kbdTriggers) > 0 && t != "" {
-		labelled = append(labelled, [2]string{"follow the keyboard",
-			"soft-kvm connect --trigger " + strings.Join(kbdTriggers, ",") + " -- " + t})
+		suggestions = append(suggestions, suggestion{
+			"# FOLLOW THE KEYBOARD — switch when a keyboard attaches here,\n# and send the mouse along.\n",
+			"soft-kvm connect --trigger " + strings.Join(kbdTriggers, ",") + " -- " + t,
+		})
 	}
 	if t := switchTarget(devices, hidpp.KindKeyboard); len(mouseTriggers) > 0 && t != "" {
-		labelled = append(labelled, [2]string{"follow the mouse",
-			"soft-kvm connect --trigger " + strings.Join(mouseTriggers, ",") + " -- " + t})
+		suggestions = append(suggestions, suggestion{
+			"# FOLLOW THE MOUSE — switch when a mouse attaches here, and\n# send the keyboard along. Install one gesture, not both.\n",
+			"soft-kvm connect --trigger " + strings.Join(mouseTriggers, ",") + " -- " + t,
+		})
 	}
-
-	if len(labelled) == 0 {
+	if len(suggestions) == 0 {
 		// No HID++ switch target: trigger-only suggestion.
 		triggers := slices.Concat(kbdTriggers, mouseTriggers)
 		slices.Sort(triggers)
-		if _, err := fmt.Fprintln(w, "Suggested invocation:"); err != nil {
-			return err
-		}
-		_, err := fmt.Fprintf(w, "  soft-kvm connect --trigger %s\n", strings.Join(triggers, ","))
-		return err
+		suggestions = append(suggestions, suggestion{
+			"# SWITCH ON ATTACH — no HID++ device answered a scan, so only\n# the display follows; the peripherals stay where they are.\n",
+			"soft-kvm connect --trigger " + strings.Join(triggers, ","),
+		})
 	}
 
-	if _, err := fmt.Fprintln(w, "Suggested invocations — choose which device you switch by hand:"); err != nil {
-		return err
-	}
-	width := 0
-	for _, l := range labelled {
-		width = max(width, len(l[0]))
-	}
-	for _, l := range labelled {
-		if _, err := fmt.Fprintf(w, "  %-*s  %s\n", width, l[0]+":", l[1]); err != nil {
+	usesHIDSwitch := false
+	for i, sg := range suggestions {
+		if i > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+		}
+		if _, err := io.WriteString(w, dim(sg.comment)); err != nil {
 			return err
 		}
+		if _, err := fmt.Fprintln(w, wrapCommand(sg.cmd)); err != nil {
+			return err
+		}
+		usesHIDSwitch = usesHIDSwitch || strings.Contains(sg.cmd, "hid-switch")
 	}
-	_, err := fmt.Fprintln(w, `
-The trailing hid-switch is a built-in virtual command (SPEC §5.5) that tells
-the other peripheral to follow the gesture when this host loses ownership.
-Replace <host-index> with the other host's Easy-Switch slot minus one (0-2).
-hid-switch moves every paired device of the named kind; to address one
-pairing slot instead, give its number (1-6) in place of the kind.`)
+	if !usesHIDSwitch {
+		return nil
+	}
+	_, err := io.WriteString(w, dim(`
+# HOST is the other host's Easy-Switch slot minus one (0-2). hid-switch
+# is built in, not a program: it moves every paired device of the named
+# kind — give a pairing slot number (1-6) instead of the kind to move
+# just one.
+`))
 	return err
 }
 
@@ -362,7 +489,7 @@ pairing slot instead, give its number (1-6) in place of the kind.`)
 func switchTarget(devices []probedDevice, kind hidpp.Kind) string {
 	for _, dev := range devices {
 		if dev.status == probeOK && dev.inv.Kind == kind {
-			return fmt.Sprintf("hid-switch %s <host-index>", vidpidString(dev.key.vid, dev.key.pid))
+			return fmt.Sprintf("hid-switch %s HOST", vidpidString(dev.key.vid, dev.key.pid))
 		}
 	}
 	for _, dev := range devices {
@@ -371,7 +498,7 @@ func switchTarget(devices []probedDevice, kind hidpp.Kind) string {
 		}
 		for _, p := range dev.inv.Paired {
 			if p.Kind == kind {
-				return fmt.Sprintf("hid-switch %s %s <host-index>",
+				return fmt.Sprintf("hid-switch %s %s HOST",
 					vidpidString(dev.key.vid, dev.key.pid), kind)
 			}
 		}
@@ -390,22 +517,6 @@ func (d *hidDevice) name() string {
 	default:
 		return "(unknown)"
 	}
-}
-
-func ifaceList(ifaces []ifaceUsage) string {
-	n := len(ifaces)
-	if n == 0 {
-		return "0 interfaces"
-	}
-	names := make([]string, n)
-	for i, u := range ifaces {
-		names[i] = usageName(u.usagePage, u.usage)
-	}
-	noun := "interfaces"
-	if n == 1 {
-		noun = "interface"
-	}
-	return fmt.Sprintf("%d %s: %s", n, noun, strings.Join(names, ", "))
 }
 
 func (d *hidDevice) hasKeyboard() bool {

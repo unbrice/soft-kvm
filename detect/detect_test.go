@@ -11,8 +11,10 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/unbrice/soft-kvm/hidpp"
 )
@@ -103,20 +105,35 @@ func TestRenderDevices(t *testing.T) {
 	if !strings.Contains(out, "046d:c548") {
 		t.Error("missing receiver")
 	}
-	if !strings.Contains(out, "3 interfaces: keyboard, mouse, raw") {
-		t.Error("missing interface list")
+	if !strings.Contains(out, "keyboard, mouse, raw, HID++") {
+		t.Error("missing interface list and HID++ tag")
 	}
-	if !strings.Contains(out, "(no keyboard)") {
-		t.Error("missing no-keyboard marker")
+	if !strings.Contains(out, triggerMark+"046d:c548") {
+		t.Error("keyboard-capable device is not marked as a trigger candidate")
 	}
-	if !strings.Contains(out, "(HID++)") {
-		t.Error("missing HID++ marker")
-	}
-	if !strings.Contains(out, "slot 1: keyboard") || !strings.Contains(out, "slot 2: mouse") {
+	if !strings.Contains(out, "paired: 1 keyboard, 2 mouse") {
 		t.Error("missing receiver slot map")
 	}
-	if !strings.Contains(out, "HID++ scan failed: 🔒 permission denied") {
+	if !strings.Contains(out, "🔒 HID++ scan denied") {
 		t.Error("missing scan failure reason")
+	}
+	// The Razer mouse has no keyboard interface and no successful probe:
+	// it is not a candidate, and a failed scan must not tag it HID++.
+	for line := range strings.Lines(out) {
+		if !strings.Contains(line, "1532:0285") {
+			continue
+		}
+		if strings.HasPrefix(line, triggerMark) {
+			t.Errorf("non-candidate marked as a trigger: %q", line)
+		}
+		if strings.Contains(line, "HID++") {
+			t.Errorf("HID++ claimed for a device whose scan failed: %q", line)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if n := utf8.RuneCountInString(line); n > 80 {
+			t.Errorf("line is %d columns, it wraps in an 80-column terminal: %q", n, line)
+		}
 	}
 }
 
@@ -139,7 +156,7 @@ func TestRenderDevicesProbeOKWithoutVendor(t *testing.T) {
 	if err := renderDevices(&buf, devices); err != nil {
 		t.Fatalf("renderDevices: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "(HID++)") {
+	if out := buf.String(); !strings.Contains(out, "mouse, HID++") {
 		t.Errorf("missing HID++ marker for probeOK device without vendor interface:\n%s", out)
 	}
 }
@@ -232,7 +249,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	if err := renderSuggestions(&buf, []probedDevice{keyboard, direct}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 <host-index>") {
+	if out := buf.String(); !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 HOST") {
 		t.Errorf("missing direct-mouse hid-switch suggestion:\n%s", out)
 	}
 
@@ -247,7 +264,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	if err := renderSuggestions(&buf, []probedDevice{keyboard, withMouse}); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548 mouse <host-index>") {
+	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548 mouse HOST") {
 		t.Errorf("missing receiver-mouse hid-switch suggestion:\n%s", out)
 	}
 
@@ -288,12 +305,12 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "follow the keyboard:") ||
-		!strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 <host-index>") {
+	if !strings.Contains(out, "# FOLLOW THE KEYBOARD") ||
+		!strings.Contains(out, "soft-kvm connect --trigger 046d:b35b -- hid-switch 046d:b034 HOST") {
 		t.Errorf("missing keyboard-led suggestion:\n%s", out)
 	}
-	if !strings.Contains(out, "follow the mouse:") ||
-		!strings.Contains(out, "soft-kvm connect --trigger 046d:b034 -- hid-switch 046d:b35b <host-index>") {
+	if !strings.Contains(out, "# FOLLOW THE MOUSE") ||
+		!strings.Contains(out, "soft-kvm connect --trigger 046d:b034 -- hid-switch 046d:b35b HOST") {
 		t.Errorf("missing mouse-led suggestion:\n%s", out)
 	}
 }
@@ -390,5 +407,35 @@ func TestClassifyProbeErr(t *testing.T) {
 	other := errors.New("boom")
 	if got := classifyProbeErr(other); got != other {
 		t.Errorf("classifyProbeErr(boom) = %v, want it unchanged", got)
+	}
+}
+
+// TestDimComments pins the transcript styling: only #-comment lines are
+// dimmed, each closes its own reset, and colour off is the identity.
+func TestDimComments(t *testing.T) {
+	in := "# a comment\n\nsoft-kvm connect --trigger 046d:c548\n#\n"
+	if got := dimComments(in, false); got != in {
+		t.Errorf("colour off: got %q, want the input unchanged", got)
+	}
+	want := "\x1b[2m# a comment\x1b[0m\n\nsoft-kvm connect --trigger 046d:c548\n\x1b[2m#\x1b[0m\n"
+	if got := dimComments(in, true); got != want {
+		t.Errorf("colour on: got %q, want %q", got, want)
+	}
+}
+
+// TestWantsColorNonFile pins that a writer that is not a terminal — every
+// test's bytes.Buffer, and `soft-kvm detect > file` — renders plain.
+func TestWantsColorNonFile(t *testing.T) {
+	if wantsColor(&bytes.Buffer{}) {
+		t.Error("a bytes.Buffer must not be styled")
+	}
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	t.Setenv("NO_COLOR", "1")
+	if wantsColor(f) {
+		t.Error("NO_COLOR must disable styling")
 	}
 }

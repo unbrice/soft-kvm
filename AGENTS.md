@@ -19,7 +19,7 @@ tree disagree on detail, the tree wins; fix the SPEC in the same change.
 ## How it works
 
 One binary, `soft-kvm` (module `github.com/unbrice/soft-kvm`), same artifact on
-every host, five subcommands:
+every host, six subcommands:
 
 - `serve [IP:]PORT` — the coordinator. Owns `owner/epoch`, serves `GET /state`,
   `POST /claim/{id}` and `GET /wait?epoch=N&id=ME` (long-poll) over mutual TLS:
@@ -43,6 +43,13 @@ every host, five subcommands:
 - `hid-switch VID:PID [DEVICE_INDEX|keyboard|mouse] HOST_INDEX` — runs the
   built-in Logitech HID++ `changeHost` command by hand, without a server or
   token (SPEC §5.5).
+- `service <install|print|uninstall> [serve|connect] [args]` — Linux only:
+  validates with the `serve`/`connect` flag sets and installs, prints or removes
+  the canonical systemd units from `units/`, baking the raw argv into
+  `ExecStart=`; the coordinator step copies the binary to
+  `/usr/local/bin/soft-kvm` and writes `/etc/soft-kvm/env`, the agent step
+  writes `~/.config/soft-kvm/env` (both `0600`). On macOS it points at launchd
+  (SPEC §5.6, §6.2).
 
 `SOFTKVM_TOKEN` (env, never a flag) is required by `serve`, `activate` and
 `connect`; `detect` and `hid-switch` need no token. The TLS identity and the
@@ -64,7 +71,7 @@ imports `model`, `state`, `client`, `discover` and `hidpp`.
 
 | Package    | Files                                  | Concern                                                                                                         |
 | ---------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| (root)     | `main.go`                              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring                                           |
+| (root)     | `main.go`, `service_*.go`              | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the systemd service installer (Linux)    |
 | `state`    | `state.go`                             | the `/state` wire type and atomic JSON persistence                                                              |
 | `model`    | `machine.go`                           | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                              |
 | `identity` | `tls.go`                               | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf` |
@@ -213,6 +220,10 @@ jj sharp edges:
   mDNS fingerprint are deterministic salt-free functions of the token, so a weak
   one is one offline dictionary pass from compromise (SPEC §9). Generate with
   `openssl rand -hex 32`.
+- The token rests in two `0600` env files, one per role (SPEC §5.6, §6.4):
+  `/etc/soft-kvm/env` (root-only, read by PID 1 for the coordinator unit) and
+  `~/.config/soft-kvm/env` (per-user, read by the user manager for the agent
+  unit). `service install` re-renders them from the embedded templates.
 - The switch commands are argv slices taken after `--`, never shell strings
   (SPEC §9). `--check-cmd` and `--notify-cmd` are the exception: their per-OS
   defaults carry shell quoting, so they run as `sh -c <string>`.

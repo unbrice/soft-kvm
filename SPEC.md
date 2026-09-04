@@ -10,17 +10,17 @@ work; §10 is the integration pass, run at the end.
 
 ## 1. Context
 
-| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                  |
-| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Input-switch commands | Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` · macOS: BetterDisplay (`"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<code>`) — both are defaults baked into the binary, overridable via CLI args                                                                                                                                                                                                                                                              |
-| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                               |
-| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                    |
-| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Implementation        | One Go binary, `soft-kvm`, five subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` — `detect` enumerates HID devices to help write `--trigger`, `hid-switch` is the standalone form of the built-in switch command). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) |
+| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                             |
+| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Input-switch commands | Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` · macOS: BetterDisplay (`"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<code>`) — both are defaults baked into the binary, overridable via CLI args                                                                                                                                                                                                                                                                         |
+| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                          |
+| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                               |
+| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Implementation        | One Go binary, `soft-kvm`, six subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` / `service` — `detect` enumerates HID devices to help write `--trigger`, `hid-switch` is the standalone form of the built-in switch command). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) |
 
 ## 2. Goals / non-goals
 
@@ -406,6 +406,45 @@ Typical pair — keyboard and mouse on receiver channel 1 and BT channel 2:
 - macOS, mouse over BT: `-- hid-switch 046d:b034 0`
 - Linux, through the Bolt receiver: `-- hid-switch 046d:c548 mouse 1`
 
+### 5.6 `soft-kvm service <install|print|uninstall> [serve|connect] [args]`
+
+Systemd install/print/uninstall for both roles, Linux only; on macOS the
+subcommand refuses with a pointer to launchd (§6.2). Bare `service install`
+prints the walkthrough as a shell transcript: the shared secret, a by-hand trial
+of `detect`/`serve`/`connect`, then the two install commands. Each step runs
+independently, reading `SOFTKVM_TOKEN` from the environment (never a flag, §9):
+
+- `service install serve [PORT] [--state PATH] [--instance NAME]
+  [--no-advertise]`
+  (root): copies the running binary to `/usr/local/bin/soft-kvm` (`0755`, temp
+  file + rename; skipped when the running binary already is that path), writes
+  `/etc/soft-kvm/env` (`0600
+  root:root`) from the embedded template, and
+  installs/enables the canonical coordinator unit (§6.4). The unit's
+  `ProtectHome=yes` rules out a binary under home, which is why the binary is
+  copied rather than referenced. Re-running refreshes the binary and re-renders
+  the env file from the template — hand edits are discarded.
+- `service install connect [connect args]` (regular user; refuses root): writes
+  `~/.config/soft-kvm/env` (`0600`) and installs/enables the canonical agent
+  user unit, then points at `loginctl enable-linger` for boot-before-login. A
+  host running only the agent skips the serve step entirely.
+
+Both install steps validate their arguments with the same flag sets the
+`serve`/`connect` subcommands use — and everything those validate after parsing
+(the address normalisation, `--trigger`, the VID:PID list, the trailing
+switch-command chunks) — before writing anything, and bake the *raw* argument
+tokens, systemd-quoted, into `ExecStart=`. Re-serialising parsed flags would
+bake defaults read from the installer's environment — `serve`'s `--state`
+default under sudo would be root's path, defeating `StateDirectory=` (§6.4).
+Only the parsed `--trigger` counts: one inside a switch-command argv
+(`-- somecmd --trigger foo`) is baked as a switch-command argument, not honoured
+as the trigger.
+
+`service print serve|connect [args]` runs the same validation and rendering but
+no euid, token or on-disk checks, and writes nothing — the unit goes to stdout
+for review or piping. `service uninstall serve|connect` disables and removes the
+unit; the env files and `/usr/local/bin/soft-kvm` stay.
+
 ## 6. Host components
 
 ### 6.1 Linux host
@@ -415,7 +454,7 @@ Typical pair — keyboard and mouse on receiver channel 1 and BT channel 2:
 | Detector (primary) | HID device add/remove events via `telesma-app/hid` (netlink kernel uevents on `hidraw`, VID:PID from sysfs) — the same library and code path as macOS (§6.2). No udev rule, no forked processes, no cgo |
 | Guards             | None (always-on desktop)                                                                                                                                                                                |
 | Switch command     | Baked-in `ddcutil` default; user in `i2c` group — no sudo                                                                                                                                               |
-| Packaging          | NixOS: `systemd.user.services.soft-kvm` in the flake, `Restart=always`, `RestartSec=5`                                                                                                                  |
+| Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.6); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                       |
 
 **Detector specifics** — the parts that are easy to get wrong:
 
@@ -514,7 +553,10 @@ nothing.
 - State: declare `StateDirectory=soft-kvm` in the unit and the default `--state`
   lands in `/var/lib/soft-kvm/state.json` (system unit) or the user's own state
   directory (user unit), whatever `User=` it runs as. Token via
-  `EnvironmentFile=`, mode `0600`.
+  `EnvironmentFile=`, mode `0600`. `soft-kvm service install serve` writes it as
+  `0600 root:root` and installs the binary to `/usr/local/bin/soft-kvm` — the
+  unit's `ProtectHome=yes` rules out a binary under home (§5.6). The agent's
+  per-user copy is `~/.config/soft-kvm/env`, also `0600` (§6.1).
 - Avahi will fight `grandcat/zeroconf` for UDP 5353 if both try to own it. The
   library sets `SO_REUSEADDR`/`SO_REUSEPORT` and coexists; where it does not,
   register through Avahi with a static `/etc/avahi/services/soft-kvm.service`
@@ -673,10 +715,20 @@ binary that does not exist yet.
       the Mac and treat discovery as a Linux-only convenience
 - [ ] Kill the server, move it to the other host, restart: agents reconnect with
       no config change
+- [ ] Two-step `soft-kvm service install` (§5.6): bare `install` prints the
+      guidance; `install serve` under sudo installs `/usr/local/bin/soft-kvm`
+      and `/etc/soft-kvm/env` (`0600 root:root`); `install connect` as the user
+      writes `~/.config/soft-kvm/env` (`0600`)
+- [ ] Coordinator runs from the copied binary:
+      `systemctl status
+      soft-kvm-serve` is active (running) despite
+      `ProtectHome=yes` and a mode-0700 home
+- [ ] Agent runs from boot: `loginctl enable-linger`, reboot, the agent claims
+      before any login
 
 ## 11. Implementation notes
 
-**No CLI framework.** Five subcommands, one `flag.NewFlagSet` each, a switch on
+**No CLI framework.** Six subcommands, one `flag.NewFlagSet` each, a switch on
 `os.Args[1]`. Cobra costs two modules and actively hurts here: pflag parses
 flags interspersed with positional arguments, so `-vcp=inputSelect` inside the
 trailing switch command is read as an unknown flag unless interspersal is turned
