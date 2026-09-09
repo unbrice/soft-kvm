@@ -400,11 +400,16 @@ used; the handshake nudges a few times before giving up, because a dozing
 Bluetooth device can ignore the first requests until its vendor channel wakes.
 When the direct index stays silent to HID++ 2.0, one HID++ 1.0 register read
 settles it: receivers speak only 1.0 registers at `0xFF`, answered locally from
-their own flash, so even an error reply proves Logitech framing. Only the 7-byte
-short report (`0x10`) is sent: every HID++ device carries it, our requests never
-exceed its three parameter bytes, and Bolt receivers STALL the 20-byte
-`SET_REPORT` on their control pipe. Replies may still arrive long. Kinds come
-from `getDeviceType` (feature `0x0005`, function 2) — one byte, no name reads. A
+their own flash, so even an error reply proves Logitech framing. The 7-byte
+short report (`0x10`) is preferred: Bolt receivers STALL the 20-byte
+`SET_REPORT` on their control pipe. Replies may still arrive long. Bluetooth Low
+Energy peripherals (e.g. Ergo K860, Lift) omit `0x10` from their report
+descriptor and declare only the 20-byte long report (`0x11`). macOS refuses
+`0x10` on them with `kIOReturnNotFound`, so the request is resent as `0x11` and
+later ones go out long from the start. Linux never refuses an undeclared report:
+hidraw passes it through and BlueZ drops it, so paired with a Linux host these
+peripherals stay silent and the handshake times out. Kinds come from
+`getDeviceType` (feature `0x0005`, function 2) — one byte, no name reads. A
 receiver's slot map is its local pairing table (HID++ 1.0 register `0x2B5`,
 sub-registers `0x20+slot-1` on Unifying, `0x50+slot` on Bolt): on-chip flash, no
 RF, so it is right whether a paired device is awake, asleep, off, or switched to
@@ -740,6 +745,10 @@ binary that does not exist yet.
 - [ ] `hid-switch` (§5.5) moves the mouse from each host: over Bluetooth from
       the Mac (two-argument form), through the Bolt receiver from Linux (kind
       form and an explicit slot). `detect`'s slot map matches `solaar show`
+- [ ] `hid-switch` from the Mac reaches a Bluetooth LE peripheral that declares
+      no `0x10` (Ergo K860, Lift): `SOFTKVM_LOG=debug` shows `0x10` refused with
+      `0xe00002f0`, then `0x11`. Paired with Linux, the same peripheral times
+      out (§5.5)
 - [ ] Agent silent on battery; silent with display unplugged; resumes < 30 s
       after dock, including after a multi-hour lid-closed sleep
 - [ ] Off-LAN test (laptop on hotspot): zero claims, no error spam

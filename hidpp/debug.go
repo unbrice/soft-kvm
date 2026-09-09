@@ -26,7 +26,8 @@ import (
 // only. Set is the name to write at the current host, truncated to the
 // device's nameMaxLen; WriteBack rewrites the name already stored there.
 // Long frames each write as one 0x11 report per 14-byte chunk instead of one
-// 0x10 report per byte.
+// 0x10 report per byte — which goes out as 0x11 too, zero-padded, on an
+// interface that declares no 0x10.
 type HostsDebugOptions struct {
 	WriteBack bool
 	Set       string
@@ -258,7 +259,11 @@ func (d *hostsDebug) writeName(ctx context.Context, currHost uint8, target []byt
 		}
 		return
 	}
-	_, _ = fmt.Fprintf(d.w, "writing %q at host index %d: one 0x10 report per byte\n", target, currHost)
+	framing := "one 0x10 report per byte"
+	if d.c.long {
+		framing = "one 0x11 report per byte, zero-padded: the interface declares no 0x10"
+	}
+	_, _ = fmt.Fprintf(d.w, "writing %q at host index %d: %s\n", target, currHost, framing)
 	for off, b := range target {
 		_, err := d.call(ctx, fmt.Sprintf("0x1815 fn 4 setHostFriendlyName(%d, %d, %q)", currHost, off, string(b)),
 			false, d.featHostsInfo, fnHostsSetName, currHost, byte(off), b)
@@ -269,9 +274,9 @@ func (d *hostsDebug) writeName(ctx context.Context, currHost uint8, target []byt
 	}
 }
 
-// call performs one request, prints it with its raw bytes and its elapsed
-// time, and returns the reply parameters. Each exchange gets probeTimeout,
-// never the caller's deadline: one run is many exchanges.
+// call performs one request, prints it with the raw bytes that went out and
+// its elapsed time, and returns the reply parameters. Each exchange gets
+// probeTimeout, never the caller's deadline: one run is many exchanges.
 func (d *hostsDebug) call(ctx context.Context, label string, long bool, featIdx, fn uint8, params ...byte) ([]byte, error) {
 	build := buildReport
 	if long {
@@ -288,11 +293,12 @@ func (d *hostsDebug) call(ctx context.Context, label string, long bool, featIdx,
 		return matchReply(r, d.devIdx, featIdx, fn)
 	})
 	elapsed := time.Since(start).Round(time.Millisecond)
+	tx := d.c.frame(report) // long on an interface without 0x10
 	if rerr != nil {
-		_, _ = fmt.Fprintf(d.w, "%s  tx=% x  error: %v  (%s)\n", label, report, rerr, elapsed)
+		_, _ = fmt.Fprintf(d.w, "%s  tx=% x  error: %v  (%s)\n", label, tx, rerr, elapsed)
 		return nil, rerr
 	}
-	_, _ = fmt.Fprintf(d.w, "%s  tx=% x  rx=% x  (%s)\n", label, report, reply, elapsed)
+	_, _ = fmt.Fprintf(d.w, "%s  tx=% x  rx=% x  (%s)\n", label, tx, reply, elapsed)
 	return reply, nil
 }
 

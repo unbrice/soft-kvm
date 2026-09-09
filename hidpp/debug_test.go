@@ -22,6 +22,8 @@ import (
 // nbHost/currHost, 0x1815 fn 0/1/3 from its names, and applies fn 4 writes
 // to them. Long-framed (0x11) requests are answered only when longOK — with
 // it false they stall, the way Bolt receivers STALL the 20-byte SET_REPORT.
+// noShort refuses every short write the way macOS refuses a report missing
+// from a Bluetooth LE peripheral's descriptor.
 // Unknown requests queue no reply; inside a synctest bubble the resulting
 // silence costs fake time only.
 type hostsEmu struct {
@@ -35,6 +37,7 @@ type hostsEmu struct {
 	status      map[uint8]uint8
 	noHostsInfo bool // report 0x1815 as unsupported
 	longOK      bool
+	noShort     bool
 }
 
 // The feature indexes the emulated device resolves, matching what the
@@ -46,6 +49,9 @@ const (
 
 func (e *hostsEmu) Write(_ context.Context, p []byte) (int, error) {
 	e.writes = append(e.writes, slices.Clone(p))
+	if e.noShort && p[0] == reportShort {
+		return 0, errReportNotFound
+	}
 	if reply := e.answer(p); reply != nil {
 		e.push(reply)
 	}
@@ -286,6 +292,35 @@ func TestHostsDebugSetLongStalls(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestHostsDebugSetOnLongOnly(t *testing.T) {
+	// A Bluetooth LE peripheral on macOS: its descriptor has no 0x10, so the
+	// per-byte writes go out as 0x11 — and the transcript must show that.
+	emu := k860Emu()
+	emu.noShort = true
+	emu.names[0] = ""
+	out := runTranscript(t, emu, HostsDebugOptions{Set: "soft"})
+	if emu.names[0] != "soft" {
+		t.Errorf("name = %q, want %q", emu.names[0], "soft")
+	}
+	writes := emu.setNameWrites()
+	if len(writes) != len("soft") {
+		t.Fatalf("%d writes, want one per byte (%d)", len(writes), len("soft"))
+	}
+	for i, w := range writes {
+		if len(w) != 20 || w[0] != reportLong || w[6] != "soft"[i] {
+			t.Errorf("write %d = %x, want a 20-byte 0x11 report carrying %q", i, w, "soft"[i])
+		}
+	}
+	for _, want := range []string{
+		"one 0x11 report per byte, zero-padded",
+		"tx=11 02 0a 41 00 00 73 00 00", // setHostFriendlyName(0, 0, 's'), long
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("transcript omitted %q:\n%s", want, out)
+		}
+	}
 }
 
 func TestHostsDebugWriteBack(t *testing.T) {
