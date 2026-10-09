@@ -32,6 +32,12 @@ var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 // smaller than the client's internal /wait timeout.
 const DefaultWaitTimeout = 50 * time.Second
 
+// LiveGraceTime is how long a host stays live after its last /wait closed.
+// Every wake and every 204 closes the long-poll, and the agent re-opens it one
+// /state round trip later: without the grace the loser reads /state inside the
+// winner's gap and refuses to switch (SPEC §4.3).
+const LiveGraceTime = 30 * time.Second
+
 // Server carries the display bit and serves the /claim /state /wait API.
 type Server struct {
 	mu           sync.Mutex
@@ -43,6 +49,7 @@ type Server struct {
 	ownerChannel uint8
 	serverID     string
 	waiters      map[string]int
+	lastWait     map[string]time.Time // when each host's last /wait closed
 	broadcast    chan struct{}
 	waitTimeout  time.Duration
 }
@@ -66,10 +73,40 @@ func NewServer(statePath, token string) *Server {
 		ownerChannel: persisted.OwnerChannel,
 		serverID:     newUUID(),
 		waiters:      make(map[string]int),
+		lastWait:     make(map[string]time.Time),
 		broadcast:    make(chan struct{}),
 		waitTimeout:  DefaultWaitTimeout,
 	}
 	return s
+}
+
+// isLiveLocked reports whether id has an open /wait, or closed its last one
+// within the grace. Caller must hold s.mu.
+func (s *Server) isLiveLocked(id string) bool {
+	if s.waiters[id] > 0 {
+		return true
+	}
+	last, ok := s.lastWait[id]
+	return ok && time.Since(last) < LiveGraceTime
+}
+
+// liveLocked builds the /state live map: the owner is always present, every
+// other host only while live. It drops expired grace entries. Caller must hold
+// s.mu.
+func (s *Server) liveLocked() map[string]bool {
+	live := make(map[string]bool, len(s.waiters)+1)
+	live[s.owner] = false
+	for id := range s.waiters {
+		live[id] = true
+	}
+	for id := range s.lastWait {
+		if s.isLiveLocked(id) {
+			live[id] = true
+		} else {
+			delete(s.lastWait, id)
+		}
+	}
+	return live
 }
 
 // SetWaitTimeout configures the long-poll timeout. Exported for tests.
@@ -169,7 +206,7 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	force := r.URL.Query().Get("force")
-	if s.waiters[id] == 0 && force != "true" && force != "1" {
+	if !s.isLiveLocked(id) && force != "true" && force != "1" {
 		w.WriteHeader(http.StatusBadRequest)
 		maybeWriteJSON(w, map[string]string{"error": fmt.Sprintf("no live agent for %s", id)})
 		return
@@ -203,20 +240,12 @@ func (s *Server) CurrentState() state.ServerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	live := make(map[string]bool, len(s.waiters)+1)
-	live[s.owner] = false
-	for id, n := range s.waiters {
-		if n > 0 {
-			live[id] = true
-		}
-	}
-
 	return state.ServerState{
 		Owner:        s.owner,
 		Epoch:        s.epoch,
 		Since:        s.since,
 		OwnerChannel: s.ownerChannel,
-		Live:         live,
+		Live:         s.liveLocked(),
 		ServerID:     s.serverID,
 	}
 }
@@ -258,6 +287,7 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 			s.waiters[id]--
 			if s.waiters[id] <= 0 {
 				delete(s.waiters, id)
+				s.lastWait[id] = time.Now()
 			}
 			slog.Debug("wait deregistered", "id", id)
 			s.mu.Unlock()
@@ -282,18 +312,11 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 
 // serverStateLocked returns the ServerState snapshot while s.mu is held.
 func (s *Server) serverStateLocked() state.ServerState {
-	live := make(map[string]bool, len(s.waiters)+1)
-	live[s.owner] = false
-	for id, n := range s.waiters {
-		if n > 0 {
-			live[id] = true
-		}
-	}
 	return state.ServerState{
 		Owner:    s.owner,
 		Epoch:    s.epoch,
 		Since:    s.since,
-		Live:     live,
+		Live:     s.liveLocked(),
 		ServerID: s.serverID,
 	}
 }
