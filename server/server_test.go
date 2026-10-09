@@ -291,17 +291,10 @@ func TestServerStateLive(t *testing.T) {
 	mustStatus(t, waitResp, http.StatusNoContent)
 	_ = waitResp.Body.Close()
 
-	// After the waiter exits, mac is no longer live.
-	deadline = time.Now().Add(time.Second)
-	for {
-		st = s.CurrentState()
-		if !st.Live["mac"] {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("mac still live after wait closed: %+v", st.Live)
-		}
-		time.Sleep(5 * time.Millisecond)
+	// The closed wait leaves mac live for LiveGraceTime: the agent re-opens
+	// its long-poll one /state round trip later (SPEC §4.3).
+	if st = s.CurrentState(); !st.Live["mac"] {
+		t.Fatalf("mac not live inside the grace: %+v", st.Live)
 	}
 }
 

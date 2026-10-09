@@ -155,9 +155,12 @@ reach the monitor. Three conditions gate it, all required.
   boots while the bit says `mac` hands the display to a laptop that is not
   there.
 - **Winner liveness.** The server counts open `/wait` connections per host and
-  reports them in `/state` as `live`. The loser refuses to act when the winner
-  has no live agent. `soft-kvm activate` against a host with no live agent
-  requires `--force`.
+  reports them in `/state` as `live`. A host stays live for a grace period after
+  its last `/wait` closes (`server.LiveGraceTime`): every wake and every 204
+  closes the long-poll, and the agent re-opens it one `/state` round trip later,
+  so without the grace the loser reads `/state` inside the winner's gap. The
+  loser refuses to act when the winner has no live agent. `soft-kvm activate`
+  against a host with no live agent requires `--force`.
 - **DDC veto.** When `--check-cmd` is set, it must succeed. Non-zero exit means
   the input is already inactive: skip, and resynchronise `last_owner`. When
   `--check-cmd` is empty (the macOS default), the veto is skipped and the switch
@@ -634,11 +637,12 @@ display bit and nothing else.
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /claim/{id}?channel=N` | Idempotent. Increments `epoch` and wakes waiters **only on actual change**; `channel` (1-3, optional) is the claimant's own Easy-Switch channel and is refreshed even on an unchanged claim. → `200 {owner, epoch, changed}` · `400` unknown host or bad channel |
 | `GET /state`                 | → `200 {owner, epoch, since, live, server_id, owner_channel}`. `owner_channel` is 0 when the owner published none; it is always present, never omitted, so a client decoding into a reused struct cannot keep a stale one                                        |
-| `GET /wait?epoch=N&id=<me>`  | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration                                                                                                                                  |
+| `GET /wait?epoch=N&id=<me>`  | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration, plus the grace of §4.3                                                                                                          |
 
 - `since` is RFC 3339. `live` is `{"linux": true, "mac": false}`, derived from
-  currently-open `/wait` connections. `server_id` is a UUID regenerated on every
-  process start, so an agent can tell a restart from a state change.
+  open `/wait` connections plus the grace of §4.3. `server_id` is a UUID
+  regenerated on every process start, so an agent can tell a restart from a
+  state change.
 - **Clients treat `epoch` as opaque.** Adopt whatever the server returns; never
   compare numerically. A restored-from-backup or reset `state.json` moves the
   epoch backwards, and a client that only waits for `epoch > N` spins at line
