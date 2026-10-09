@@ -11,8 +11,10 @@
 package hidpp
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"syscall"
@@ -82,8 +84,9 @@ func TestParse(t *testing.T) {
 }
 
 func TestBuildReport(t *testing.T) {
-	// Every request is the 7-byte short report: the long report is a reply
-	// size — receivers STALL the 20-byte SET_REPORT on their control pipe.
+	// Requests are built as the 7-byte short report: receivers STALL the
+	// 20-byte SET_REPORT on their control pipe. conn.send reframes them long
+	// on an interface that declares no 0x10.
 	r := buildReport(0x02, 0x07, fnSetHost, []byte{0x01})
 	if len(r) != 7 {
 		t.Fatalf("report length = %d, want 7", len(r))
@@ -227,18 +230,23 @@ func (q *reportQueue) Close() error { return nil }
 
 // fakeConn is a scripted deviceConn: it records writes, and a write whose
 // report ID is wantID queues the scripted reply. writeErr and readErr fail
-// the corresponding operation.
+// the corresponding operation; shortErr fails short writes only — a
+// descriptor without 0x10.
 type fakeConn struct {
 	reportQueue
 	writes   [][]byte
 	wantID   byte
 	reply    []byte
 	writeErr error
+	shortErr error
 	readErr  error
 }
 
 func (f *fakeConn) Write(_ context.Context, p []byte) (int, error) {
 	f.writes = append(f.writes, slices.Clone(p))
+	if f.shortErr != nil && p[0] == reportShort {
+		return 0, f.shortErr
+	}
 	if f.writeErr == nil && f.reply != nil && p[0] == f.wantID {
 		f.push(slices.Clone(f.reply))
 	}
@@ -567,6 +575,9 @@ func TestFeatureWriteFallback(t *testing.T) {
 		{name: "no output report, feature denied", writeErr: notFound,
 			featureErr:   errors.New("IOHIDDeviceSetReport failed: 0xe00002e2"),
 			wantFeatures: 1, wantErr: errors.New("IOHIDDeviceSetReport failed: 0xe00002e2")},
+		// NotFound passes up: conn.send then tries the long report.
+		{name: "no such report at all", writeErr: notFound, featureErr: notFound,
+			wantFeatures: 1, wantErr: notFound},
 		{name: "other write error, no fallback", writeErr: syscall.EINVAL, wantErr: syscall.EINVAL},
 	}
 	for _, c := range cases {
@@ -586,6 +597,128 @@ func TestFeatureWriteFallback(t *testing.T) {
 			}
 			if len(emu.writes) != 1 {
 				t.Errorf("%d output writes, want 1", len(emu.writes))
+			}
+		})
+	}
+}
+
+// errReportNotFound is how macOS refuses a report its descriptor lacks
+// (kIOReturnNotFound), as the library renders IOKit errors.
+var errReportNotFound = errors.New("IOHIDDeviceSetReport failed: 0xe00002f0")
+
+// descriptorEmu is a featureReporter as macOS presents it: output and
+// feature list the report IDs its descriptor declares per type, and any
+// other report fails with kIOReturnNotFound. Each attempt is logged as type
+// and ID ("O10", "F11"); an accepted one draws reply.
+type descriptorEmu struct {
+	reportQueue
+	output, feature []byte
+	reply           []byte
+	log             []string
+}
+
+func (d *descriptorEmu) Write(_ context.Context, p []byte) (int, error) {
+	return len(p), d.set("O", d.output, p)
+}
+
+func (d *descriptorEmu) SendFeatureReport(p []byte) error {
+	return d.set("F", d.feature, p)
+}
+
+func (d *descriptorEmu) set(kind string, declared, p []byte) error {
+	d.log = append(d.log, fmt.Sprintf("%s%02x", kind, p[0]))
+	if !slices.Contains(declared, p[0]) {
+		return errReportNotFound
+	}
+	d.push(slices.Clone(d.reply))
+	return nil
+}
+
+// TestReportFraming sends two requests through conn and featureWriteFallback
+// for each descriptor shape. The first finds the framing that gets through;
+// the second must reuse the report size without relearning it, while the
+// report type is retried on every write.
+func TestReportFraming(t *testing.T) {
+	reply := []byte{reportLong, DeviceIndexDirect, 0x00, fnGetFeature<<4 | swID, 0x05}
+	cases := []struct {
+		name            string
+		output, feature []byte
+		want            string
+	}{
+		{"receiver: short output", []byte{reportShort, reportLong}, nil, "O10 | O10"},
+		{"Bluetooth LE: long output only", []byte{reportLong}, nil, "O10 F10 O11 | O11"},
+		{"short feature only", nil, []byte{reportShort}, "O10 F10 | O10 F10"},
+		{"long feature only", nil, []byte{reportLong}, "O10 F10 O11 F11 | O11 F11"},
+	}
+	for _, tc := range cases {
+		runSync(t, tc.name, func(t *testing.T) {
+			emu := &descriptorEmu{output: tc.output, feature: tc.feature, reply: reply}
+			c := &conn{dev: featureWriteFallback{emu}}
+			var rounds []string
+			for range 2 {
+				ctx, cancel := context.WithTimeout(t.Context(), probeTimeout)
+				_, err := c.getFeature(ctx, DeviceIndexDirect, featChangeHost)
+				cancel()
+				if err != nil {
+					t.Fatalf("getFeature = %v after %v", err, emu.log)
+				}
+				rounds = append(rounds, strings.Join(emu.log, " "))
+				emu.log = nil
+			}
+			if got := strings.Join(rounds, " | "); got != tc.want {
+				t.Errorf("attempts = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSendLong(t *testing.T) {
+	devIdx, featIdx, fn := uint8(0xFF), uint8(0x00), uint8(fnGetFeature)
+	fnSw := fn<<4 | swID
+	request := func(t *testing.T, c *conn) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), probeTimeout)
+		defer cancel()
+		return c.request(ctx, devIdx, featIdx, fn, 0x18, 0x14)
+	}
+
+	runSync(t, "resent long, zero-padded, and long it stays", func(t *testing.T) {
+		fake := &fakeConn{shortErr: errReportNotFound, wantID: reportLong,
+			reply: []byte{reportLong, devIdx, featIdx, fnSw, 0x05}}
+		c := &conn{dev: fake}
+		for range 2 {
+			if reply, err := request(t, c); err != nil || len(reply) == 0 || reply[0] != 0x05 {
+				t.Fatalf("request = %x, %v; want feature index 5", reply, err)
+			}
+		}
+		short := []byte{reportShort, devIdx, featIdx, fnSw, 0x18, 0x14, 0x00}
+		long := append([]byte{reportLong, devIdx, featIdx, fnSw, 0x18, 0x14}, make([]byte, 14)...)
+		if want := [][]byte{short, long, long}; !slices.EqualFunc(fake.writes, want, bytes.Equal) {
+			t.Errorf("writes = %x, want %x", fake.writes, want)
+		}
+	})
+
+	runSync(t, "the long write's error is the one returned", func(t *testing.T) {
+		tcc := errors.New("IOHIDDeviceSetReport failed: 0xe00002e2")
+		c := &conn{dev: &fakeConn{shortErr: errReportNotFound, writeErr: tcc}}
+		if _, err := request(t, c); !errors.Is(err, tcc) {
+			t.Errorf("request error = %v, want the Input Monitoring denial %v", err, tcc)
+		}
+		if c.long {
+			t.Error("a refused long write switched the interface to long reports")
+		}
+	})
+
+	// Linux refuses a report only on an interface that carries no HID++ at
+	// all — a USB STALL (EPIPE), a DJ node's EINVAL — where no other report
+	// helps: one write, no resend.
+	for _, werr := range []error{syscall.EPIPE, syscall.EINVAL} {
+		runSync(t, "linux "+werr.Error()+" is not resent", func(t *testing.T) {
+			fake := &fakeConn{writeErr: werr}
+			if _, err := request(t, &conn{dev: fake}); !errors.Is(err, werr) {
+				t.Errorf("request error = %v, want %v", err, werr)
+			}
+			if len(fake.writes) != 1 {
+				t.Errorf("%d writes, want 1", len(fake.writes))
 			}
 		})
 	}

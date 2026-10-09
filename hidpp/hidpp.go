@@ -23,8 +23,10 @@ import (
 )
 
 const (
-	reportShort = 0x10 // 7-byte HID++ report — all requests are sent short
-	reportLong  = 0x11 // 20-byte HID++ report — a reply size only
+	reportShort = 0x10 // 7-byte HID++ report — requests are built short
+	reportLong  = 0x11 // 20-byte HID++ report — replies, and requests where 0x10 is undeclared
+
+	reportLongLen = 20
 
 	// Error replies arrive in a normal short/long report; the sub-ID byte
 	// (report[2]) carries the error indicator, followed by the request's
@@ -343,8 +345,8 @@ type featureReporter interface {
 // interface's descriptor declares the report ID as Feature rather than
 // Output — Logitech's HID++ collection flattened into a Bluetooth device's
 // primary node on macOS, where IOHIDDeviceSetReport(kIOHIDReportTypeOutput,
-// 0x10) fails with kIOReturnNotFound. Linux's hidraw write() makes this
-// fallback itself, so it never triggers there. When the fallback ran, its
+// 0x10) fails with kIOReturnNotFound. Linux hidraw never consults the
+// descriptor, so it never triggers there. When the fallback ran, its
 // error is the one returned: the output-report failure is fully explained,
 // and a feature failure (NotPermitted — the Input Monitoring gate; NotFound
 // again — no such report at all) is the actionable one.
@@ -372,9 +374,11 @@ func isReportNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "0xe00002f0")
 }
 
-// conn is an open HID++ interface.
+// conn is an open HID++ interface. long is set once the interface has shown
+// it declares no short report: every short request then goes out long (send).
 type conn struct {
-	dev deviceConn
+	dev  deviceConn
+	long bool
 }
 
 // openInterface returns an HID++-answering interface of VID:PID. Vendor-defined
@@ -621,8 +625,7 @@ func (c *conn) request(ctx context.Context, devIdx, featIdx, fn uint8, params ..
 // report size. A link drop mid-exchange (EIO on Linux hidraw) comes back
 // wrapped in errLinkDropped. The caller's ctx deadline bounds the exchange.
 func (c *conn) exchange(ctx context.Context, report []byte, match func([]byte) ([]byte, error)) ([]byte, error) {
-	slog.Debug("hidpp: report out", "report", fmt.Sprintf("%x", report))
-	if _, err := c.dev.Write(ctx, report); err != nil {
+	if err := c.send(ctx, report); err != nil {
 		slog.Debug("hidpp: write failed", "error", err)
 		return nil, err
 	}
@@ -649,11 +652,38 @@ func (c *conn) exchange(ctx context.Context, report []byte, match func([]byte) (
 	}
 }
 
+// send writes one request. A short request the interface refuses for want
+// of a short report is resent long, and later ones go out long from the
+// start: Bluetooth LE peripherals declare only the long report (SPEC §5.5).
+// Only macOS reports the missing report (kIOReturnNotFound); Linux hidraw
+// sends any report ID as is, so a long-only peripheral paired with Linux
+// stays silent instead and the handshake times out. When the resend ran,
+// its error is the one returned: NotFound again means no HID++ report at
+// all, anything else (the Input Monitoring gate) is the actionable one.
+func (c *conn) send(ctx context.Context, report []byte) error {
+	if c.long && len(report) > 0 && report[0] == reportShort {
+		report = toLongReport(report)
+	}
+	slog.Debug("hidpp: report out", "report", fmt.Sprintf("%x", report))
+	_, err := c.dev.Write(ctx, report)
+	if !isReportNotFound(err) || report[0] != reportShort {
+		return err
+	}
+	long := toLongReport(report)
+	slog.Debug("hidpp: no short report, resending long", "error", err, "report", fmt.Sprintf("%x", long))
+	if _, err := c.dev.Write(ctx, long); err != nil {
+		return err
+	}
+	c.long = true
+	return nil
+}
+
 // buildReport frames a HID++ 2.0 request in the short report: report ID,
-// device index, feature index, function<<4|swID, then the parameters. Every
-// HID++ device carries the 7-byte short report and our requests never exceed
-// its 3 parameter bytes; the 20-byte long report is a reply size here —
-// Logitech receivers STALL the 20-byte SET_REPORT on their control pipe.
+// device index, feature index, function<<4|swID, then the parameters.
+// Receivers and most devices carry the 7-byte short report and our requests
+// never exceed its 3 parameter bytes; Logitech receivers STALL the 20-byte
+// SET_REPORT on their control pipe. An interface without the short report
+// gets each request resent long (send).
 func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
 	r := make([]byte, 7)
 	r[0] = reportShort
@@ -662,6 +692,16 @@ func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
 	r[3] = fn<<4 | swID
 	copy(r[4:], params)
 	return r
+}
+
+// toLongReport reframes a built short request as the 20-byte long report:
+// same header and parameters, zero-padded — how the Linux kernel's HID++
+// driver frames every 2.0 request.
+func toLongReport(short []byte) []byte {
+	long := make([]byte, reportLongLen)
+	long[0] = reportLong
+	copy(long[1:], short[1:])
+	return long
 }
 
 // matchReply picks the reply to a request out of the input stream. It
