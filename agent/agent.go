@@ -37,6 +37,7 @@ import (
 	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/discover"
 	"github.com/unbrice/soft-kvm/model"
+	"github.com/unbrice/soft-kvm/screen"
 	"github.com/unbrice/soft-kvm/state"
 	"golang.org/x/sync/errgroup"
 )
@@ -128,13 +129,14 @@ type Config struct {
 	Machine        *model.MachineConfig
 	AgentStatePath string
 	SwitchCommands [][]string
-	CheckArgv      []string
-	NotifyArgv     []string
-	CheckTimeout   time.Duration
-	SwitchTimeout  time.Duration
-	GuardPoll      time.Duration
-	BackoffBase    time.Duration
-	Resolver       *discover.Resolver
+	// ScreenRunner is the Runner the built-in screen-switch command drives
+	// its backend through; it reads the child's output (SPEC §5.6).
+	ScreenRunner  screen.Runner
+	NotifyArgv    []string
+	SwitchTimeout time.Duration
+	GuardPoll     time.Duration
+	BackoffBase   time.Duration
+	Resolver      *discover.Resolver
 	// OwnChannel reports the Easy-Switch channel (1-3) this host occupies on
 	// the trigger peripheral, so a claim can publish it for the loser to
 	// switch towards (SPEC §5.5). nil when there is nothing to ask.
@@ -177,6 +179,9 @@ type agent struct {
 	// hid-switch command carries no explicit host=N — the two run on
 	// different goroutines, so it is atomic rather than a plain field.
 	ownerChannel atomic.Uint32
+	// switchDone marks the switch commands that already succeeded in the
+	// current sequence. Only the action worker touches it.
+	switchDone []bool
 }
 
 // newBackoff returns a backoff using the configured base.
@@ -345,15 +350,12 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 				}
 			}
 			if act.Switch {
-				select {
-				case a.actionCh <- effectSwitch:
-				case <-ctx.Done():
-					return ctx.Err()
+				e := effectSwitch
+				if act.Retry {
+					e = effectSwitchRetry
 				}
-			}
-			if act.Probe {
 				select {
-				case a.actionCh <- effectProbe:
+				case a.actionCh <- e:
 				case <-ctx.Done():
 					return ctx.Err()
 				}

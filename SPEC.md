@@ -10,17 +10,17 @@ work; §10 is the integration pass, run at the end.
 
 ## 1. Context
 
-| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                             |
-| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Input-switch commands | Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` · macOS: BetterDisplay (`"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<code>`) — both are defaults baked into the binary, overridable via CLI args                                                                                                                                                                                                                                                                         |
-| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                          |
-| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                               |
-| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Implementation        | One Go binary, `soft-kvm`, six subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` / `service` — `detect` enumerates HID devices to help write `--trigger`, `hid-switch` is the standalone form of the built-in switch command). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) |
+| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Input-switch commands | The built-in `screen-switch` (§5.6), which delegates per OS. Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` for this LG, then a read to confirm · macOS: BetterDisplay (`"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<code>`). Nothing is baked in as a default: `detect` prints the command for this host                                                                                                                                                                                                                                   |
+| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                                                                                              |
+| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Implementation        | One Go binary, `soft-kvm`, seven subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` / `screen-switch` / `service` — `detect` enumerates HID devices and probes the monitor to print the `connect` line, `hid-switch` and `screen-switch` are the standalone forms of the built-in switch commands). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) |
 
 ## 2. Goals / non-goals
 
@@ -78,8 +78,9 @@ work; §10 is the integration pass, run at the end.
 10. **A DDC write that returns success may still not take effect.** The bus is
     unacknowledged in practice: the monitor can NAK, arrive busy, or be waking
     from standby, and `--noverify` means nothing reads the result back. Working
-    by hand is not the same as working every time, so the switch is confirmed
-    locally and retried, and the human is told when it does not land (§4.3).
+    by hand is not the same as working every time, so `screen-switch` confirms
+    the switch itself, the agent retries on its exit code, and the human is told
+    when it does not land (§4.3).
 11. **Switching inputs drops the video link on the input being left**, unless
     the LG's *Deep Sleep* setting is off. A dropped link means the losing host
     sees a monitor hot-unplug: Hyprland collapses workspaces, macOS rearranges
@@ -125,8 +126,8 @@ work; §10 is the integration pass, run at the end.
 2. Mac's `soft-kvm connect`: `POST /claim/mac` (idempotent).
 3. Server: owner changed → `epoch++` → wake all `/wait` long-polls.
 4. Linux agent wakes, reconciles via `GET /state`. It switches because **it was
-   the owner and no longer is** (`last_owner == linux`, `owner == mac`), the
-   winner is live, and its DDC veto passes.
+   the owner and no longer is** (`last_owner == linux`, `owner == mac`) and the
+   winner is live.
 5. Linux runs its switch commands; the monitor moves to the Mac's input.
 6. The Mac executes nothing display-related — by design, it can't (finding 1).
 
@@ -143,7 +144,7 @@ command tells you anything about the other, and both are verified separately.
 ### 4.3 What authorises a switch
 
 A switch is a one-way door: after running it, the host that ran it can no longer
-reach the monitor. Three conditions gate it, all required.
+reach the monitor. Two conditions gate it, both required.
 
 - **Ownership transition.** The agent persists `last_owner` locally
   (`$XDG_STATE_HOME/soft-kvm/agent.json`,
@@ -161,34 +162,35 @@ reach the monitor. Three conditions gate it, all required.
   so without the grace the loser reads `/state` inside the winner's gap. The
   loser refuses to act when the winner has no live agent. `soft-kvm activate`
   against a host with no live agent requires `--force`.
-- **DDC veto.** When `--check-cmd` is set, it must succeed. Non-zero exit means
-  the input is already inactive: skip, and resynchronise `last_owner`. When
-  `--check-cmd` is empty (the macOS default), the veto is skipped and the switch
-  operates in fire-and-forget mode.
+
+Nothing probes the monitor before the switch. A read that says "my input is
+already inactive" cannot be told from a read that failed because DDC is not
+wired up, and treating the second as the first makes a broken setup look like a
+finished handover. A switch aimed at an input the monitor already shows costs a
+write the monitor ignores, at worst one notification (§8).
 
 **Circuit breaker:** 5 s cooldown after any switch, and 3 switches within 30 s
 disables switching for 60 s with a log line. A misbehaving detector costs one
 manual OSD press, not a loop.
 
-**Confirming it landed, and what happens when it does not.** When `--check-cmd`
-is set, the write is fire-and-forget (finding 10), so the loser confirms
-locally, using the probe it already has: a switch that worked makes
-`--check-cmd` start *failing*, because this host's input is no longer active.
-The falling edge is the receipt. When `--check-cmd` is empty, exit 0 from the
-switch commands confirms the switch immediately; a non-zero exit retries up to
-`--switch-retries` (1 s apart) and then notifies. The switch command is bounded
-twice: glue-side by `--switch-timeout` (default 30 s, SIGTERM then SIGKILL after
+**Confirming it landed, and what happens when it does not.** A switch command
+exits 0 only when its switch landed; that exit code is the only receipt the
+agent reads. `screen-switch` earns it on Linux by reading the monitor back after
+the fire-and-forget write (finding 10, §5.6); on macOS, and for any external
+command, exit 0 is taken at its word. The switch command is bounded twice:
+glue-side by `--switch-timeout` (default 30 s, SIGTERM then SIGKILL after
 `WaitDelay`), and machine-side by a 60 s watchdog. Either failure feeds the same
 retry/notify path and counts toward the circuit breaker like any other failure.
-Results are accepted only while their effect is outstanding — a late
-`SwitchExit` or `ProbeExit` is ignored and logged — and a confirm window with a
-probe still in flight waits for it instead of closing on absent evidence.
+A result is accepted only while its effect is outstanding — a late `SwitchExit`
+is ignored and logged.
 
-1. Run the switch commands, in order.
-2. Poll `--check-cmd` every 500 ms for `--confirm 4s`. It goes non-zero ⇒ done.
-3. Still succeeding, or the command died or never reported ⇒ the monitor did not
-   move. Retry the switch, up to `--switch-retries 3`, 1 s apart.
-4. Still succeeding after the last retry ⇒ run `--notify-cmd` and stop. The user
+1. Run the switch commands, in order. One failing does not skip the rest: they
+   target independent devices.
+2. All exit 0 ⇒ done.
+3. Any non-zero exit, or a command that died or never reported ⇒ re-run **only
+   the commands that failed**, up to `--switch-retries 3`, at least 1 s apart. A
+   peripheral that `hid-switch` already moved is not chased again.
+4. Still failing after the last retry ⇒ run `--notify-cmd` and stop. The user
    presses the OSD Input button, which is one press and always available (§2),
    and §13 makes the keyboard follow that press.
 
@@ -197,7 +199,7 @@ the only host the user can read at that moment. Nothing re-claims and nothing
 reverts: the shared bit is already right, the keyboard is already where the user
 put it, and only the pixels are behind.
 
-This is the loser's own probe rather than a winner-side check, because the
+The receipt is the loser's own read rather than a winner-side check, because the
 winner's DDC reads are the least trustworthy thing available — on macOS
 BetterDisplay may not read the value back at all, and on a display that just
 became active the read races the link coming up.
@@ -303,37 +305,25 @@ Server resolution as §5.1, so it works from any LAN host with only the token.
 points the monitor at a host that cannot switch it back. Use cases: recovery
 from a mis-flip, testing, "just switch now".
 
-### 5.4 `soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]`
+### 5.4 `soft-kvm connect [flags] -- CMD ARGS... [-- CMD ARGS...]`
 
 The host agent: detector, claimer, watcher, and the switch commands, in one
-long-running process. Everything has a per-OS default; with discovery there are
-no required arguments.
+long-running process. Two things have no default, because they are this host's
+wiring and nothing else knows it: `--trigger` and the switch command. `connect`
+refuses to start without either and points at `soft-kvm detect`, which prints
+both.
 
-| Flag / arg              | Default (Linux)                                              | Default (macOS)                                                                                                      | Meaning                                                                                                                                                                                                                                                                                                                            |
-| ----------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--id ID`               | `linux`                                                      | `mac`                                                                                                                | Claimed identity (from `GOOS`; override for testing)                                                                                                                                                                                                                                                                               |
-| `-- SWITCH-CMD ARGS...` | `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` | `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<linux-input-code>` | Command that points the monitor at the **other** host; run by the *losing* agent. Repeat after a bare `--` for each additional command (e.g. display, then a USB device) — they run in order, the display probe stays the receipt. A command named `hid-switch` is built in, not exec'd (§5.5)                                     |
-| `--check-cmd CMD`       | `ddcutil getvcp 60`                                          | —                                                                                                                    | Veto before the switch, receipt after it (§4.3); empty on macOS (fire-and-forget switch)                                                                                                                                                                                                                                           |
-| `--check-timeout 10s`   | 10s                                                          | 10s                                                                                                                  | Bound on one `--check-cmd` run — a hung I²C read must not stall the confirm loop (§4.3)                                                                                                                                                                                                                                            |
-| `--switch-timeout 30s`  | 30s                                                          | 30s                                                                                                                  | Bound on one `SWITCH-CMD` run — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                  |
-| `--trigger LIST`        | required                                                     | required                                                                                                             | Comma-separated `VID:PID` or `VID:PID:SLOT` filters for the trigger detector. `VID:PID` watches a HID node that genuinely comes and goes — a moved receiver, a Bluetooth keyboard (§6.3). `VID:PID:SLOT` watches one pairing slot of a receiver that stays plugged in (§6.1). `soft-kvm detect` lists candidates in the right form |
-| `--settle 2s`           | 2s                                                           | 2s                                                                                                                   | Attach must persist this long before claiming                                                                                                                                                                                                                                                                                      |
-| `--confirm 4s`          | 4s                                                           | 4s                                                                                                                   | How long `--check-cmd` may keep succeeding before the switch counts as failed                                                                                                                                                                                                                                                      |
-| `--switch-retries 3`    | 3                                                            | 3                                                                                                                    | Re-runs of the switch commands, 1 s apart, before giving up                                                                                                                                                                                                                                                                        |
-| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'`        | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`                             | Run when the switch cannot be confirmed after the last retry                                                                                                                                                                                                                                                                       |
-| `--no-guards`           | implicit                                                     | —                                                                                                                    | macOS guards: AC power + dock present (§6.2)                                                                                                                                                                                                                                                                                       |
-| `SOFTKVM_TOKEN`         | required                                                     | required                                                                                                             | Shared secret                                                                                                                                                                                                                                                                                                                      |
-
-`-productNameLike=<name>` (or the monitor's actual name substring) can be added
-to `-- SWITCH-CMD` if multiple external displays are attached. The two switch
-commands take codes from different namespaces. BetterDisplay writes the standard
-VCP `0x60` and uses its values — DP=15, DP2=16, HDMI=17, HDMI2=18, USB-C/TB≈25 —
-but the monitor's real per-port codes are whatever §10 records, and vendors
-deviate.[^5^] `ddcutil` writes the LG-specific VCP `0xF4`, whose codes come from
-this monitor's firmware: DisplayPort `0xD0` (fallback `0x06`), TB/USB-C `0xD1`,
-HDMI 1 `0x90`, HDMI 2 `0x91`. `--noverify` is load-bearing, not a shortcut:
-read-back verification fails on this firmware, so a verifying write reports
-failure after succeeding.
+| Flag / arg              | Default (Linux)                                       | Default (macOS)                                                                          | Meaning                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--id ID`               | `linux`                                               | `mac`                                                                                    | Claimed identity (from `GOOS`; override for testing)                                                                                                                                                                                                                                                                                                            |
+| `-- SWITCH-CMD ARGS...` | required                                              | required                                                                                 | Command that points the monitor at the **other** host; run by the *losing* agent, and exits 0 only when the switch landed (§4.3). Repeat after a bare `--` for each additional command (e.g. display, then a USB device) — they run in order. Commands named `screen-switch` (§5.6) and `hid-switch` (§5.5) are built in, not exec'd, and are parsed at startup |
+| `--switch-timeout 30s`  | 30s                                                   | 30s                                                                                      | Bound on one `SWITCH-CMD` run, its own confirmation included — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                |
+| `--trigger LIST`        | required                                              | required                                                                                 | Comma-separated `VID:PID` or `VID:PID:SLOT` filters for the trigger detector. `VID:PID` watches a HID node that genuinely comes and goes — a moved receiver, a Bluetooth keyboard (§6.3). `VID:PID:SLOT` watches one pairing slot of a receiver that stays plugged in (§6.1). `soft-kvm detect` lists candidates in the right form                              |
+| `--settle 2s`           | 2s                                                    | 2s                                                                                       | Attach must persist this long before claiming                                                                                                                                                                                                                                                                                                                   |
+| `--switch-retries 3`    | 3                                                     | 3                                                                                        | Re-runs of the switch commands that failed, at least 1 s apart, before giving up                                                                                                                                                                                                                                                                                |
+| `--notify-cmd CMD`      | `notify-send 'soft-kvm' 'Press Input on the monitor'` | `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'` | Run when the switch still fails after the last retry                                                                                                                                                                                                                                                                                                            |
+| `--no-guards`           | implicit                                              | —                                                                                        | macOS guards: AC power + dock present (§6.2)                                                                                                                                                                                                                                                                                                                    |
+| `SOFTKVM_TOKEN`         | required                                              | required                                                                                 | Shared secret                                                                                                                                                                                                                                                                                                                                                   |
 
 **Behavior:**
 
@@ -431,7 +421,83 @@ a list, one entry per device that can carry one:
 - `-- hid-switch 046d:c52b -- hid-switch 046d:c548`
 - By hand, with an explicit target: `soft-kvm hid-switch 046d:c548:3 host=2`
 
-### 5.6 `soft-kvm service <install|print|uninstall> [serve|connect] [args]`
+### 5.6 The `screen-switch` virtual command
+
+A switch command whose first word is `screen-switch` is never exec'd: it runs
+in-process and drives the monitor through the program this OS has for it. One
+spelling works on both hosts, and the command — not the agent — is what knows
+whether the switch landed.
+
+```
+screen-switch INPUT [TABLE] [display=MATCH]
+```
+
+- **`INPUT`** is the port the *other* host is plugged into: one of the table's
+  aliases, or a raw value (`0x1B`, `27`) written as is, for a port the table
+  lacks. The aliases belong to the table — a command is always about one
+  monitor, so no list of inputs spans them.
+- **`TABLE`** names how this monitor wants its input selected; omitted, it is
+  `standard`. `screen-switch` never guesses it. `soft-kvm detect` reads the
+  monitor's manufacturer and prints the table when the brand needs one.
+- **`display=MATCH`** picks one monitor when several are attached: `--model` on
+  Linux, `-nameLike=` on macOS.
+
+| Table        | Writes                            | Aliases                                                                    | `detect` picks it for   |
+| ------------ | --------------------------------- | -------------------------------------------------------------------------- | ----------------------- |
+| `standard`   | VCP `0x60`, MCCS Input Source     | `dp1` `0x0F`, `dp2` `0x10`, `hdmi1` `0x11`, `hdmi2` `0x12`, `usbc1` `0x1B` | everything else         |
+| `lg` (Linux) | VCP `0xF4` from I²C source `0x50` | `dp1` `0xD0`, `hdmi1` `0x90`, `hdmi2` `0x91`, `usbc1` `0xD1`               | EDID manufacturer `GSM` |
+
+`lg` exists on Linux only. `0xF4` is LG's private side channel: firmware that
+ignores `0x60` writes from `ddcutil` honours it. A vendor table describes what a
+backend that writes raw VCP features must send, so macOS has none —
+BetterDisplay does that translation itself, and naming a table there is an
+unknown-table error. MCCS defines Input Source values up to HDMI 2 (`0x12`) and
+nothing for USB-C: `usbc1` as `0x1B` is a convention, and vendors deviate,[^5^]
+which is what a raw `INPUT` is for. A vendor is one more row.
+
+**Linux — `ddcutil`, write then confirm.** The write is
+`ddcutil setvcp <vcp> <value> --noverify`, plus `--i2c-source-addr` when the
+table sets one. `--noverify` is load-bearing, not a shortcut: read-back
+verification fails on firmware that goes silent on the input it just left, so a
+verifying write reports failure after succeeding. The receipt is this host's own
+`ddcutil getvcp 60`, polled every 500 ms for 4 s:
+
+- the read **fails** ⇒ the monitor no longer answers on this input (§1) ⇒ exit
+  0;
+- the read returns the **target's** value ⇒ the monitor shows the target and
+  still answers ⇒ exit 0. That covers a monitor that answers on every input, and
+  a switch to the port this host is already on. A table that writes `0x60` reads
+  back what it wrote; `lg` writes another feature and is assumed to report the
+  standard value for the port — measured for `dp1`, which reads `0x0F`. A raw
+  `INPUT` written to another feature has no known read-back, so silence is its
+  only receipt;
+- it still answers with anything else when the window closes ⇒ non-zero, and the
+  agent retries (§4.3).
+
+A write that fails — `ddcutil` missing, no `i2c-dev`, no permission — exits
+non-zero with `ddcutil`'s own message, so a broken setup reads as a failed
+switch and a notification, never as a finished one.
+
+**macOS — BetterDisplay, fire and forget.**
+`BetterDisplay set -ddc -vcp=inputSelect -value=<value>`; exit 0 is the only
+receipt, because DDC reads are unreliable from macOS on this class of link.
+BetterDisplay takes the standard value and does any per-monitor translation
+itself, which is why `standard` is the only table there.
+
+`soft-kvm screen-switch INPUT [TABLE] [display=MATCH]` runs the same command by
+hand, with no server and no token: the way to find `INPUT` before installing. A
+wrong guess costs one press of the monitor's Input button.
+
+**What `detect` contributes.** It runs the backend once and prints the
+`screen-switch` action inside each suggested `connect` line, with `DP1_HDMI_ETC`
+left in place of `INPUT` as a placeholder — which port the other host uses is
+the one fact no host can read. On Linux it names each monitor `ddcutil detect`
+reaches, the table its manufacturer maps to, and the port this host is on, so
+that one is not offered as the target. When the backend fails it prints the
+backend's error instead: "`ddcutil` requires module `i2c-dev`" at setup time,
+not on the first switch.
+
+### 5.7 `soft-kvm service <install|print|uninstall> [serve|connect] [args]`
 
 Systemd install/print/uninstall for both roles, Linux only; on macOS the
 subcommand refuses with a pointer to launchd (§6.2). Bare `service install`
@@ -478,8 +544,8 @@ unit; the env files and `/usr/local/bin/soft-kvm` stay.
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Detector (primary) | Two sources, fanned into one attach channel. `VID:PID`: HID device add/remove events via `telesma-app/hid` (netlink kernel uevents on `hidraw`, VID:PID from sysfs) — the same library and code path as macOS (§6.2). `VID:PID:SLOT`: the receiver's own device-connection notifications, read from its HID++ interface (needs the §5.5 hidraw rule) |
 | Guards             | None (always-on desktop)                                                                                                                                                                                                                                                                                                                             |
-| Switch command     | Baked-in `ddcutil` default; user in `i2c` group — no sudo                                                                                                                                                                                                                                                                                            |
-| Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.6); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                                                                                                                                                                    |
+| Switch command     | `screen-switch` through `ddcutil` (§5.6); user in `i2c` group — no sudo                                                                                                                                                                                                                                                                              |
+| Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.7); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                                                                                                                                                                    |
 
 **Detector specifics** — the parts that are easy to get wrong:
 
@@ -529,11 +595,11 @@ environment.systemPackages = [ pkgs.ddcutil ];
 ```
 
 `--i2c-source-addr` is a recent ddcutil flag; check `ddcutil --version` before
-trusting the baked-in default. On a DisplayPort link the DDC channel rides DP
-AUX, so the `/dev/i2c-N` number is created by the `xe` driver and **changes on
-monitor hotplug and across reboots**. Do not pin `--bus`; pin `--model` or
-`--sn`, or let ddcutil scan and accept the ~1–3 s cost. If reads are flaky, try
-`--sleep-multiplier 2`.
+trusting the `lg` table. On a DisplayPort link the DDC channel rides DP AUX, so
+the `/dev/i2c-N` number is created by the `xe` driver and **changes on monitor
+hotplug and across reboots**. Do not pin `--bus`; `display=MATCH` pins
+`--model`, or let ddcutil scan and accept the ~1–3 s cost. If reads are flaky,
+try `--sleep-multiplier 2`.
 
 ### 6.2 macOS host (corp laptop)
 
@@ -541,7 +607,7 @@ monitor hotplug and across reboots**. Do not pin `--bus`; pin `--model` or
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Guards             | `pmset -g ps` contains `AC Power`, and the LG is present                                                                                                                                                                                                                                        |
 | Detector (primary) | `IOHIDManager` device-matching events filtered to VID:PID, via `telesma-app/hid` (purego — dynamic FFI, no cgo, static binary preserved); the same library and code path as Linux (§6.1). No `IOHIDManagerOpen`: enumeration callbacks need no device access, so no Input-Monitoring TCC prompt |
-| Switch command     | Baked-in BetterDisplay default (§5). BetterDisplay must be running. **Verify against findings 9 and 10 first**                                                                                                                                                                                  |
+| Switch command     | `screen-switch` through BetterDisplay (§5.6). BetterDisplay must be running. **Verify against findings 9 and 10 first**                                                                                                                                                                         |
 | Packaging          | `~/Library/LaunchAgents/local.soft-kvm.plist` (`RunAtLoad`, `KeepAlive`), token in a `0600` env file, log to `~/Library/Logs/`                                                                                                                                                                  |
 | Installs           | One binary + one plist. `pmset` is stock; BetterDisplay is at `/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay`                                                                                                                                                                    |
 
@@ -603,7 +669,7 @@ nothing.
   directory (user unit), whatever `User=` it runs as. Token via
   `EnvironmentFile=`, mode `0600`. `soft-kvm service install serve` writes it as
   `0600 root:root` and installs the binary to `/usr/local/bin/soft-kvm` — the
-  unit's `ProtectHome=yes` rules out a binary under home (§5.6). The agent's
+  unit's `ProtectHome=yes` rules out a binary under home (§5.7). The agent's
   per-user copy is `~/.config/soft-kvm/env`, also `0600` (§6.1).
 - Avahi will fight `grandcat/zeroconf` for UDP 5353 if both try to own it. The
   library sets `SO_REUSEADDR`/`SO_REUSEPORT` and coexists; where it does not,
@@ -662,13 +728,13 @@ display bit and nothing else.
 | Coordinator unreachable                                           | Claims logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the two agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                                                                                                                                                                            |
 | Mac away / on battery / undocked                                  | Guards suppress everything; bit may change without the Mac — harmless, because the loser also requires the winner to be live                                                                                                                                                                                                                                                                                                                                                   |
 | Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                                                                                                                                                                    |
-| Monitor already on claimant's input                               | Loser's `--check-cmd` fails → no-op, `last_owner` resynced                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Monitor already on claimant's input                               | The loser switches anyway: nothing probes first (§4.3). The monitor ignores the write and no longer answers the read, so `screen-switch` exits 0; where the write itself errors on the inactive input, the retries run and the loser notifies once                                                                                                                                                                                                                             |
 | Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                                                                                                                                                                        |
 | Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change                                                                                                                                                                                                                                                                                                                                                                                |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network. `soft-kvm activate` does *not* help: the newly-designated loser is the absent host, and it is the one that would have to run DDC. With Auto Input Switch off, the OSD button is the only recovery — and unlike the failed-write case, no agent is left able to notify. The §4.3 gates exist to make this state unreachable                                                                                                                     |
-| Switch command exits 0 but the monitor does not move              | `--check-cmd` keeps succeeding past `--confirm`; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                                                                                                                                                   |
+| Switch write succeeds but the monitor does not move               | `screen-switch` keeps reading this input past its 4 s window and exits non-zero; retry up to `--switch-retries`, then notify and stop. The bit stays correct and the user presses OSD (§4.3)                                                                                                                                                                                                                                                                                   |
 | Switch command hangs / `SwitchExit` is lost                       | `--switch-timeout` SIGTERMs the child; if the result still never arrives, the 60 s machine watchdog counts the attempt as failed, retries, then notifies and logs "no SwitchExit within …" (§4.3)                                                                                                                                                                                                                                                                              |
-| Effect result arrives after its sequence ended                    | Ignored and logged as "ignoring late SwitchExit/ProbeExit"; the machine only accepts results while the matching effect is outstanding (§4.3)                                                                                                                                                                                                                                                                                                                                   |
+| Effect result arrives after its sequence ended                    | Ignored and logged as "ignoring late SwitchExit"; the machine only accepts a result while its effect is outstanding (§4.3)                                                                                                                                                                                                                                                                                                                                                     |
 | Switch fails while the monitor is in standby                      | Same path, and the retries usually cover it — a monitor waking from standby answers DDC a second or two late                                                                                                                                                                                                                                                                                                                                                                   |
 | Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the losing host: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                                                                                                                                                                      |
 | mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                                                                                                                                                              |
@@ -728,14 +794,21 @@ binary that does not exist yet.
       there is no detector, and no detector means no trigger
 - [ ] Per-port VCP codes recorded for every input in use, from both hosts
 - [ ] Switch fails on purpose (unplug the LG's other input, or point the command
-      at a code no port uses): `--check-cmd` keeps succeeding, retries run,
+      at a code no port uses): `screen-switch` exits non-zero, retries run,
       notification appears on the losing host, no reclaim loop
 - [ ] `ddcutil getvcp 60` succeeds **iff** the Linux input is active — and
-      confirm it still succeeds after the monitor sleeps and wakes, since the
-      probe is both the veto and the receipt (§4.3)
+      confirm it still succeeds after the monitor sleeps and wakes, since that
+      read is `screen-switch`'s receipt (§5.6)
+- [ ] `soft-kvm screen-switch <mac-port>` with **no table** from Linux: if the
+      LG honours the standard `0x60` write, `GSM` should not map to `lg`
+- [ ] `soft-kvm detect` on each host names the monitor, the table and this
+      host's own port; `ddcutil detect --terse` and `getvcp 60 --terse` output
+      matches what the parsers were written against
+- [ ] The monitor is already on the other input when the loser switches: note
+      whether `ddcutil setvcp --noverify` errors or is silently ignored (§8)
 - [ ] Fifty switches back and forth: count how many needed a retry. If retries
-      are common rather than rare, `--confirm` and `--switch-retries` need
-      different numbers than the guessed 4 s and 3
+      are common rather than rare, the 4 s confirm window and `--switch-retries`
+      need different numbers than the guessed 4 s and 3
 - [ ] Re-claim the current owner fifty times: the epoch never moves and no agent
       wakes (idempotent claims, §7)
 - [ ] Claim-to-pixels latency on the end-to-end pass: ≤ 10 s — settle and
@@ -772,7 +845,7 @@ binary that does not exist yet.
       the Mac and treat discovery as a Linux-only convenience
 - [ ] Kill the server, move it to the other host, restart: agents reconnect with
       no config change
-- [ ] Two-step `soft-kvm service install` (§5.6): bare `install` prints the
+- [ ] Two-step `soft-kvm service install` (§5.7): bare `install` prints the
       guidance; `install serve` under sudo installs `/usr/local/bin/soft-kvm`
       and `/etc/soft-kvm/env` (`0600 root:root`); `install connect` as the user
       writes `~/.config/soft-kvm/env` (`0600`)
@@ -785,7 +858,7 @@ binary that does not exist yet.
 
 ## 11. Implementation notes
 
-**No CLI framework.** Six subcommands, one `flag.NewFlagSet` each, a switch on
+**No CLI framework.** Seven subcommands, one `flag.NewFlagSet` each, a switch on
 `os.Args[1]`. Cobra costs two modules and actively hurts here: pflag parses
 flags interspersed with positional arguments, so `-vcp=inputSelect` inside the
 trailing switch command is read as an unknown flag unless interspersal is turned
@@ -797,23 +870,25 @@ ignore a flag placed after a positional in the subcommands that take no trailing
 command, so `serve`, `activate` and `detect` reject any argument past their
 positionals, with a hint when the extra looks like a flag.
 
-**Package layout.** One module, one binary, ten packages under the root `main`:
-`state` (the `/state` wire type and atomic JSON persistence), `model` (§11.3),
-`identity` (TLS identity and `kh=` fingerprint from the shared secret),
+**Package layout.** One module, one binary, eleven packages under the root
+`main`: `state` (the `/state` wire type and atomic JSON persistence), `model`
+(§11.3), `identity` (TLS identity and `kh=` fingerprint from the shared secret),
 `discover` (mDNS advertise/browse; the address cache sits behind a `Resolver`
 whose cache path is injected), `platform` (the argv runner, the per-OS defaults,
 and the per-OS `Guard` — a concrete type: no-op on Linux, pmset+display on
 macOS), `detect` (HID enumeration for the subcommand, and the two attach
 detectors both OSes share), `hidpp` (Logitech HID++ changeHost — the
-`hid-switch` virtual command, §5.5), `client`, `server`, and `agent`
-(supervisor, generations, decision loop, claims; the `Detector`, `Guard` and
-`Runner` seams live here, in their only consumer). `main` keeps flag parsing and
-wiring. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
-`platform`, `hidpp`) import nothing internal; `detect` imports `hidpp`; `model`
-imports `state`; `client` imports `state` and `identity`; `server` those two and
-`hidpp` (the channel bound it validates on a claim); `agent` imports `model`,
-`state`, `client`, `discover` and `hidpp`. Build tags in filenames, not in
-`//go:build` lines, wherever the split is per-OS (`platform`).
+`hid-switch` virtual command, §5.5), `screen` (the `screen-switch` virtual
+command: aliases, mapping tables and the per-OS backends, §5.6), `client`,
+`server`, and `agent` (supervisor, generations, decision loop, claims; the
+`Detector`, `Guard` and `Runner` seams live here, in their only consumer).
+`main` keeps flag parsing and wiring. Layering is a DAG: the leaves (`state`,
+`identity`, `discover`, `platform`, `hidpp`, `screen`) import nothing internal;
+`detect` imports `hidpp`, `platform` and `screen`; `model` imports `state`;
+`client` imports `state` and `identity`; `server` those two and `hidpp` (the
+channel bound it validates on a claim); `agent` imports `model`, `state`,
+`client`, `discover`, `hidpp` and `screen`. Build tags in filenames, not in
+`//go:build` lines, wherever the split is per-OS (`platform`, `screen`).
 
 **Logging is `log/slog`** to stderr, text handler — journald on Linux, the
 LaunchAgent log file on macOS. Every switch decision logs at Info with the
@@ -870,11 +945,13 @@ power" and "dormant, no LG" are different bug reports.
 What does *not* get an interface:
 
 - **The display.** There is one implementation — run this argv slice — for the
-  switch, the probe, the notification, and later the flip. The seam tests need
-  is the runner, so it is a func type, not an interface:
+  switch, the notification, and later the flip. The seam tests need is the
+  runner, so it is a func type, not an interface:
   `type Runner func(ctx context.Context, argv []string) error` — defined in
   `agent`, implemented by `platform.Run`. A fake runner records calls and
-  returns canned exit codes.
+  returns canned exit codes. `screen` has the same seam with the child's output
+  added (`screen.Runner`, implemented by `platform.Output`), because its receipt
+  is a value it reads back.
 - **The server client.** Tests point the real client at `httptest.NewServer`
   wrapping the real handler, which exercises the actual protocol. A mocked
   client would test the mock.
@@ -884,9 +961,9 @@ What does *not* get an interface:
 ### 11.3 The agent is a pure state machine
 
 Every rule in §4.3 is a decision about whether to open a one-way door, and each
-of them is time-dependent: settle, confirm, retry spacing, cooldown, circuit
-breaker, sleep detection. Testing that through goroutines and real clocks gives
-slow, flaky tests for exactly the logic that must not be wrong.
+of them is time-dependent: settle, retry spacing, cooldown, circuit breaker,
+sleep detection. Testing that through goroutines and real clocks gives slow,
+flaky tests for exactly the logic that must not be wrong.
 
 So the decisions live in a function with no I/O, no goroutines, and no clock:
 
@@ -895,14 +972,13 @@ type Event struct {          // exactly one field set, plus Now
     Now         time.Time
     Attach      bool
     State       *ServerState // from /state or a /wait wake
-    SwitchExit  *error       // result of the switch command
-    ProbeExit   *error       // result of --check-cmd
+    SwitchExit  *error       // result of the switch commands
 }
 
 type Action struct {
     Claim     string        // non-empty: POST /claim/<id>
-    Switch    bool          // run SWITCH-CMD
-    Probe     bool          // run --check-cmd
+    Switch    bool          // run the switch commands
+    Retry     bool          // with Switch: re-run only the commands that failed
     Notify    bool          // run --notify-cmd
     WakeAt    time.Time     // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it
     SaveOwner *string       // non-nil: persist this as last_owner
@@ -916,10 +992,10 @@ func (m *Machine) Step(e Event) []Action
 and recycles on `errGuardsDown`. The decision loop stamps `Now` at processing
 time for every event, dispatches the `Action`s to a run-level worker in
 `agent/actions.go`, and posts results back as ordinary events. Effects are no
-longer executed inline: one action worker runs Switch/Probe/Notify one at a time
-and posts `SwitchExit`/`ProbeExit` to the loop. Channels are scoped by freshness
-— `attachCh` and `stateCh` are created per generation, while `results` and the
-action worker are run-level. It contains no policy.
+longer executed inline: one action worker runs Switch/Notify one at a time and
+posts `SwitchExit` to the loop. Channels are scoped by freshness — `attachCh`
+and `stateCh` are created per generation, while `results` and the action worker
+are run-level. It contains no policy.
 
 ### 11.4 Tests
 
@@ -961,12 +1037,12 @@ finish a switch whose write did not land (§4.3). Today the keyboard stays where
 it was and the user makes a second gesture. That press is detectable on Linux,
 so if the USB switch can be actuated electrically, the keyboard follows it.
 
-**Detector: the rising edge of `--check-cmd`.** The probe already distinguishes
-"my input is active" from "my input is not". Polled every 10 s, a fail→success
-transition is the user handing Linux the display. It works with Deep Sleep off,
-which DRM hotplug does not (finding 11): with the link held up on the inactive
-input, `card0-DP-3` never goes disconnected, so the kernel sees nothing. DDC is
-the only witness.
+**Detector: the rising edge of `ddcutil getvcp 60`.** The read `screen-switch`
+confirms with (§5.6) already distinguishes "my input is active" from "my input
+is not". Polled every 10 s, a fail→success transition is the user handing Linux
+the display. It works with Deep Sleep off, which DRM hotplug does not (finding
+11): with the link held up on the inactive input, `card0-DP-3` never goes
+disconnected, so the kernel sees nothing. DDC is the only witness.
 
 Act on the edge only when `owner != me`. A rising edge while `owner == me` is
 the monitor coming out of standby, which happens far more often than an OSD

@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// detect.go: HID device enumeration, --trigger suggestions, and the
-// follow-keyboard/switch-mouse hid-switch suggestion (SPEC §5.5, §6.1).
+// detect.go: HID device enumeration, --trigger suggestions, the
+// follow-keyboard/switch-mouse hid-switch suggestion and the screen-switch
+// one (SPEC §5.5, §5.6, §6.1).
 
 package detect
 
@@ -24,6 +25,7 @@ import (
 	"github.com/telesma-app/hid"
 	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/platform"
+	"github.com/unbrice/soft-kvm/screen"
 )
 
 const logitechVID = 0x046d
@@ -75,22 +77,117 @@ type hidDevice struct {
 // context, so a slow receiver cannot stretch detect linearly.
 const probeBudget = 15 * time.Second
 
-// Run enumerates HID devices and prints how to set --trigger for connect:
-// the suggested invocations first, as a shell transcript, then the device
-// list they were drawn from.
+// screenBudget bounds the monitor probe: `ddcutil detect` walks every I²C bus
+// and takes seconds on a good day.
+const screenBudget = 20 * time.Second
+
+// Run enumerates HID devices and probes the monitor, then prints how to wire
+// connect: the suggested invocations first, as a shell transcript, then what
+// screen-switch needs filled in, then the device list they were drawn from.
 func Run(ctx context.Context, w io.Writer) error {
 	devices, err := enumerateHIDDevices(ctx)
 	if err != nil {
 		return fmt.Errorf("enumerate HID devices: %w", err)
 	}
 	probed := probeAll(ctx, devices)
-	if err := renderSuggestions(w, probed); err != nil {
+	sctx, cancel := context.WithTimeout(ctx, screenBudget)
+	report := screen.Probe(sctx, platform.Output)
+	cancel()
+	if err := renderSuggestions(w, probed, screenCommand(report)); err != nil {
+		return err
+	}
+	if err := renderScreen(w, report); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintln(w); err != nil {
 		return err
 	}
 	return renderDevices(w, probed)
+}
+
+// inputPlaceholder stands in the suggestions for the one thing detect cannot
+// know: which monitor port the other host is plugged into.
+const inputPlaceholder = "DP1_HDMI_ETC"
+
+// screenCommand renders the screen-switch action for this host's monitor. The
+// table is spelled out only when the monitor's brand needs one — this is the
+// only place a table is ever guessed (SPEC §5.6) — and display= only when
+// there is more than one monitor to tell apart.
+func screenCommand(r screen.Report) string {
+	cmd := "screen-switch " + inputPlaceholder
+	if len(r.Displays) == 0 {
+		return cmd
+	}
+	d := r.Displays[0]
+	if t := screen.TableFor(d.Mfg); t.Name != screen.StandardName {
+		cmd += " " + t.Name
+	}
+	if len(r.Displays) > 1 {
+		cmd += " " + shellQuote("display="+d.Model)
+	}
+	return cmd
+}
+
+// shellQuote single-quotes s when a shell would otherwise split or expand it.
+func shellQuote(s string) string {
+	safe := func(r rune) bool {
+		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			strings.ContainsRune("=-_.:/,", r)
+	}
+	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !safe(r) }) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// renderScreen explains the screen-switch action: whether its backend works
+// here, which monitor and table were found, and which ports the placeholder can be.
+func renderScreen(w io.Writer, r screen.Report) error {
+	var b strings.Builder
+	b.WriteString("\n# screen-switch is built in as well: it points the monitor at the other\n")
+	fmt.Fprintf(&b, "# host through %s and reports whether the monitor moved.\n", r.Backend)
+
+	table := screen.TableFor("") // no monitor named: the standard table
+	var own string
+	ownOK := false
+	switch {
+	case r.Err != nil:
+		fmt.Fprintf(&b, "# It cannot reach a monitor from this host yet:\n")
+		for line := range strings.Lines(r.Err.Error()) {
+			fmt.Fprintf(&b, "#   %s\n", strings.TrimRight(line, "\n"))
+		}
+		b.WriteString("# Fix that and re-run detect: it also tells whether the monitor needs\n")
+		b.WriteString("# a mapping table.\n")
+	case len(r.Displays) > 0:
+		d := r.Displays[0]
+		table = screen.TableFor(d.Mfg)
+		for _, d := range r.Displays {
+			t := screen.TableFor(d.Mfg)
+			fmt.Fprintf(&b, "# Monitor: %s (%s), mapping table %s", d.Model, d.Mfg, t.Name)
+			if a, ok := t.AliasFor(d.Input); ok && d.InputOK {
+				fmt.Fprintf(&b, ", showing this host on %s", a)
+			}
+			b.WriteString(".\n")
+		}
+		if d.InputOK {
+			own, ownOK = table.AliasFor(d.Input)
+		}
+	}
+
+	var ports []string
+	for _, a := range table.Aliases() {
+		if !ownOK || a != own {
+			ports = append(ports, a)
+		}
+	}
+	fmt.Fprintf(&b, "# Replace %s with the port the OTHER host is plugged into —\n", inputPlaceholder)
+	fmt.Fprintf(&b, "# %s — or a raw value such as 0x1B. Try it by\n", strings.Join(ports, ", "))
+	b.WriteString("# hand first: one press of the monitor's Input button undoes it.\n")
+	if _, err := io.WriteString(w, Dim(w, b.String())); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintln(w, "soft-kvm "+screenCommand(r))
+	return err
 }
 
 func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
@@ -437,7 +534,7 @@ func wrapCommand(cmd string) string {
 // renderSuggestions prints the invocations as a shell transcript — prose as
 // #-comments, commands at column 0 — so the block reads like the one
 // `service install` prints and survives a pipe into a file.
-func renderSuggestions(w io.Writer, devices []probedDevice) error {
+func renderSuggestions(w io.Writer, devices []probedDevice, screenCmd string) error {
 	dim := func(s string) string { return Dim(w, s) }
 	var kbdTriggers, mouseTriggers []string
 	for _, dev := range devices {
@@ -479,21 +576,20 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		return err
 	}
 
-	// The action is the same either way — move whatever is still linked here
-	// — so the two suggestions differ only in what leads the gesture.
-	action := ""
-	if cmds := switchCommands(devices); len(cmds) > 0 {
-		action = " -- " + strings.Join(cmds, " -- ")
-	}
+	// The action is the same either way — point the monitor at the other
+	// host, then move whatever is still linked here — so the two suggestions
+	// differ only in what leads the gesture.
+	hidCmds := switchCommands(devices)
+	action := " -- " + strings.Join(append([]string{screenCmd}, hidCmds...), " -- ")
 	type suggestion struct{ comment, cmd string }
 	var suggestions []suggestion
-	if len(kbdTriggers) > 0 && action != "" {
+	if len(kbdTriggers) > 0 && len(hidCmds) > 0 {
 		suggestions = append(suggestions, suggestion{
 			"# FOLLOW THE KEYBOARD — switch when the keyboard takes the link\n# here, and send the other peripherals along.\n",
 			"soft-kvm connect --trigger " + strings.Join(kbdTriggers, ",") + action,
 		})
 	}
-	if len(mouseTriggers) > 0 && action != "" {
+	if len(mouseTriggers) > 0 && len(hidCmds) > 0 {
 		suggestions = append(suggestions, suggestion{
 			"# FOLLOW THE MOUSE — switch when the mouse takes the link here,\n# and send the other peripherals along. Install one, not both.\n",
 			"soft-kvm connect --trigger " + strings.Join(mouseTriggers, ",") + action,
@@ -505,7 +601,7 @@ func renderSuggestions(w io.Writer, devices []probedDevice) error {
 		slices.Sort(triggers)
 		suggestions = append(suggestions, suggestion{
 			"# SWITCH ON ATTACH — no HID++ device answered a scan, so only\n# the display follows; the peripherals stay where they are.\n",
-			"soft-kvm connect --trigger " + strings.Join(triggers, ","),
+			"soft-kvm connect --trigger " + strings.Join(triggers, ",") + action,
 		})
 	}
 

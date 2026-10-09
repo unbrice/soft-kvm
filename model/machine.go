@@ -20,16 +20,15 @@ type Event struct {
 	Now        time.Time
 	Attach     bool               // receiver attach edge from the Detector
 	State      *state.ServerState // from /state or a /wait wake
-	SwitchExit *error             // result of the switch commands (nil = all exit 0)
-	ProbeExit  *error             // result of running --check-cmd (nil = exit 0 = my input IS active)
+	SwitchExit *error             // result of the switch commands (nil = all exit 0 = the switch landed)
 }
 
 // Action is the machine's only output. Glue executes it and feeds results back
 // as the next Event (SPEC §11.3).
 type Action struct {
 	Claim     string    // non-empty: POST /claim/<id>
-	Switch    bool      // run SWITCH-CMD
-	Probe     bool      // run --check-cmd
+	Switch    bool      // run the switch commands
+	Retry     bool      // with Switch: a re-run within one sequence, so commands that already succeeded are skipped
 	Notify    bool      // run --notify-cmd
 	WakeAt    time.Time // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it; a batch with no WakeAt action means no pending deadline
 	SaveOwner *string   // non-nil: persist this as last_owner (agent.json)
@@ -40,10 +39,8 @@ type Action struct {
 type MachineConfig struct {
 	ID            string
 	Settle        time.Duration
-	Confirm       time.Duration
 	SwitchRetries int
 	RetrySpacing  time.Duration
-	NoCheck       bool // when true, skip pre-switch veto probe and confirm loop (fire-and-forget switch)
 	// Cooldown, BreakerWindow, BreakerMax and BreakerOpenFor implement the
 	// §4.3 circuit breaker.
 	Cooldown       time.Duration
@@ -51,10 +48,6 @@ type MachineConfig struct {
 	BreakerMax     int
 	BreakerOpenFor time.Duration
 }
-
-// probeInterval paces --check-cmd runs across the --confirm window (SPEC
-// §4.3: "poll", not a tight loop paced by check-cmd latency).
-const probeInterval = 500 * time.Millisecond
 
 // SwitchDeadline is the watchdog for modeSwitching, the only mode whose sole
 // exit is an external event: a lost SwitchExit would otherwise wedge the
@@ -71,9 +64,7 @@ type mode int
 const (
 	modeIdle mode = iota
 	modeSettling
-	modeReconcile
 	modeSwitching
-	modeConfirming
 	modeRetryWait
 )
 
@@ -91,20 +82,16 @@ type Machine struct {
 	deferred *state.ServerState
 	gateWake time.Time
 
-	reconState         *state.ServerState
-	latestState        *state.ServerState
-	switchSentAt       time.Time
-	attemptCount       int
-	confirmDeadline    time.Time
-	nextProbeAt        time.Time
-	allProbesSucceeded bool
-	retryWaitDeadline  time.Time
+	reconState        *state.ServerState
+	latestState       *state.ServerState
+	switchSentAt      time.Time
+	attemptCount      int
+	retryWaitDeadline time.Time
 
 	// Outstanding-effect bookkeeping: results pair by mode alone, so under
 	// concurrent glue a stale result can mispair; a result is accepted only
 	// while its effect is outstanding.
 	switchOutstanding bool
-	probeOutstanding  bool
 
 	cooldownUntil    time.Time
 	breakerOpenUntil time.Time
@@ -123,7 +110,7 @@ func NewMachine(cfg MachineConfig, lastOwner string, hasRecord bool) *Machine {
 
 // Step processes one event and returns the actions to execute. The fixed
 // deadline-processing order is: attach settle, deferred reconcile gate,
-// switch retry wait, switch watchdog, confirm probe poll, confirm deadline.
+// switch retry wait, switch watchdog.
 func (m *Machine) Step(e Event) []Action {
 	var actions []Action
 
@@ -134,8 +121,6 @@ func (m *Machine) Step(e Event) []Action {
 		actions = append(actions, m.handleAttach(e.Now)...)
 	case e.SwitchExit != nil:
 		actions = append(actions, m.handleSwitchExit(*e.SwitchExit, e.Now)...)
-	case e.ProbeExit != nil:
-		actions = append(actions, m.handleProbeExit(*e.ProbeExit, e.Now)...)
 	}
 
 	m.processDeadlines(e.Now, &actions)
@@ -160,7 +145,7 @@ func (m *Machine) handleState(s *state.ServerState, now time.Time) []Action {
 	}
 
 	switch m.mode {
-	case modeReconcile, modeSwitching, modeConfirming, modeRetryWait:
+	case modeSwitching, modeRetryWait:
 		m.latestState = s
 		return nil
 	default:
@@ -182,7 +167,9 @@ func (m *Machine) handleAttach(now time.Time) []Action {
 	return nil
 }
 
-// handleSwitchExit handles the result of a SWITCH-CMD run.
+// handleSwitchExit handles the result of one run of the switch commands. Exit
+// 0 is the receipt: a switch command reports success only once the switch
+// landed (SPEC §4.3), so there is nothing left to confirm here.
 func (m *Machine) handleSwitchExit(err error, now time.Time) []Action {
 	if !m.switchOutstanding {
 		// The result arrived after its sequence ended (or was never
@@ -193,68 +180,12 @@ func (m *Machine) handleSwitchExit(err error, now time.Time) []Action {
 		return nil
 	}
 	m.switchOutstanding = false
-	status := "success"
 	if err != nil {
-		status = err.Error()
-	}
-
-	if m.cfg.NoCheck {
-		if err != nil {
-			var actions []Action
-			m.retryOrFail(now, &actions, fmt.Sprintf("switch to %q attempt %d exit: %s", m.reconState.Owner, m.attemptCount, status))
-			return actions
-		}
-		return m.sequenceSuccess(now)
-	}
-
-	m.mode = modeConfirming
-	m.confirmDeadline = now.Add(m.cfg.Confirm)
-	m.nextProbeAt = time.Time{}
-	m.allProbesSucceeded = true
-	m.probeOutstanding = true
-	return []Action{{
-		Probe: true,
-		Log:   fmt.Sprintf("switch to %q attempt %d exit: %s", m.reconState.Owner, m.attemptCount, status),
-	}}
-}
-
-// handleProbeExit handles the result of a --check-cmd run.
-func (m *Machine) handleProbeExit(err error, now time.Time) []Action {
-	if !m.probeOutstanding {
-		return []Action{{Log: "ignoring late ProbeExit"}}
-	}
-	m.probeOutstanding = false
-	switch m.mode {
-	case modeReconcile:
-		if err != nil {
-			return m.vetoFail(now)
-		}
-		m.mode = modeSwitching
-		m.switchSentAt = now
-		m.attemptCount = 1
-		m.switchOutstanding = true
-		return []Action{{
-			Switch: true,
-			Log:    fmt.Sprintf("veto passed; switching to %q attempt 1", m.reconState.Owner),
-		}}
-
-	case modeConfirming:
-		if err != nil {
-			return m.sequenceSuccess(now)
-		}
-		if now.Before(m.confirmDeadline) {
-			// Poll, don't spin: the next probe fires on the timer
-			// (processDeadlines), never back-to-back (SPEC §4.3).
-			m.nextProbeAt = now.Add(probeInterval)
-			return nil
-		}
 		var actions []Action
-		m.confirmElapsed(now, &actions)
+		m.retryOrFail(now, &actions, fmt.Sprintf("switch to %q attempt %d exit: %s", m.reconState.Owner, m.attemptCount, err))
 		return actions
-
-	default:
-		return nil
 	}
+	return m.sequenceSuccess(now)
 }
 
 // reconcile evaluates the §4.3 gates for a state while idle or settling.
@@ -286,30 +217,19 @@ func (m *Machine) reconcile(s *state.ServerState, now time.Time) []Action {
 		}}
 	}
 
-	if m.cfg.NoCheck {
-		m.mode = modeSwitching
-		m.reconState = s
-		m.latestState = s
-		m.switchSentAt = now
-		m.attemptCount = 1
-		m.switchOutstanding = true
-		return []Action{{
-			Switch: true,
-			Log:    fmt.Sprintf("switching to %q attempt 1: ownership transition, winner live, gates clear (no-check mode)", s.Owner),
-		}}
-	}
-
-	m.mode = modeReconcile
+	m.mode = modeSwitching
 	m.reconState = s
 	m.latestState = s
-	m.probeOutstanding = true
+	m.switchSentAt = now
+	m.attemptCount = 1
+	m.switchOutstanding = true
 	// A pending settle survives: attach→claim is an independent trigger
 	// (SPEC §5.4) and the claim is what rescues a stale bit pointing at the
 	// other host while the receiver is attached here. It fires once the
 	// machine is idle again.
 	return []Action{{
-		Probe: true,
-		Log:   fmt.Sprintf("probing before switch to %q: ownership transition, winner live, gates clear", s.Owner),
+		Switch: true,
+		Log:    fmt.Sprintf("switching to %q attempt 1: ownership transition, winner live, gates clear", s.Owner),
 	}}
 }
 
@@ -364,6 +284,7 @@ func (m *Machine) processDeadlines(now time.Time, actions *[]Action) {
 			m.switchOutstanding = true
 			*actions = append(*actions, Action{
 				Switch: true,
+				Retry:  true,
 				Log:    fmt.Sprintf("retry switch to %q attempt %d", m.reconState.Owner, m.attemptCount),
 			})
 			continue
@@ -375,44 +296,15 @@ func (m *Machine) processDeadlines(now time.Time, actions *[]Action) {
 			reason := fmt.Sprintf("no SwitchExit within %v (lost event or hung child) after attempt %d", SwitchDeadline, m.attemptCount)
 			m.retryOrFail(now, actions, reason)
 			continue
-
-		case m.mode == modeConfirming && !m.nextProbeAt.IsZero() && !m.nextProbeAt.After(now) &&
-			m.confirmDeadline.After(now):
-			m.nextProbeAt = time.Time{}
-			m.probeOutstanding = true
-			*actions = append(*actions, Action{Probe: true})
-			continue
-
-		case m.mode == modeConfirming && !m.confirmDeadline.IsZero() && !m.confirmDeadline.After(now) && m.allProbesSucceeded:
-			if m.probeOutstanding {
-				// The window waits for evidence still in flight (bounded
-				// glue-side by --check-timeout); the arriving ProbeExit
-				// resolves it in handleProbeExit. Not clearing the deadline
-				// here is safe: this case re-evaluates on each event and
-				// emits nothing until the result lands.
-				break
-			}
-			m.confirmElapsed(now, actions)
-			continue
 		}
 		break
 	}
 }
 
-// confirmElapsed is reached when the confirm window closes with every probe
-// still succeeding. It either retries the switch or gives up.
-func (m *Machine) confirmElapsed(now time.Time, actions *[]Action) {
-	// Both entry points (the confirm-deadline case and a ProbeExit landing
-	// past the deadline) come through here; own the teardown so neither
-	// leaves a stale confirm deadline behind.
-	m.confirmDeadline = time.Time{}
-	m.retryOrFail(now, actions, "confirm elapsed")
-}
-
 // retryOrFail treats the current attempt as failed: it retries while attempts
 // remain (subject to retry spacing) and fails the sequence otherwise. reason
 // names the failure class in the log — a watchdog-fired attempt counts toward
-// the circuit breaker exactly like a confirm-window one (via sequenceFailure).
+// the circuit breaker exactly like a non-zero exit (via sequenceFailure).
 func (m *Machine) retryOrFail(now time.Time, actions *[]Action, reason string) {
 	maxAttempts := 1 + m.cfg.SwitchRetries
 	if m.attemptCount < maxAttempts {
@@ -424,6 +316,7 @@ func (m *Machine) retryOrFail(now time.Time, actions *[]Action, reason string) {
 			m.switchOutstanding = true
 			*actions = append(*actions, Action{
 				Switch: true,
+				Retry:  true,
 				Log:    fmt.Sprintf("%s; retry switch to %q attempt %d", reason, m.reconState.Owner, m.attemptCount),
 			})
 			return
@@ -438,8 +331,8 @@ func (m *Machine) retryOrFail(now time.Time, actions *[]Action, reason string) {
 	*actions = append(*actions, m.sequenceFailure(now, reason)...)
 }
 
-// sequenceSuccess completes a switch sequence because a confirm probe failed
-// (the falling edge receipt).
+// sequenceSuccess completes a switch sequence because the switch commands all
+// exited 0.
 func (m *Machine) sequenceSuccess(now time.Time) []Action {
 	owner := m.reconState.Owner
 	actions := []Action{{SaveOwner: &owner, Log: fmt.Sprintf("switch to %q confirmed", owner)}}
@@ -458,8 +351,8 @@ func (m *Machine) sequenceSuccess(now time.Time) []Action {
 }
 
 // sequenceFailure completes a switch sequence after the last retry without
-// confirmation. reason names the failure class in the log so a watchdog-fired
-// attempt is greppable alongside ordinary confirm-window failures.
+// a successful run. reason names the failure class in the log so a
+// watchdog-fired attempt is greppable alongside ordinary non-zero exits.
 func (m *Machine) sequenceFailure(now time.Time, reason string) []Action {
 	owner := m.reconState.Owner
 	actions := []Action{{
@@ -470,23 +363,6 @@ func (m *Machine) sequenceFailure(now time.Time, reason string) []Action {
 	m.hasRecord = true
 	m.cooldownUntil = now.Add(m.cfg.Cooldown)
 	m.recordBreaker(now)
-	m.clearSequence()
-	actions = append(actions, m.postSequence(now, owner)...)
-	if m.mode == modeIdle || m.mode == modeSettling {
-		m.lastOwner = owner
-	}
-	return actions
-}
-
-// vetoFail aborts a reconcile before the switch because the probe says the
-// input is already inactive.
-func (m *Machine) vetoFail(now time.Time) []Action {
-	owner := m.reconState.Owner
-	actions := []Action{{
-		SaveOwner: &owner,
-		Log:       fmt.Sprintf("probe veto: input already inactive; resync last_owner to %q", owner),
-	}}
-	m.hasRecord = true
 	m.clearSequence()
 	actions = append(actions, m.postSequence(now, owner)...)
 	if m.mode == modeIdle || m.mode == modeSettling {
@@ -515,12 +391,8 @@ func (m *Machine) clearSequence() {
 	m.reconState = nil
 	m.attemptCount = 0
 	m.switchSentAt = time.Time{}
-	m.confirmDeadline = time.Time{}
-	m.nextProbeAt = time.Time{}
 	m.retryWaitDeadline = time.Time{}
-	m.allProbesSucceeded = false
 	m.switchOutstanding = false
-	m.probeOutstanding = false
 }
 
 // postSequence runs after any sequence end: reconciles a stashed newer state
@@ -545,7 +417,7 @@ func (m *Machine) postSequence(now time.Time, target string) []Action {
 // wakeAt returns the earliest future deadline the machine is tracking.
 func (m *Machine) wakeAt(now time.Time) time.Time {
 	var wake time.Time
-	candidates := []time.Time{m.settleDeadline, m.gateWake, m.confirmDeadline, m.nextProbeAt, m.retryWaitDeadline}
+	candidates := []time.Time{m.settleDeadline, m.gateWake, m.retryWaitDeadline}
 	if m.mode == modeSwitching && m.switchOutstanding {
 		candidates = append(candidates, m.switchSentAt.Add(SwitchDeadline))
 	}

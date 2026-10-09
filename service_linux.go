@@ -208,8 +208,8 @@ func validateServeArgs(args []string) error {
 // validateConnectArgs parses connect's raw argument tokens with the same
 // flag set connectCmd uses and applies everything connect validates after
 // parsing: a non-empty parsed --trigger (one inside a switch-command argv
-// does not count), the VID:PID list, and the trailing switch-command
-// chunks.
+// does not count), the VID:PID list, and the trailing switch commands —
+// at least one, with built-in ones that parse.
 func validateConnectArgs(args []string) error {
 	fs, v := newConnectFlagSet()
 	if err := parseArgs(fs, args); err != nil {
@@ -221,7 +221,7 @@ func validateConnectArgs(args []string) error {
 	if _, err := detect.NewDetector(*v.trigger); err != nil {
 		return err
 	}
-	_, err := splitSwitchCommands(fs.Args())
+	_, err := parseSwitchCommands(fs.Args())
 	return err
 }
 
@@ -280,9 +280,9 @@ export SOFTKVM_TOKEN=$(openssl rand -hex 32)
 
 # CHOOSE YOUR SETTINGS AND TRY THEM before baking them into units;
 # soft-kvm serve --help and soft-kvm connect --help list the flags.
-soft-kvm detect                      # lists the VID:PID for --trigger
-soft-kvm serve                       # then, in one terminal
-soft-kvm connect --trigger VID:PID   # and in another; Ctrl-C both after
+soft-kvm detect   # prints the connect command that fits this host
+soft-kvm serve    # then, in one terminal; and in another:
+soft-kvm connect --trigger VID:PID -- screen-switch DP1_HDMI_ETC
 
 # INSTALL COORDINATOR on an always-on host of your LAN, as root; hosts
 # that only run an agent skip it. This command installs
@@ -293,7 +293,8 @@ sudo --preserve-env=SOFTKVM_TOKEN \
 # INSTALL AGENT on every host, as your regular user. This command writes
 # ~/.config/soft-kvm/env and a user unit that runs the binary you invoke
 # it with.
-/usr/local/bin/soft-kvm service install connect --trigger VID:PID
+/usr/local/bin/soft-kvm service install connect --trigger VID:PID \
+  -- screen-switch DP1_HDMI_ETC
 
 # Optional, once the services are installed:
 
