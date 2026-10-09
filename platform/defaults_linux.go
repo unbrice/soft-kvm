@@ -13,16 +13,8 @@ import (
 
 const (
 	DefaultID        = "linux"
-	DefaultCheckCmd  = "ddcutil getvcp 60"
 	DefaultNotifyCmd = "notify-send 'soft-kvm' 'Press Input on the monitor'"
 )
-
-// DefaultSwitchCmd points the LG at the Mac's input: the LG-specific VCP 0xF4
-// with source address 0x50. --noverify is load-bearing, not a shortcut:
-// read-back verification fails on this firmware (SPEC §5.4).
-var DefaultSwitchCmd = []string{
-	"ddcutil", "setvcp", "0xF4", "0xD0", "--i2c-source-addr=0x50", "--noverify",
-}
 
 // StateDir is $XDG_STATE_HOME/soft-kvm, defaulting to ~/.local/state/soft-kvm.
 func StateDir() (string, error) {

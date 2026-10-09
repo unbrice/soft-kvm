@@ -12,22 +12,9 @@ import (
 )
 
 const (
-	DefaultID = "mac"
-	// DefaultCheckCmd is empty on macOS: DDC read is unsupported on many monitors
-	// and USB4/Thunderbolt connections (including LG UltraWide). The switch operates
-	// in fire-and-forget mode by default; override via --check-cmd if DDC read works.
-	DefaultCheckCmd  = ""
+	DefaultID        = "mac"
 	DefaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
 )
-
-// DefaultSwitchCmd points the monitor at the other host's input through BetterDisplay,
-// which writes the standard VCP 0x60. 15 is BetterDisplay's DisplayPort
-// value; §10 records this monitor's real per-port codes, and `-- SWITCH-CMD
-// ARGS...` overrides the whole command when they deviate (SPEC §5.4).
-var DefaultSwitchCmd = []string{
-	"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay", "set", "-ddc",
-	"-vcp=inputSelect", "-value=15",
-}
 
 // StateDir is ~/Library/Application Support/soft-kvm (SPEC §4.3).
 func StateDir() (string, error) {

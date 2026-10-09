@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/unbrice/soft-kvm/hidpp"
+	"github.com/unbrice/soft-kvm/screen"
 )
 
 func TestUsageName(t *testing.T) {
@@ -184,11 +185,11 @@ func TestRenderSuggestions(t *testing.T) {
 		}},
 	}
 	var buf bytes.Buffer
-	if err := renderSuggestions(&buf, devices); err != nil {
+	if err := renderSuggestions(&buf, devices, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b,046d:c548\n") {
+	if !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b,046d:c548 -- screen-switch DP1_HDMI_ETC\n") {
 		t.Error("missing suggestion listing the keyboard-capable devices only, sorted")
 	}
 	if strings.Contains(out, "1532:0285") {
@@ -209,7 +210,7 @@ func TestRenderSuggestionsFiltersVIDZero(t *testing.T) {
 		interfaces: []ifaceUsage{{0x01, 0x06}},
 	}}
 	var buf bytes.Buffer
-	if err := renderSuggestions(&buf, []probedDevice{internal, external}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{internal, external}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
@@ -247,7 +248,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		inv:    &hidpp.Inventory{Kind: hidpp.KindMouse},
 	}
 	var buf bytes.Buffer
-	if err := renderSuggestions(&buf, []probedDevice{keyboard, direct}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{keyboard, direct}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
@@ -278,7 +279,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		Paired: []hidpp.PairedDevice{{Index: 1, Kind: hidpp.KindKeyboard}, {Index: 2, Kind: hidpp.KindMouse, Online: true}},
 	}
 	buf.Reset()
-	if err := renderSuggestions(&buf, []probedDevice{keyboard, withMouse}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{keyboard, withMouse}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548") {
@@ -290,7 +291,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	empty.status = probeOK
 	empty.inv = &hidpp.Inventory{Kind: hidpp.KindReceiver}
 	buf.Reset()
-	if err := renderSuggestions(&buf, []probedDevice{keyboard, empty}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{keyboard, empty}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	if out := buf.String(); strings.Contains(out, "hid-switch") {
@@ -302,7 +303,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	failed.status = probeFailed
 	failed.err = fs.ErrPermission
 	buf.Reset()
-	if err := renderSuggestions(&buf, []probedDevice{keyboard, failed}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{keyboard, failed}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	if out := buf.String(); strings.Contains(out, "hid-switch") {
@@ -315,7 +316,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	probedKeyboard.status = probeOK
 	probedKeyboard.inv = &hidpp.Inventory{Kind: hidpp.KindKeyboard}
 	buf.Reset()
-	if err := renderSuggestions(&buf, []probedDevice{probedKeyboard, direct}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{probedKeyboard, direct}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out = buf.String()
@@ -352,7 +353,7 @@ func TestRenderSuggestionsNoCandidates(t *testing.T) {
 		}},
 	}
 	var buf bytes.Buffer
-	if err := renderSuggestions(&buf, devices); err != nil {
+	if err := renderSuggestions(&buf, devices, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
@@ -475,7 +476,7 @@ func TestRenderSuggestionsReceiverSlots(t *testing.T) {
 		},
 	}
 	var buf bytes.Buffer
-	if err := renderSuggestions(&buf, []probedDevice{shadowKbd, receiver}); err != nil {
+	if err := renderSuggestions(&buf, []probedDevice{shadowKbd, receiver}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
@@ -502,5 +503,79 @@ func TestIsTriggerExcludesShadow(t *testing.T) {
 	shadowed.shadow = true
 	if (probedDevice{hidDevice: shadowed}).isTrigger() {
 		t.Error("a receiver-shadowed node must not be a trigger candidate")
+	}
+}
+
+func TestScreenCommand(t *testing.T) {
+	dell := screen.Display{Mfg: "DEL", Model: "DELL U2720Q"}
+	asus := screen.Display{Mfg: "ACI", Model: "PA278QV"}
+	cases := []struct {
+		name   string
+		report screen.Report
+		want   string
+	}{
+		{"backend down", screen.Report{Err: errors.New("no i2c")}, "screen-switch DP1_HDMI_ETC"},
+		{"no display named", screen.Report{}, "screen-switch DP1_HDMI_ETC"},
+		{"standard monitor names no table", screen.Report{Displays: []screen.Display{dell}}, "screen-switch DP1_HDMI_ETC"},
+		{"two monitors need display=", screen.Report{Displays: []screen.Display{dell, asus}},
+			"screen-switch DP1_HDMI_ETC 'display=DELL U2720Q'"},
+	}
+	for _, c := range cases {
+		if got := screenCommand(c.report); got != c.want {
+			t.Errorf("%s: screenCommand = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestRenderScreen(t *testing.T) {
+	t.Run("backend down says why", func(t *testing.T) {
+		var buf bytes.Buffer
+		r := screen.Report{Backend: "ddcutil", Err: errors.New("ddcutil: exit status 1: No /dev/i2c devices exist.\nddcutil requires module i2c-dev.")}
+		if err := renderScreen(&buf, r); err != nil {
+			t.Fatalf("renderScreen: %v", err)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"#   ddcutil: exit status 1: No /dev/i2c devices exist.\n",
+			"#   ddcutil requires module i2c-dev.\n",
+			"\nsoft-kvm screen-switch DP1_HDMI_ETC\n",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing %q in:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("own port is not offered as the target", func(t *testing.T) {
+		var buf bytes.Buffer
+		r := screen.Report{Backend: "ddcutil", Displays: []screen.Display{
+			{Mfg: "DEL", Model: "DELL U2720Q", Input: 0x0F, InputOK: true},
+		}}
+		if err := renderScreen(&buf, r); err != nil {
+			t.Fatalf("renderScreen: %v", err)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"# Monitor: DELL U2720Q (DEL), mapping table standard, showing this host on dp1.\n",
+			"# dp2, hdmi1, hdmi2, usbc1 — or a raw value",
+			"\nsoft-kvm screen-switch DP1_HDMI_ETC\n",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing %q in:\n%s", want, out)
+			}
+		}
+	})
+}
+
+func TestShellQuote(t *testing.T) {
+	for in, want := range map[string]string{
+		"display=PA278QV":      "display=PA278QV",
+		"display=LG ULTRAWIDE": "'display=LG ULTRAWIDE'",
+		"it's":                 `'it'\''s'`,
+		"":                     "''",
+	} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

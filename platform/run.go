@@ -39,8 +39,15 @@ func CommandContext(ctx context.Context, argv []string) *exec.Cmd {
 // an error wrapping *exec.ExitError otherwise. Child output is captured and
 // attached to the error, never streamed.
 func Run(ctx context.Context, argv []string) error {
+	_, err := Output(ctx, argv)
+	return err
+}
+
+// Output is Run for callers that read what the child printed: it returns the
+// combined stdout and stderr alongside the same error.
+func Output(ctx context.Context, argv []string) ([]byte, error) {
 	if len(argv) == 0 {
-		return errors.New("empty argv")
+		return nil, errors.New("empty argv")
 	}
 	cmd := CommandContext(ctx, argv)
 	var out bytes.Buffer
@@ -48,15 +55,15 @@ func Run(ctx context.Context, argv []string) error {
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
 		if tail := strings.TrimSpace(out.String()); tail != "" {
-			return fmt.Errorf("%s: %w: %s", argv[0], err, tail)
+			return out.Bytes(), fmt.Errorf("%s: %w: %s", argv[0], err, tail)
 		}
-		return fmt.Errorf("%s: %w", argv[0], err)
+		return out.Bytes(), fmt.Errorf("%s: %w", argv[0], err)
 	}
-	return nil
+	return out.Bytes(), nil
 }
 
-// ShellArgv wraps a --check-cmd / --notify-cmd flag string for `sh -c` — those
-// defaults carry shell quoting, so they run through a shell. The trailing
+// ShellArgv wraps the --notify-cmd flag string for `sh -c` — its per-OS
+// defaults carry shell quoting, so it runs through a shell. The trailing
 // SWITCH-CMD is the opposite: an argv slice, never a shell string (SPEC §9).
 func ShellArgv(cmdline string) []string {
 	return []string{"sh", "-c", cmdline}

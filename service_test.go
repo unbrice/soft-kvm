@@ -185,12 +185,37 @@ func TestServeInstallRequiresToken(t *testing.T) {
 }
 
 func TestConnectInstallRefusesRoot(t *testing.T) {
-	err := validateConnectInstall(0, testToken, []string{"--trigger", "046d:c52b"})
+	err := validateConnectInstall(0, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"})
 	if err == nil || !strings.Contains(err.Error(), "regular user") {
 		t.Fatalf("euid 0: got %v, want a refusal naming the regular user", err)
 	}
-	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b"}); err != nil {
+	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"}); err != nil {
 		t.Fatalf("non-root with valid trigger: got %v, want nil", err)
+	}
+}
+
+// There is no default switch command: install refuses the same argv connect
+// would, and points at detect (SPEC §5.4).
+func TestConnectInstallRequiresSwitchCommand(t *testing.T) {
+	err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b"})
+	if err == nil || !strings.Contains(err.Error(), "soft-kvm detect") {
+		t.Fatalf("no switch command: got %v, want a refusal naming soft-kvm detect", err)
+	}
+	// A built-in command is parsed at install time, not on the first switch.
+	for _, argv := range [][]string{
+		{"screen-switch", "vga"},
+		{"screen-switch", "dp1", "dell"},
+		{"hid-switch", "nonsense"},
+	} {
+		args := append([]string{"--trigger", "046d:c52b", "--"}, argv...)
+		if err := validateConnectInstall(1000, testToken, args); err == nil {
+			t.Errorf("%v: got nil, want a refusal", argv)
+		}
+	}
+	// Anything else is an external program, taken as is.
+	args := []string{"--trigger", "046d:c52b", "--", "ddcutil", "setvcp", "60", "0x11"}
+	if err := validateConnectInstall(1000, testToken, args); err != nil {
+		t.Errorf("external command: got %v, want nil", err)
 	}
 }
 

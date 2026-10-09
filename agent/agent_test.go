@@ -144,7 +144,6 @@ func agentMachineConfig(id string) *model.MachineConfig {
 	return &model.MachineConfig{
 		ID:             id,
 		Settle:         50 * time.Millisecond,
-		Confirm:        50 * time.Millisecond,
 		SwitchRetries:  1,
 		RetrySpacing:   50 * time.Millisecond,
 		Cooldown:       50 * time.Millisecond,
@@ -167,9 +166,7 @@ func agentTestConfig(t *testing.T, base, statePath string, s *server.Server, det
 		Machine:        agentMachineConfig("linux"),
 		AgentStatePath: statePath,
 		SwitchCommands: [][]string{{"switch", "cmd"}},
-		CheckArgv:      []string{"check", "cmd"},
 		NotifyArgv:     []string{"notify", "cmd"},
-		CheckTimeout:   1 * time.Second,
 		SwitchTimeout:  1 * time.Second,
 		GuardPoll:      20 * time.Millisecond,
 		BackoffBase:    10 * time.Millisecond,
@@ -249,9 +246,7 @@ func TestAgentSwitchPath(t *testing.T) {
 	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
-	// Probe succeeds (veto passed), both switch commands succeed, confirm probe
-	// fails (landed).
-	runner := &recordingRunner{errs: []error{nil, nil, nil, errors.New("input inactive")}}
+	runner := &recordingRunner{}
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 	// A second switch command (e.g. a USB device) runs after the display one.
@@ -267,108 +262,23 @@ func TestAgentSwitchPath(t *testing.T) {
 		t.Fatalf("force claim other: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		calls := runner.Calls()
-		if len(calls) >= 4 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected 4 runner calls, got %d: %v", len(calls), calls)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
+	// Exit 0 from every command is the receipt: nothing probes before or after.
+	waitForLastOwner(t, statePath, "other")
 	calls := runner.Calls()
-	if !slices.Equal(calls[0], cfg.CheckArgv) {
-		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 runner calls, got %d: %v", len(calls), calls)
 	}
-	if !slices.Equal(calls[1], cfg.SwitchCommands[0]) {
-		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchCommands[0])
-	}
-	if !slices.Equal(calls[2], cfg.SwitchCommands[1]) {
-		t.Errorf("call 2 = %v, want switch %v", calls[2], cfg.SwitchCommands[1])
-	}
-	if !slices.Equal(calls[3], cfg.CheckArgv) {
-		t.Errorf("call 3 = %v, want confirm probe %v", calls[3], cfg.CheckArgv)
-	}
-
-	var as state.AgentState
-	if err := state.Load(statePath, &as); err != nil {
-		t.Fatalf("load agent state: %v", err)
-	}
-	if as.LastOwner != "other" {
-		t.Errorf("last_owner = %q, want other", as.LastOwner)
-	}
-}
-
-func TestAgentSwitchPathNoCheck(t *testing.T) {
-	s, srv := newAgentTestServer(t)
-	defer srv.Close()
-	base := agentTestBase(t, srv.URL)
-	client := newTestClient(t, testToken)
-
-	if _, err := client.Claim(context.Background(), base, "mac", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
-	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "mac"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
-
-	s.SetWaiterCount("other", 1)
-
-	det := newFakeDetector()
-	runner := &recordingRunner{errs: []error{nil}}
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.ID = "mac"
-	cfg.Machine.ID = "mac"
-	cfg.Machine.NoCheck = true
-	cfg.CheckArgv = nil
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runAgent(ctx, t, cfg)
-
-	waitForLive(t, s, "mac")
-
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
-		t.Fatalf("force claim other: %v", err)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		calls := runner.Calls()
-		if len(calls) >= 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected 1 runner call, got %d: %v", len(calls), calls)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	calls := runner.Calls()
 	if !slices.Equal(calls[0], cfg.SwitchCommands[0]) {
 		t.Errorf("call 0 = %v, want switch %v", calls[0], cfg.SwitchCommands[0])
 	}
-
-	deadline = time.Now().Add(2 * time.Second)
-	for {
-		var as state.AgentState
-		if err := state.Load(statePath, &as); err == nil && as.LastOwner == "other" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("agent state not updated to other")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if !slices.Equal(calls[1], cfg.SwitchCommands[1]) {
+		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchCommands[1])
 	}
 }
 
-func TestAgentVetoPath(t *testing.T) {
+// A retry re-runs only the commands that failed: the peripheral the second
+// command already moved must not be chased again (SPEC §4.3).
+func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
@@ -386,10 +296,12 @@ func TestAgentVetoPath(t *testing.T) {
 	s.SetWaiterCount("other", 1)
 
 	det := newFakeDetector()
-	// First probe fails the veto, so no switch runs.
-	runner := &recordingRunner{errs: []error{errors.New("input inactive")}}
+	// Attempt 1: the display command fails, the USB one succeeds. Attempt 2:
+	// the display command succeeds.
+	runner := &recordingRunner{errs: []error{errors.New("monitor still here"), nil, nil}}
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.SwitchCommands = append(cfg.SwitchCommands, []string{"switch", "usb"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -401,35 +313,81 @@ func TestAgentVetoPath(t *testing.T) {
 		t.Fatalf("force claim other: %v", err)
 	}
 
+	waitForLastOwner(t, statePath, "other")
+	calls := runner.Calls()
+	want := [][]string{cfg.SwitchCommands[0], cfg.SwitchCommands[1], cfg.SwitchCommands[0]}
+	if len(calls) != len(want) {
+		t.Fatalf("expected %d runner calls, got %d: %v", len(want), len(calls), calls)
+	}
+	for i := range want {
+		if !slices.Equal(calls[i], want[i]) {
+			t.Errorf("call %d = %v, want %v", i, calls[i], want[i])
+		}
+	}
+}
+
+// screen-switch is built in: it goes to the screen runner, never to the argv
+// runner as a program called "screen-switch" (SPEC §5.6).
+func TestAgentScreenSwitchIsBuiltIn(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+
+	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
+		t.Fatalf("save agent state: %v", err)
+	}
+
+	s.SetWaiterCount("other", 1)
+
+	det := newFakeDetector()
+	runner := &recordingRunner{}
+	// The write succeeds; any read after it fails, which is the monitor
+	// having left this input.
+	screenRunner := &recordingRunner{errs: []error{nil, errors.New("no DDC reply")}}
+	guard := &fakeGuard{ok: true}
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.SwitchCommands = [][]string{{"screen-switch", "dp1"}}
+	cfg.ScreenRunner = func(ctx context.Context, argv []string) ([]byte, error) {
+		return nil, screenRunner.run(ctx, argv)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+
+	waitForLive(t, s, "linux")
+
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
+		t.Fatalf("force claim other: %v", err)
+	}
+
+	waitForLastOwner(t, statePath, "other")
+	if len(screenRunner.Calls()) == 0 {
+		t.Error("screen-switch never reached the screen runner")
+	}
+	if calls := runner.Calls(); len(calls) != 0 {
+		t.Errorf("screen-switch was exec'd as a program: %v", calls)
+	}
+}
+
+func waitForLastOwner(t *testing.T, statePath, want string) {
+	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		calls := runner.Calls()
-		if len(calls) >= 1 {
-			break
+		var as state.AgentState
+		if err := state.Load(statePath, &as); err == nil && as.LastOwner == want {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("expected at least 1 runner call, got %d", len(calls))
+			t.Fatalf("agent state never reached last_owner=%q (got %q)", want, as.LastOwner)
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-
-	calls := runner.Calls()
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 runner call, got %d: %v", len(calls), calls)
-	}
-	if !slices.Equal(calls[0], cfg.CheckArgv) {
-		t.Errorf("call 0 = %v, want probe %v", calls[0], cfg.CheckArgv)
-	}
-	if slices.ContainsFunc(calls, func(argv []string) bool { return slices.Equal(argv, cfg.SwitchCommands[0]) }) {
-		t.Error("switch command ran despite veto")
-	}
-
-	var as state.AgentState
-	if err := state.Load(statePath, &as); err != nil {
-		t.Fatalf("load agent state: %v", err)
-	}
-	if as.LastOwner != "other" {
-		t.Errorf("last_owner = %q, want other", as.LastOwner)
 	}
 }
 

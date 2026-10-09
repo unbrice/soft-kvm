@@ -31,6 +31,7 @@ import (
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/model"
 	"github.com/unbrice/soft-kvm/platform"
+	"github.com/unbrice/soft-kvm/screen"
 	"github.com/unbrice/soft-kvm/server"
 )
 
@@ -118,6 +119,8 @@ func main() {
 		err = detectCmd(ctx)
 	case "hid-switch":
 		err = hidSwitchCmd(ctx)
+	case "screen-switch":
+		err = screenSwitchCmd(ctx)
 	case "service":
 		err = serviceCmd(ctx)
 	default:
@@ -147,16 +150,18 @@ func usageTo(w io.Writer) {
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
-  connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]
+  connect [flags] -- CMD ARGS... [-- CMD ARGS...]
   detect
   hid-switch VID:PID[:SLOT] host=N
+  screen-switch INPUT [TABLE] [display=MATCH]
   service <install|print|uninstall> [serve|connect] [args]
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
-serve, activate and connect; detect and hid-switch need no token.
-SOFTKVM_SERVER overrides server discovery (SPEC §5); SOFTKVM_LOG=debug turns
-on debug logs. A connect switch command named "hid-switch" is built in, not
-exec'd (SPEC §5.5).`)
+serve, activate and connect; detect, hid-switch and screen-switch need no
+token. SOFTKVM_SERVER overrides server discovery (SPEC §5); SOFTKVM_LOG=debug
+turns on debug logs. connect switch commands named "hid-switch" and
+"screen-switch" are built in, not exec'd (SPEC §5.5, §5.6); detect prints the
+ones that fit this host.`)
 }
 
 // checkToken applies the shared-secret length rules. The TLS identity and
@@ -379,11 +384,8 @@ type connectFlags struct {
 	serverFlag    *string
 	trigger       *string
 	settle        *time.Duration
-	confirm       *time.Duration
 	switchRetries *int
-	checkTimeout  *time.Duration
 	switchTimeout *time.Duration
-	checkCmd      *string
 	notifyCmd     *string
 	noGuards      bool
 	displayMatch  string
@@ -400,19 +402,16 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
 		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID[:SLOT]` filters — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
-		confirm:       fs.Duration("confirm", 4*time.Second, "how long check-cmd may keep succeeding before the switch has failed"),
-		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch command before giving up"),
-		checkTimeout:  fs.Duration("check-timeout", 10*time.Second, "bound on one check-cmd run"),
+		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch commands that failed before giving up"),
 		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run, so a hung I²C write cannot freeze the agent"),
-		checkCmd:      fs.String("check-cmd", platform.DefaultCheckCmd, "veto before the switch, receipt after it"),
-		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch cannot be confirmed"),
+		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch still fails after the retries"),
 	}
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")
 		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: any external)")
 	}
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect [flags] [-- CMD ARGS... [-- CMD ARGS...]]")
+		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect [flags] -- CMD ARGS... [-- CMD ARGS...]")
 		printFlags(fs, fs.Output())
 	}
 	return fs, v
@@ -442,13 +441,10 @@ func connectCmd(ctx context.Context) error {
 	guard := platform.NewGuard(flags.displayMatch, flags.noGuards)
 
 	// The trailing commands are argv slices, never shell strings (SPEC §9).
-	switchCommands, err := splitSwitchCommands(fs.Args())
+	switchCommands, err := parseSwitchCommands(fs.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return errUsage
-	}
-	if len(switchCommands) == 0 {
-		switchCommands = [][]string{platform.DefaultSwitchCmd}
 	}
 
 	c, err := client.NewClient(token)
@@ -459,14 +455,12 @@ func connectCmd(ctx context.Context) error {
 	machineCfg := model.MachineConfig{
 		ID:             *flags.id,
 		Settle:         *flags.settle,
-		Confirm:        *flags.confirm,
 		SwitchRetries:  *flags.switchRetries,
 		RetrySpacing:   1 * time.Second,
 		Cooldown:       5 * time.Second,
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
 		BreakerOpenFor: 60 * time.Second,
-		NoCheck:        *flags.checkCmd == "",
 	}
 
 	stateDir, err := platform.StateDir()
@@ -474,11 +468,6 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
-
-	var checkArgv []string
-	if *flags.checkCmd != "" {
-		checkArgv = platform.ShellArgv(*flags.checkCmd)
-	}
 
 	// The winner publishes which Easy-Switch channel it is on, read off the
 	// trigger peripheral. Only a HID++ trigger can answer, so a plain HID
@@ -496,15 +485,40 @@ func connectCmd(ctx context.Context) error {
 		Machine:        &machineCfg,
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
 		SwitchCommands: switchCommands,
-		CheckArgv:      checkArgv,
+		ScreenRunner:   platform.Output,
 		NotifyArgv:     platform.ShellArgv(*flags.notifyCmd),
-		CheckTimeout:   *flags.checkTimeout,
 		SwitchTimeout:  *flags.switchTimeout,
 		Resolver:       resolver,
 		OwnChannel:     ownChannel,
 	}
 
 	return agent.Run(ctx, cfg)
+}
+
+// parseSwitchCommands is what connect and the service-install validator both
+// apply to the trailing arguments: at least one switch command — there is no
+// default, since which input to select is this host's wiring and `detect` is
+// what knows it (SPEC §5.4) — and built-in commands that parse.
+func parseSwitchCommands(args []string) ([][]string, error) {
+	cmds, err := splitSwitchCommands(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(cmds) == 0 {
+		return nil, errors.New("connect: a switch command is required after `--` (run `soft-kvm detect` to print one for this host)")
+	}
+	for _, argv := range cmds {
+		switch argv[0] {
+		case "hid-switch":
+			_, err = hidpp.Parse(argv[1:])
+		case "screen-switch":
+			_, err = screen.Parse(argv[1:])
+		}
+		if err != nil {
+			return nil, fmt.Errorf("connect: %w", err)
+		}
+	}
+	return cmds, nil
 }
 
 // splitSwitchCommands splits the trailing arguments on bare "--" tokens: each
@@ -565,4 +579,29 @@ func hidSwitchCmd(ctx context.Context) error {
 	// Run by hand there is no owner to inherit a channel from, so host=N is
 	// not optional here — Do says so if it is missing.
 	return sw.Do(ctx, 0)
+}
+
+func screenSwitchCmd(ctx context.Context) error {
+	fs := flag.NewFlagSet("screen-switch", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: soft-kvm screen-switch INPUT [TABLE] [display=MATCH]")
+		fmt.Fprintln(os.Stderr, "  INPUT  one of the table's ports, or a raw value such as 0x1B")
+		fmt.Fprintln(os.Stderr, "  TABLE  how this monitor selects inputs; soft-kvm detect prints the one it needs")
+		for i, t := range screen.Tables() {
+			note := ""
+			if i == 0 {
+				note = " (default)"
+			}
+			fmt.Fprintf(os.Stderr, "           %-9s %s%s\n", t.Name, strings.Join(t.Aliases(), ", "), note)
+		}
+	}
+	if err := parseArgs(fs, os.Args[2:]); err != nil {
+		return err
+	}
+	sw, err := screen.Parse(fs.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return errUsage
+	}
+	return sw.Do(ctx, platform.Output)
 }
