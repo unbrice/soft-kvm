@@ -54,9 +54,9 @@ every host, seven subcommands:
 - `screen-switch INPUT [TABLE] [display=MATCH]` — runs the built-in monitor
   switch by hand, without a server or token. `INPUT` is one of the table's port
   aliases (`dp1`, `hdmi2`, `usbc1`, …) or a raw value; `TABLE` defaults to
-  `standard` and is never guessed here. It delegates to `ddcutil` on Linux,
-  where it also reads the monitor back to confirm the switch, and to
-  BetterDisplay on macOS (SPEC §5.6).
+  `standard` and is never guessed here. It delegates to `ddcutil` on Linux and
+  to `IOAVService` on macOS, reading the monitor back on both to confirm the
+  switch (SPEC §5.6).
 - `service <install|print|uninstall> [serve|connect] [args]` — Linux only:
   validates with the `serve`/`connect` flag sets and installs, prints or removes
   the canonical systemd units from `units/`, baking the raw argv into
@@ -85,39 +85,41 @@ lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
 validates on a claim); `agent` imports `model`, `state`, `client`, `discover`,
 `hidpp` and `screen`.
 
-| Package    | Files                                       | Concern                                                                                                                                                                                 |
-| ---------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)                                                   |
-| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                                                                      |
-| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                                                                      |
-| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                                         |
-| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                                                       |
-| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal                                                      |
-| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                                                            |
-| `hidpp`    | `hidpp.go`                                  | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1)                                        |
-| `screen`   | `screen.go`, `screen_*.go`                  | the `screen-switch` command: the standard mapping table and the per-OS backends — ddcutil write-then-confirm plus the vendor tables (`lg`) on Linux, BetterDisplay on macOS (SPEC §5.6) |
-| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                                                           |
-| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                                                            |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                                                                   |
+| Package    | Files                                       | Concern                                                                                                                                                                        |
+| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)                                          |
+| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                                                             |
+| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                                                             |
+| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                                |
+| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                                              |
+| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal                                             |
+| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                                                   |
+| `hidpp`    | `hidpp.go`                                  | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1)                               |
+| `screen`   | `screen.go`, `screen_*.go`                  | the `screen-switch` command: the standard and vendor (`lg`) mapping tables and the per-OS write-then-confirm backends — `ddcutil` on Linux, `IOAVService` on macOS (SPEC §5.6) |
+| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                                                  |
+| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                                                   |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                                                          |
 
 The invariants header lives at the top of `agent/agent.go`.
-`platform.NewGuard(match, disabled)` returns a concrete per-OS `Guard`: a no-op
-on Linux (the always-on desktop has no guards), AC-power and display checks on
-macOS. It satisfies `agent.Guard` structurally — `platform` imports nothing
-internal.
+`platform.NewGuard(match, disabled, displays)` returns a concrete per-OS
+`Guard`: a no-op on Linux (the always-on desktop has no guards), AC-power and
+display checks on macOS. `platform` imports nothing internal, so `main` injects
+`screen.DisplayNames` as `displays`. The `Guard` satisfies `agent.Guard`
+structurally.
 
 ## Stack
 
 Go ≥ 1.25 (`go.mod` is the language floor), `CGO_ENABLED=0`, stdlib +
 `golang.org/x/sync` (errgroup supervision, SPEC §11.1) +
 `github.com/grandcat/zeroconf` (mDNS) + `github.com/telesma-app/hid` (purego
-FFI: HID attach events on both OSes, SPEC §6.1-6.2). No CLI framework: stdlib
-`flag`, one `FlagSet` per subcommand, because pflag's interspersed parsing eats
-the trailing `-- SWITCH-CMD ARGS...` (SPEC §11). Logging is `log/slog` to
-stderr; `SOFTKVM_LOG=debug` lowers the level. The handler depends on who is
-reading: a clock, a level and dimmed attributes when stderr is a terminal, the
-stdlib logfmt `TextHandler` everywhere else, so journald and pipes keep the
-machine-readable form.
+FFI: HID attach events on both OSes, SPEC §6.1-6.2) +
+`github.com/ebitengine/purego` (macOS `IOAVService` DDC/CI, SPEC §5.6). No CLI
+framework: stdlib `flag`, one `FlagSet` per subcommand, because pflag's
+interspersed parsing eats the trailing `-- SWITCH-CMD ARGS...` (SPEC §11).
+Logging is `log/slog` to stderr; `SOFTKVM_LOG=debug` lowers the level. The
+handler depends on who is reading: a clock, a level and dimmed attributes when
+stderr is a terminal, the stdlib logfmt `TextHandler` everywhere else, so
+journald and pipes keep the machine-readable form.
 
 ## Toolchain
 

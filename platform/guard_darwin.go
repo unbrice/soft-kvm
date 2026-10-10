@@ -18,16 +18,20 @@ import (
 type Guard struct {
 	match    string
 	disabled bool
+	displays func() ([]string, error)
 	mu       sync.Mutex
 	lastSeen time.Time
 }
 
 // NewGuard returns a macOS guard. When disabled is true all checks are
-// bypassed; match is the display name substring used when disabled is false.
-func NewGuard(match string, disabled bool) *Guard {
+// bypassed. displays lists the external monitors by name — main passes
+// screen.DisplayNames, since platform imports nothing internal — and match is
+// the name substring that counts as the shared monitor; "" is any of them.
+func NewGuard(match string, disabled bool, displays func() ([]string, error)) *Guard {
 	return &Guard{
 		match:    strings.ToLower(match),
 		disabled: disabled,
+		displays: displays,
 	}
 }
 
@@ -41,7 +45,7 @@ func (g *Guard) OK(ctx context.Context) (ok bool, reason string) {
 		return false, "no AC power"
 	}
 
-	present, err := g.displayPresent(ctx)
+	present, err := g.displayPresent()
 	if err != nil {
 		return false, "no display: " + err.Error()
 	}
@@ -74,12 +78,18 @@ func (g *Guard) acPower(ctx context.Context) error {
 	return nil
 }
 
-func (g *Guard) displayPresent(ctx context.Context) (bool, error) {
-	ctx2, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	out, err := CommandContext(ctx2, []string{"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay", "get", "-identifiers"}).Output()
+// displayPresent reports whether an external monitor whose name contains
+// match is attached. displays walks the IORegistry, which takes milliseconds
+// where system_profiler takes seconds (SPEC §6.2).
+func (g *Guard) displayPresent() (bool, error) {
+	names, err := g.displays()
 	if err != nil {
 		return false, err
 	}
-	return strings.Contains(strings.ToLower(string(out)), g.match), nil
+	for _, name := range names {
+		if strings.Contains(strings.ToLower(name), g.match) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

@@ -10,17 +10,17 @@ work; §10 is the integration pass, run at the end.
 
 ## 1. Context
 
-| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Input-switch commands | The built-in `screen-switch` (§5.6), which delegates per OS. Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` for this LG, then a read to confirm · macOS: BetterDisplay (`"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" set -ddc -vcp=inputSelect -value=<code>`). Nothing is baked in as a default: `detect` prints the command for this host                                                                                                                                                                                                                                   |
-| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                                                                                              |
-| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Implementation        | One Go binary, `soft-kvm`, seven subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` / `screen-switch` / `service` — `detect` enumerates HID devices and probes the monitor to print the `connect` line, `hid-switch` and `screen-switch` are the standalone forms of the built-in switch commands). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) |
+| Item                  | Facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Input-switch commands | The built-in `screen-switch` (§5.6), which delegates per OS. Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify` for this LG, then a read to confirm · macOS: `IOAVServiceWriteI2C` and `IOAVServiceReadI2C` over `CoreFoundation` and `IOKit` (`purego` FFI, no external helper). Nothing is baked in as a default: `detect` prints the command for this host                                                                                                                                                                                                                                                                                                    |
+| Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Policy                | Corp device: outbound-only networking, minimal/no installs, must hold **no powerful credentials**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Implementation        | One Go binary, `soft-kvm`, seven subcommands (`serve` / `activate` / `connect` / `detect` / `hid-switch` / `screen-switch` / `service` — `detect` enumerates HID devices and probes the monitor to print the `connect` line, `hid-switch` and `screen-switch` are the standalone forms of the built-in switch commands). Same artifact everywhere; the host carrying the bit runs `serve` alongside its `connect`. `CGO_ENABLED=0`, Go ≥ 1.25, stdlib + `golang.org/x/sync` (errgroup supervision, §11.1) + `grandcat/zeroconf` (mDNS discovery, §5.1) + `telesma-app/hid` (USB attach events on both OSes, §6.1-6.2) + `ebitengine/purego` (macOS `IOAVService` DDC/CI, §5.6) |
 
 ## 2. Goals / non-goals
 
@@ -33,8 +33,7 @@ work; §10 is the integration pass, run at the end.
 - Manual monitor OSD switching always remains possible.
 - Exactly one deliverable: a static Go binary per host (`linux/amd64`,
   `darwin/arm64`, plus `linux/arm64` if a Pi carries the bit). No scripts, no
-  curl plumbing, no runtime deps on the corp laptop beyond stock tools and
-  BetterDisplay.
+  curl plumbing, no runtime deps on the corp laptop beyond stock tools.
 
 **Non-goals**
 
@@ -71,10 +70,12 @@ work; §10 is the integration pass, run at the end.
 8. **A LAN coordination host makes the witness unnecessary**: any clean local
    attach signal + a shared bit is a complete solution.
 9. **Switching the LG away works from both hosts, verified by hand** — `ddcutil`
-   from Linux, BetterDisplay from macOS. Not every LG does: at least one recent
-   UltraGear silently ignores VCP `0x60` writes from macOS through every
-   protocol BetterDisplay exposes,[^4^] with `m1ddc` as the fallback there.[^6^]
-   This one does not need it.
+   from Linux, Apple's `IOAVService` (`IOAVServiceWriteI2C` /
+   `IOAVServiceReadI2C`, the same private IOKit entry points `m1ddc`[^6^] and
+   BetterDisplay[^4^][^5^] call) from macOS. Because `IOAVService` takes the raw
+   7-bit I²C source address and VCP feature byte directly, the LG side-channel
+   write (`0xF4` from source `0x50`) works on macOS too without an external
+   helper, even on firmware that ignores standard `0x60` writes.[^4^]
 10. **A DDC write that returns success may still not take effect.** The bus is
     unacknowledged in practice: the monitor can NAK, arrive busy, or be waking
     from standby, and `--noverify` means nothing reads the result back. Working
@@ -134,12 +135,12 @@ work; §10 is the integration pass, run at the end.
 ### 4.2 Data flow (switch Mac → Linux)
 
 Symmetric: the receiver attaches on Linux, Linux claims, the Mac is the loser
-and runs BetterDisplay, the monitor moves to Linux's input.
+and runs `screen-switch` through `IOAVService`, the monitor moves to Linux's
+input.
 
-The two hosts do not send the same thing. Linux writes the LG-specific VCP
-`0xF4` with source address `0x50`; macOS writes the standard `0x60` through
-BetterDisplay. Different features, same effect on this monitor — so neither
-command tells you anything about the other, and both are verified separately.
+Both hosts use the same mapping tables (§5.6): for this LG, both write the
+LG-specific VCP `0xF4` from I²C source address `0x50` — Linux through `ddcutil`,
+macOS through `IOAVServiceWriteI2C`.
 
 ### 4.3 What authorises a switch
 
@@ -175,14 +176,14 @@ manual OSD press, not a loop.
 
 **Confirming it landed, and what happens when it does not.** A switch command
 exits 0 only when its switch landed; that exit code is the only receipt the
-agent reads. `screen-switch` earns it on Linux by reading the monitor back after
-the fire-and-forget write (finding 10, §5.6); on macOS, and for any external
-command, exit 0 is taken at its word. The switch command is bounded twice:
-glue-side by `--switch-timeout` (default 30 s, SIGTERM then SIGKILL after
-`WaitDelay`), and machine-side by a 60 s watchdog. Either failure feeds the same
-retry/notify path and counts toward the circuit breaker like any other failure.
-A result is accepted only while its effect is outstanding — a late `SwitchExit`
-is ignored and logged.
+agent reads. `screen-switch` earns it on both OSes by reading the monitor back
+after the fire-and-forget write (finding 10, §5.6); for any external command,
+exit 0 is taken at its word. The switch command is bounded twice: glue-side by
+`--switch-timeout` (default 30 s, SIGTERM then SIGKILL after `WaitDelay`), and
+machine-side by a 60 s watchdog. Either failure feeds the same retry/notify path
+and counts toward the circuit breaker like any other failure. A result is
+accepted only while its effect is outstanding — a late `SwitchExit` is ignored
+and logged.
 
 1. Run the switch commands, in order. One failing does not skip the rest: they
    target independent devices.
@@ -199,10 +200,8 @@ the only host the user can read at that moment. Nothing re-claims and nothing
 reverts: the shared bit is already right, the keyboard is already where the user
 put it, and only the pixels are behind.
 
-The receipt is the loser's own read rather than a winner-side check, because the
-winner's DDC reads are the least trustworthy thing available — on macOS
-BetterDisplay may not read the value back at all, and on a display that just
-became active the read races the link coming up.
+The receipt is the loser's own read rather than a winner-side check, because on
+a display that just became active the read races the link coming up.
 
 ## 5. CLI surface
 
@@ -424,9 +423,9 @@ a list, one entry per device that can carry one:
 ### 5.6 The `screen-switch` virtual command
 
 A switch command whose first word is `screen-switch` is never exec'd: it runs
-in-process and drives the monitor through the program this OS has for it. One
-spelling works on both hosts, and the command — not the agent — is what knows
-whether the switch landed.
+in-process and drives the monitor through the backend this OS has for it —
+`ddcutil` on Linux, `IOAVService` on macOS. One spelling works on both hosts,
+and the command — not the agent — is what knows whether the switch landed.
 
 ```
 screen-switch INPUT [TABLE] [display=MATCH]
@@ -440,27 +439,36 @@ screen-switch INPUT [TABLE] [display=MATCH]
   `standard`. `screen-switch` never guesses it. `soft-kvm detect` reads the
   monitor's manufacturer and prints the table when the brand needs one.
 - **`display=MATCH`** picks one monitor when several are attached: `--model` on
-  Linux, `-nameLike=` on macOS.
+  Linux, and a case-insensitive substring of the EDID product name on macOS.
 
-| Table        | Writes                            | Aliases                                                                    | `detect` picks it for   |
-| ------------ | --------------------------------- | -------------------------------------------------------------------------- | ----------------------- |
-| `standard`   | VCP `0x60`, MCCS Input Source     | `dp1` `0x0F`, `dp2` `0x10`, `hdmi1` `0x11`, `hdmi2` `0x12`, `usbc1` `0x1B` | everything else         |
-| `lg` (Linux) | VCP `0xF4` from I²C source `0x50` | `dp1` `0xD0`, `hdmi1` `0x90`, `hdmi2` `0x91`, `usbc1` `0xD1`               | EDID manufacturer `GSM` |
+| Table      | Writes                            | Aliases                                                                    | `detect` picks it for   |
+| ---------- | --------------------------------- | -------------------------------------------------------------------------- | ----------------------- |
+| `standard` | VCP `0x60`, MCCS Input Source     | `dp1` `0x0F`, `dp2` `0x10`, `hdmi1` `0x11`, `hdmi2` `0x12`, `usbc1` `0x1B` | everything else         |
+| `lg`       | VCP `0xF4` from I²C source `0x50` | `dp1` `0xD0`, `hdmi1` `0x90`, `hdmi2` `0x91`, `usbc1` `0xD1`               | EDID manufacturer `GSM` |
 
-`lg` exists on Linux only. `0xF4` is LG's private side channel: firmware that
-ignores `0x60` writes from `ddcutil` honours it. A vendor table describes what a
-backend that writes raw VCP features must send, so macOS has none —
-BetterDisplay does that translation itself, and naming a table there is an
-unknown-table error. MCCS defines Input Source values up to HDMI 2 (`0x12`) and
-nothing for USB-C: `usbc1` as `0x1B` is a convention, and vendors deviate,[^5^]
-which is what a raw `INPUT` is for. A vendor is one more row.
+`0xF4` is LG's private side channel: firmware that ignores `0x60` writes honours
+it. Both backends send the table's I²C source address and VCP feature directly,
+so every table works on both OSes. MCCS defines Input Source values up to HDMI 2
+(`0x12`) and nothing for USB-C: `usbc1` as `0x1B` is a convention, and vendors
+deviate,[^5^] which is what a raw `INPUT` is for. A vendor is one more row.
 
-**Linux — `ddcutil`, write then confirm.** The write is
-`ddcutil setvcp <vcp> <value> --noverify`, plus `--i2c-source-addr` when the
-table sets one. `--noverify` is load-bearing, not a shortcut: read-back
-verification fails on firmware that goes silent on the input it just left, so a
-verifying write reports failure after succeeding. The receipt is this host's own
-`ddcutil getvcp 60`, polled every 500 ms for 4 s:
+**Write then confirm.** Both backends write the target feature without inline
+verification, then poll Input Source (VCP `0x60` from I²C source `0x51`) every
+500 ms for 4 s:
+
+- **Linux — `ddcutil`.** The write is `ddcutil setvcp <vcp> <value> --noverify`,
+  plus `--i2c-source-addr` when the table sets one; the read is
+  `ddcutil --terse getvcp 60`. `--noverify` is load-bearing, not a shortcut:
+  read-back verification fails on firmware that goes silent on the input it just
+  left, so a verifying write reports failure after succeeding.
+- **macOS — `IOAVService`.** `screen` loads `CoreFoundation` and `IOKit` via
+  `purego`, matches each external display from the IORegistry
+  (`DCPAVServiceProxy` → EDID + `IOAVServiceCreateWithService`), writes the
+  DDC/CI `setVCP` packet (`0x03`) through `IOAVServiceWriteI2C`, waits 50 ms,
+  and reads VCP `0x60` (`0x01` / `0x02`, up to 3 attempts 50 ms apart) back
+  through `IOAVServiceReadI2C`.
+
+On both OSes:
 
 - the read **fails** ⇒ the monitor no longer answers on this input (§1) ⇒ exit
   0;
@@ -474,15 +482,10 @@ verifying write reports failure after succeeding. The receipt is this host's own
 - it still answers with anything else when the window closes ⇒ non-zero, and the
   agent retries (§4.3).
 
-A write that fails — `ddcutil` missing, no `i2c-dev`, no permission — exits
-non-zero with `ddcutil`'s own message, so a broken setup reads as a failed
-switch and a notification, never as a finished one.
-
-**macOS — BetterDisplay, fire and forget.**
-`BetterDisplay set -ddc -vcp=inputSelect -value=<value>`; exit 0 is the only
-receipt, because DDC reads are unreliable from macOS on this class of link.
-BetterDisplay takes the standard value and does any per-monitor translation
-itself, which is why `standard` is the only table there.
+A write that fails — `ddcutil` missing, no `i2c-dev`, no permission, or no
+matching `IOAVService` — exits non-zero with the backend's own error, so a
+broken setup reads as a failed switch and a notification, never as a finished
+one.
 
 `soft-kvm screen-switch INPUT [TABLE] [display=MATCH]` runs the same command by
 hand, with no server and no token: the way to find `INPUT` before installing. A
@@ -491,11 +494,13 @@ wrong guess costs one press of the monitor's Input button.
 **What `detect` contributes.** It runs the backend once and prints the
 `screen-switch` action inside each suggested `connect` line, with `DP1_HDMI_ETC`
 left in place of `INPUT` as a placeholder — which port the other host uses is
-the one fact no host can read. On Linux it names each monitor `ddcutil detect`
-reaches, the table its manufacturer maps to, and the port this host is on, so
-that one is not offered as the target. When the backend fails it prints the
-backend's error instead: "`ddcutil` requires module `i2c-dev`" at setup time,
-not on the first switch.
+the one fact no host can read. On both OSes it names each external monitor the
+backend reaches (leaving out Apple displays whose EDID vendor is `APP` on macOS,
+since neither the built-in panel nor Apple's monitors have an input to select),
+the table its EDID manufacturer maps to, and the port this host is on when Input
+Source maps to a known alias, so that one is not offered as the target. When the
+backend fails it prints the backend's error instead: "`ddcutil` requires module
+`i2c-dev`" at setup time, not on the first switch.
 
 ### 5.7 `soft-kvm service <install|print|uninstall> [serve|connect] [args]`
 
@@ -607,9 +612,9 @@ try `--sleep-multiplier 2`.
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Guards             | `pmset -g ps` contains `AC Power`, and the LG is present                                                                                                                                                                                                                                        |
 | Detector (primary) | `IOHIDManager` device-matching events filtered to VID:PID, via `telesma-app/hid` (purego — dynamic FFI, no cgo, static binary preserved); the same library and code path as Linux (§6.1). No `IOHIDManagerOpen`: enumeration callbacks need no device access, so no Input-Monitoring TCC prompt |
-| Switch command     | `screen-switch` through BetterDisplay (§5.6). BetterDisplay must be running. **Verify against findings 9 and 10 first**                                                                                                                                                                         |
+| Switch command     | `screen-switch` through `IOAVService` (§5.6) — in-process via `purego`, no external helper                                                                                                                                                                                                      |
 | Packaging          | `~/Library/LaunchAgents/local.soft-kvm.plist` (`RunAtLoad`, `KeepAlive`), token in a `0600` env file, log to `~/Library/Logs/`                                                                                                                                                                  |
-| Installs           | One binary + one plist. `pmset` is stock; BetterDisplay is at `/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay`                                                                                                                                                                    |
+| Installs           | One binary + one plist. `pmset` is stock; the guard lists the monitors from the IORegistry in-process (§5.6), with no external helper                                                                                                                                                           |
 
 - **`hid-switch` needs Input Monitoring** (§5.5). Enumeration and the attach
   events need no TCC grant, but the virtual command — like `detect`'s scan —
@@ -627,10 +632,11 @@ try `--sleep-multiplier 2`.
   attach edge when the guards pass again, and claims — even though the USB
   attach itself happened while the agent was suspended.
 - **`system_profiler SPDisplaysDataType` costs 1–3 s** and wakes the discrete
-  GPU path. Do not call it on a 2 s cadence. Use
-  `"/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" get -identifiers`
-  — it is already a dependency and returns in milliseconds — and keep
-  `system_profiler` for `activate`-time diagnostics.
+  GPU path. Do not call it on the guard's cadence: the guard lists the external
+  monitors from the IORegistry instead — `DCPAVServiceProxy` entries named from
+  their EDID, Apple's own displays left out — which takes milliseconds, and
+  `--display-match` matches a substring of those names. Keep `system_profiler`
+  for `activate`-time diagnostics.
 - **launchd throttles respawns to one per 10 s.** A crash loop is silent except
   in the log; `KeepAlive` will not tell you.
 - **macOS 13+ lists `KeepAlive` agents under Login Items → Allow in
@@ -802,8 +808,11 @@ binary that does not exist yet.
 - [ ] `soft-kvm screen-switch <mac-port>` with **no table** from Linux: if the
       LG honours the standard `0x60` write, `GSM` should not map to `lg`
 - [ ] `soft-kvm detect` on each host names the monitor, the table and this
-      host's own port; `ddcutil detect --terse` and `getvcp 60 --terse` output
-      matches what the parsers were written against
+      host's own port; `ddcutil detect --terse` and `getvcp 60 --terse` on Linux
+      and `IOAVServiceReadI2C` on macOS match what the parsers were written
+      against
+- [ ] `soft-kvm detect` on the Mac with the lid open leaves the built-in panel
+      out: its EDID manufacturer is `APP`
 - [ ] The monitor is already on the other input when the loser switches: note
       whether `ddcutil setvcp --noverify` errors or is silently ignored (§8)
 - [ ] Fifty switches back and forth: count how many needed a retry. If retries
@@ -950,8 +959,8 @@ What does *not* get an interface:
   `type Runner func(ctx context.Context, argv []string) error` — defined in
   `agent`, implemented by `platform.Run`. A fake runner records calls and
   returns canned exit codes. `screen` has the same seam with the child's output
-  added (`screen.Runner`, implemented by `platform.Output`), because its receipt
-  is a value it reads back.
+  added (`screen.Runner`, implemented by `platform.Output`), which the Linux
+  `ddcutil` backend calls to read the monitor back.
 - **The server client.** Tests point the real client at `httptest.NewServer`
   wrapping the real handler, which exercises the actual protocol. A mocked
   client would test the mock.
@@ -1016,12 +1025,13 @@ are run-level. It contains no policy.
 
 - Module: `github.com/<user>/soft-kvm`; layout in §11.
 - Deps: stdlib, `golang.org/x/sync`, `github.com/grandcat/zeroconf` (which pulls
-  `miekg/dns` and `golang.org/x/net`), and `github.com/telesma-app/hid` (which
-  pulls `ebitengine/purego`, `golang.org/x/sys` and `golang.org/x/text`). All
-  pure Go — purego does FFI through `dlopen`, not cgo — so `CGO_ENABLED=0`,
-  `-trimpath`, `-ldflags="-s -w"` still hold. Discovery costs three modules
-  where the rest of the binary costs two — that is the price of not editing an
-  IP address in three places.
+  `miekg/dns` and `golang.org/x/net`), `github.com/telesma-app/hid` (which pulls
+  `ebitengine/purego`, `golang.org/x/sys` and `golang.org/x/text`), and
+  `github.com/ebitengine/purego` directly on macOS for `CoreFoundation` and
+  `IOKit` DDC/CI in `screen`. All pure Go — purego does FFI through `dlopen`,
+  not cgo — so `CGO_ENABLED=0`, `-trimpath`, `-ldflags="-s -w"` still hold.
+  Discovery costs three modules where the rest of the binary costs two — that is
+  the price of not editing an IP address in three places.
 - Targets: `linux/amd64` (desktop), `darwin/arm64` (laptop), and `linux/arm64`
   or `linux/arm` for a Pi — check `uname -m`, since `armv7l` means `linux/arm`
   `GOARM=7` even under a 64-bit kernel.

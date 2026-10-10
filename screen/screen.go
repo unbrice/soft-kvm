@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // screen.go: the `screen-switch` virtual switch command — input aliases, the
-// mapping tables and the argv parser (SPEC §5.6). The per-OS files
-// drive the monitor: ddcutil on Linux, BetterDisplay on macOS.
+// mapping tables, the argv parser and the confirm loop both backends share
+// (SPEC §5.6). The per-OS files drive the monitor: ddcutil on Linux,
+// IOAVService on macOS.
 
 package screen
 
@@ -16,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Runner executes one argv slice and returns its combined output: nil error
@@ -54,7 +56,7 @@ func (t *Table) reads(alias string) (value uint8, ok bool) {
 }
 
 // inputSourceVCP is the MCCS Input Source feature: what the standard table
-// writes, and what the Linux backend reads back to confirm a switch.
+// writes, and what both backends read back to confirm a switch.
 const inputSourceVCP = 0x60
 
 // StandardName names the table a command gets when it names none, and the
@@ -72,10 +74,24 @@ var standard = &Table{
 	},
 }
 
-// tables holds every mapping this OS can use, standard first. The vendor
-// tables are per-OS: they describe what a backend must write, and only a
-// backend that writes raw VCP features needs one.
-var tables = append([]*Table{standard}, vendorTables...)
+// lg is LG's private side channel: firmware that ignores 0x60 writes honours
+// 0xF4 sent from source address 0x50 (SPEC §5.6).
+var lg = &Table{
+	Name:   "lg",
+	VCP:    0xF4,
+	Source: 0x50,
+	Mfg:    []string{"GSM"},
+	Inputs: map[string]uint8{
+		"dp1": 0xD0, "usbc1": 0xD1, "hdmi1": 0x90, "hdmi2": 0x91,
+	},
+	// It reports the standard values in Input Source: measured on dp1,
+	// assumed for the other ports.
+	Reads: standard.Inputs,
+}
+
+// tables holds every mapping, standard first. A vendor table describes what
+// a backend that writes raw VCP features must send, and both backends do.
+var tables = []*Table{standard, lg}
 
 // Tables lists the mapping tables, standard first.
 func Tables() []*Table { return tables }
@@ -191,7 +207,7 @@ func Parse(args []string) (*Switch, error) {
 // Display is one DDC-capable monitor `detect` found.
 type Display struct {
 	Mfg   string // EDID manufacturer ID, e.g. GSM
-	Model string
+	Model string // the name display=MATCH selects it by
 	// Input is the monitor's current Input Source value — this host's own
 	// port, since it is the one on screen. InputOK is false when unread.
 	Input   uint8
@@ -246,4 +262,135 @@ func parseDetect(out []byte) []Display {
 		displays = append(displays, Display{Mfg: f[0], Model: f[1]})
 	}
 	return displays
+}
+
+// The confirm window: how long the monitor may keep answering on this input
+// after the write before the switch counts as failed, and the poll spacing.
+// Variables so the tests can shrink them.
+var (
+	confirmWindow = 4 * time.Second
+	confirmPoll   = 500 * time.Millisecond
+)
+
+// confirm polls this host's own read of Input Source after a write, the
+// receipt both backends share (SPEC §5.6): it fails, or reports the target,
+// once the switch landed. read returns err when the monitor no longer
+// answers, and ok false when it answered with nothing readable.
+func (s *Switch) confirm(ctx context.Context, read func(context.Context) (v uint8, ok bool, err error)) error {
+	deadline := time.Now().Add(confirmWindow)
+	for {
+		v, ok, err := read(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			return nil // DDC went silent: this input is no longer the active one
+		}
+		if ok && s.ExpectOK && v == s.Expect {
+			// The monitor shows the target and still answers: it answers on
+			// every input, or the target is this host's own port.
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("screen-switch: monitor still on this input %v after the write", confirmWindow)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(confirmPoll):
+		}
+	}
+}
+
+// DDC/CI for a backend that speaks it in-process (SPEC §5.6). The I²C call
+// itself sends the source address first; the frames below follow it.
+const (
+	ddcAddr  = 0x37 // the monitor's DDC/CI I²C address
+	ddcHost  = 0x51 // the standard host source address
+	edidAddr = 0x50 // the EDID's I²C address
+)
+
+// errNoReply is a read that brought nothing back from the monitor: it no
+// longer answers DDC/CI on this input.
+var errNoReply = errors.New("no DDC/CI reply")
+
+// getVCPRequest frames a Get VCP Feature request for vcp, sent from src.
+func getVCPRequest(src, vcp uint8) []byte { return ddcFrame(src, 0x01, vcp) }
+
+// setVCPRequest frames a Set VCP Feature request writing value to vcp.
+func setVCPRequest(src, vcp uint8, value uint16) []byte {
+	return ddcFrame(src, 0x03, vcp, byte(value>>8), byte(value))
+}
+
+// ddcFrame lays out a host message after its source byte: the length, the
+// payload, and a checksum that also covers the two addresses.
+func ddcFrame(src uint8, payload ...byte) []byte {
+	msg := append([]byte{0x80 | byte(len(payload))}, payload...)
+	sum := byte(ddcAddr<<1) ^ src
+	for _, b := range msg {
+		sum ^= b
+	}
+	return append(msg, sum)
+}
+
+// parseVCPReply reads the current value out of the 11-byte reply to a Get
+// VCP Feature request for vcp.
+func parseVCPReply(reply []byte, vcp uint8) (uint16, error) {
+	if len(reply) < 11 || reply[0] != ddcAddr<<1 {
+		return 0, errNoReply
+	}
+	// A null message, what this LG answers once it shows another input:
+	// nothing to report, which ddcutil counts as no response too.
+	if reply[1] == 0x80 && reply[2] == 0xBE {
+		return 0, fmt.Errorf("%w: null message", errNoReply)
+	}
+	// On this M4 Pro the length byte of a VCP reply has come back as 0x51,
+	// with a checksum that still covers the 0x88 the length must be: check
+	// against that length, not the byte read.
+	sum := byte(0x50) ^ reply[0] ^ 0x88
+	for _, b := range reply[2:10] {
+		sum ^= b
+	}
+	switch {
+	case sum != reply[10]:
+		return 0, fmt.Errorf("DDC/CI reply % x: bad checksum", reply)
+	case reply[2] != 0x02 || reply[4] != vcp:
+		return 0, fmt.Errorf("DDC/CI reply % x: not about VCP %#02x", reply, vcp)
+	case reply[3] != 0:
+		return 0, fmt.Errorf("DDC/CI reply % x: VCP %#02x unsupported", reply, vcp)
+	}
+	return uint16(reply[8])<<8 | uint16(reply[9]), nil
+}
+
+// parseEDID reads the manufacturer and the monitor name out of an EDID base
+// block. ok is false when edid is not one: wrong header, length or checksum.
+func parseEDID(edid []byte) (mfg, name string, ok bool) {
+	if len(edid) < 128 || string(edid[:8]) != "\x00\xff\xff\xff\xff\xff\xff\x00" {
+		return "", "", false
+	}
+	var sum byte
+	for _, b := range edid[:128] {
+		sum += b
+	}
+	if sum != 0 {
+		return "", "", false
+	}
+	// Four 18-byte descriptors follow the timings; tag 0xFC is the name:
+	// thirteen bytes, ended by a newline and padded with spaces.
+	for d := 54; d < 126; d += 18 {
+		if edid[d] == 0 && edid[d+1] == 0 && edid[d+3] == 0xFC {
+			name, _, _ = strings.Cut(string(edid[d+5:d+18]), "\n")
+			name = strings.TrimRight(name, " ")
+		}
+	}
+	return pnpID(uint16(edid[8])<<8 | uint16(edid[9])), name, true
+}
+
+// pnpID decodes an EDID manufacturer ID: three letters of five bits each, 'A'
+// as 1, so 0x1E6D is GSM. It returns "" for 0, a display that names none.
+func pnpID(code uint16) string {
+	if code == 0 {
+		return ""
+	}
+	return string([]byte{'@' + byte(code>>10&31), '@' + byte(code>>5&31), '@' + byte(code&31)})
 }

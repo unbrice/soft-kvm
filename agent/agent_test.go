@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -329,6 +330,9 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 // screen-switch is built in: it goes to the screen runner, never to the argv
 // runner as a program called "screen-switch" (SPEC §5.6).
 func TestAgentScreenSwitchIsBuiltIn(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ScreenRunner (ddcutil) is Linux-only; macOS uses IOAVService")
+	}
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)

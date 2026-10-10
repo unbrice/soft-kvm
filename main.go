@@ -436,9 +436,10 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 
-	// The Linux desktop has no guards: NewGuard there ignores displayMatch and
-	// is always ok (SPEC §6.1-6.2).
-	guard := platform.NewGuard(flags.displayMatch, flags.noGuards)
+	// The Linux desktop has no guards: NewGuard there ignores its arguments
+	// and is always ok (SPEC §6.1-6.2). On macOS it lists the monitors
+	// through screen, which platform cannot import.
+	guard := platform.NewGuard(flags.displayMatch, flags.noGuards, screen.DisplayNames)
 
 	// The trailing commands are argv slices, never shell strings (SPEC §9).
 	switchCommands, err := parseSwitchCommands(fs.Args())

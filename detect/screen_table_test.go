@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen_linux_test.go: the screen-switch suggestion for a monitor whose
-// brand maps to a vendor table — those exist on Linux only (SPEC §5.6).
+// screen_table_test.go: the screen-switch suggestion for a monitor whose
+// brand maps to a vendor table (SPEC §5.6).
 
 package detect
 

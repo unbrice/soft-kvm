@@ -123,21 +123,9 @@ func screenCommand(r screen.Report) string {
 		cmd += " " + t.Name
 	}
 	if len(r.Displays) > 1 {
-		cmd += " " + shellQuote("display="+d.Model)
+		cmd += " 'display=" + strings.ReplaceAll(d.Model, "'", `'\''`) + "'"
 	}
 	return cmd
-}
-
-// shellQuote single-quotes s when a shell would otherwise split or expand it.
-func shellQuote(s string) string {
-	safe := func(r rune) bool {
-		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			strings.ContainsRune("=-_.:/,", r)
-	}
-	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !safe(r) }) < 0 {
-		return s
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // renderScreen explains the screen-switch action: whether its backend works

@@ -566,16 +566,3 @@ func TestRenderScreen(t *testing.T) {
 		}
 	})
 }
-
-func TestShellQuote(t *testing.T) {
-	for in, want := range map[string]string{
-		"display=PA278QV":      "display=PA278QV",
-		"display=LG ULTRAWIDE": "'display=LG ULTRAWIDE'",
-		"it's":                 `'it'\''s'`,
-		"":                     "''",
-	} {
-		if got := shellQuote(in); got != want {
-			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
-		}
-	}
-}

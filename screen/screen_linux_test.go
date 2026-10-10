@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // screen_linux_test.go: the ddcutil write-then-confirm sequence against a
-// fake runner, and the lg vendor table.
+// fake runner.
 
 package screen
 
@@ -49,15 +49,6 @@ func shrinkConfirm(t *testing.T) {
 	w, p := confirmWindow, confirmPoll
 	confirmWindow, confirmPoll = 40*time.Millisecond, 5*time.Millisecond
 	t.Cleanup(func() { confirmWindow, confirmPoll = w, p })
-}
-
-func mustParse(t *testing.T, args ...string) *Switch {
-	t.Helper()
-	s, err := Parse(args)
-	if err != nil {
-		t.Fatalf("Parse(%v): %v", args, err)
-	}
-	return s
 }
 
 func TestDoWritesTheTable(t *testing.T) {
@@ -170,44 +161,6 @@ func TestProbe(t *testing.T) {
 			t.Fatalf("Probe = %+v, want %+v", r, want)
 		}
 	})
-}
-
-func TestLGTable(t *testing.T) {
-	lg := tableByName("lg")
-	if lg == nil {
-		t.Fatal("no lg table on Linux")
-	}
-	for _, mfg := range []string{"GSM", "gsm"} {
-		if got := TableFor(mfg); got != lg {
-			t.Errorf("TableFor(%s) = %q, want lg", mfg, got.Name)
-		}
-	}
-	// A table names only the ports it has a value for.
-	if got := strings.Join(lg.Aliases(), ","); got != "dp1,hdmi1,hdmi2,usbc1" {
-		t.Errorf("lg aliases = %q", got)
-	}
-	if _, err := Parse([]string{"dp2", "lg"}); err == nil || !strings.Contains(err.Error(), "dp1, hdmi1, hdmi2, usbc1") {
-		t.Errorf("Parse(dp2 lg) error = %v, want one listing lg's ports", err)
-	}
-	// lg writes 0xF4 but reads back the standard Input Source values.
-	for value, want := range map[uint8]string{0x0F: "dp1", 0x11: "hdmi1", 0x12: "hdmi2", 0x1B: "usbc1"} {
-		if got, ok := lg.AliasFor(value); !ok || got != want {
-			t.Errorf("lg AliasFor(%#x) = %q/%v, want %s", value, got, ok, want)
-		}
-	}
-	if got, ok := lg.AliasFor(0xD0); ok {
-		t.Errorf("lg AliasFor(0xD0) = %q, want none: 0xD0 is written, never read", got)
-	}
-	if s := mustParse(t, "dp1", "lg"); !s.ExpectOK || s.Expect != 0x0F {
-		t.Errorf("Parse(dp1 lg) expect = %#x/%v, want 0x0F", s.Expect, s.ExpectOK)
-	}
-	if s := mustParse(t, "usbc1", "lg"); !s.ExpectOK || s.Expect != 0x1B {
-		t.Errorf("Parse(usbc1 lg) expect = %#x/%v, want 0x1B", s.Expect, s.ExpectOK)
-	}
-	// A raw value went to 0xF4: nothing says how the port reads back.
-	if s := mustParse(t, "0xD2", "lg"); s.Table != lg || s.ExpectOK {
-		t.Errorf("Parse(0xD2 lg) = table %q, ExpectOK %v; want lg, false", s.Table.Name, s.ExpectOK)
-	}
 }
 
 // Switching to the port the monitor already shows succeeds the same way

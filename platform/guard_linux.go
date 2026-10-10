@@ -11,8 +11,10 @@ import "context"
 // Guard is the Linux no-op guard.
 type Guard struct{}
 
-// NewGuard returns a Linux guard; match and disabled are ignored.
-func NewGuard(match string, disabled bool) *Guard { return &Guard{} }
+// NewGuard returns a Linux guard; its arguments are ignored.
+func NewGuard(match string, disabled bool, displays func() ([]string, error)) *Guard {
+	return &Guard{}
+}
 
 // OK always reports that switching is allowed.
 func (*Guard) OK(context.Context) (bool, string) { return true, "no guards" }
