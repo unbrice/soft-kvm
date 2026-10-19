@@ -412,9 +412,9 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
 		trigger:       fs.String("trigger", "", "required: comma-separated `NAME`s of --declare-hid devices to watch — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
-		switchRetries: fs.Int("switch-retries", 3, "re-runs of the commands or takes that failed before giving up"),
-		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, and on one write of a take, so a hung I²C write cannot freeze the agent"),
-		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run by the previous holder when a take still fails after the retries"),
+		switchRetries: fs.Int("switch-retries", 3, "re-runs of the commands, and new attempts at giving assignments away, that failed before giving up"),
+		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, and on one write giving an assignment away, so a hung I²C write cannot freeze the agent"),
+		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run by the previous assignee when giving an assignment away still fails after the retries"),
 
 		declareScreen:  &commandList{},
 		declareHID:     &commandList{},
@@ -468,8 +468,10 @@ func connectCmd(ctx context.Context) error {
 		return err
 	}
 
-	machineCfg := model.MachineConfig{
+	deciderCfg := model.DeciderConfig{
 		ID:             *flags.id,
+		OnActivation:   flags.onActivation.argv,
+		OnDeactivation: flags.onDeactivation.argv,
 		Settle:         *flags.settle,
 		SwitchRetries:  *flags.switchRetries,
 		RetrySpacing:   1 * time.Second,
@@ -477,7 +479,7 @@ func connectCmd(ctx context.Context) error {
 		Cooldown:       5 * time.Second,
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
-		BreakerOpenFor: 60 * time.Second,
+		BreakerPause:   60 * time.Second,
 	}
 
 	stateDir, err := platform.StateDir()
@@ -494,10 +496,8 @@ func connectCmd(ctx context.Context) error {
 		Guard:          guard,
 		Client:         c,
 		Runner:         platform.Run,
-		Machine:        &machineCfg,
+		Decider:        &deciderCfg,
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
-		OnActivation:   flags.onActivation.argv,
-		OnDeactivation: flags.onDeactivation.argv,
 		Screens:        wiring.screens,
 		HIDs:           wiring.hids,
 		WriteScreen: func(ctx context.Context, w screen.Write, name string) error {
@@ -591,8 +591,8 @@ func validateConnect(fs *flag.FlagSet, v *connectFlags) (wiring, error) {
 		if len(argv) > 1 {
 			return w, fmt.Errorf("connect: %s takes no argument, got %q", argv[0], argv[1:])
 		}
-		takeScreen = takeScreen || argv[0] == agent.TakeScreen
-		takeHID = takeHID || argv[0] == agent.TakeHID
+		takeScreen = takeScreen || argv[0] == model.TakeScreen
+		takeHID = takeHID || argv[0] == model.TakeHID
 	}
 	switch {
 	case takeScreen && len(w.screens) == 0:
@@ -607,7 +607,7 @@ func validateConnect(fs *flag.FlagSet, v *connectFlags) (wiring, error) {
 }
 
 // isTake reports whether name is one of the built-in take commands.
-func isTake(name string) bool { return name == agent.TakeScreen || name == agent.TakeHID }
+func isTake(name string) bool { return name == model.TakeScreen || name == model.TakeHID }
 
 // commandList is a repeatable flag: each use is one string — a command or a
 // declaration — split into an argv by splitCommand.

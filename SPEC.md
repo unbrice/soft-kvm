@@ -15,7 +15,7 @@ work; §10 is the integration pass, run at the end.
 | Hosts                 | Linux desktop `1b-nix0` (NixOS, Hyprland/Wayland, Intel Arc A770 on `xe`, monitor on `card0-DP-3`, always-on, home LAN); macOS **corp laptop** (locked down, different trust domain, frequently away)                                                                                                                                                                                                                                                                                                                                             |
 | Display               | One 4K ultrawide LG, shared. Built-in KVM unusable (USB hub bound to a single upstream port)                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | DDC/CI constraint     | Monitor answers DDC **only on the currently active video input** (observed in practice)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Input-switch commands | A screen take (§5.6), written per OS. Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify --model NAME` for this LG · macOS: `IOAVServiceWriteI2C` over `CoreFoundation` and `IOKit` (`purego` FFI, no external helper). Nothing is baked in as a default: `detect` prints the declaration for this host                                                                                                                                                                                                                           |
+| Input-switch commands | Giving a screen away (§5.6), per OS. Linux: `ddcutil setvcp 0xF4 0xD0 --i2c-source-addr=0x50 --noverify --model NAME` for this LG · macOS: `IOAVServiceWriteI2C` over `CoreFoundation` and `IOKit` (`purego` FFI, no external helper). Nothing is baked in as a default: `detect` prints the declaration for this host                                                                                                                                                                                                                            |
 | Peripherals           | Logitech multi-device keyboard + mouse on a **Bolt** receiver, `046d:c548`. A Unifying receiver `046d:c52b` is also plugged into the desktop — the detector filter must not match it. Keyboard and mouse stay on Bolt channel 1 permanently; the Easy-Switch keys retire                                                                                                                                                                                                                                                                          |
 | Trigger hardware      | Cheap USB 3.0 sharing switch, UGREEN / ATEN class. Not bought                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Coordination host     | Whichever host runs `soft-kvm serve`, found over mDNS — no host holds another's address (§5.1). The desktop by default; a Raspberry Pi on the LAN (the HA Pi; HA itself is **not** used) if a neutral one is wanted                                                                                                                                                                                                                                                                                                                               |
@@ -126,14 +126,15 @@ work; §10 is the integration pass, run at the end.
 2. Mac's `soft-kvm connect`: `POST /claim/mac` (idempotent).
 3. Server: owner changed → `activation++`, `epoch++` → wake all `/wait`
    long-polls. Linux runs its `--on-deactivation` commands, if it has any.
-4. The Mac's agent wakes and sees the ownership come to it (`last_owner != mac`,
-   `owner == mac`). It runs its `--on-activation` commands: `take-screen` posts
-   the Mac's screen declaration, `take-hid` its device declarations
-   (`POST /take/mac`).
-5. Server: one **hold** recorded per name → `epoch++` → wake.
-6. Every other agent wakes and runs the takes it can serve. Linux finds the LG
-   among its monitors and writes `F4:50=D1` to it — the monitor moves to the
-   Mac's input — then sends the mouse it still holds to the Mac's channel.
+4. The Mac's agent wakes and sees the ownership come to it
+   (`handled_owner != mac`, `owner == mac`). It runs its `--on-activation`
+   commands: `take-screen` posts the Mac's screen declaration, `take-hid` its
+   device declarations (`POST /take/mac`).
+5. Server: one **assignment** recorded per name → `epoch++` → wake.
+6. Every other agent wakes and gives away what the assignments name, where it
+   can. Linux finds the LG among its monitors and writes `F4:50=D1` to it — the
+   monitor moves to the Mac's input — then sends the mouse it still holds to the
+   Mac's channel.
 7. The mouse links on the Mac, whose agent posts `/arrived`; Linux reads it on
    the next wake and stops.
 
@@ -151,36 +152,40 @@ host's port, so a third host joins without any existing host being reconfigured.
 ### 4.3 What authorises a switch
 
 A **take** is the owner's request that one named screen or device come to it.
-The server keeps the last take per name as a **hold**: the **holder** that took
-it, the **previous holder**, what to write, and — for a device — whether it
-`arrived`. A screen take is a one-way door: after the write, the host that wrote
-can no longer reach the monitor. Three conditions gate a take, all required.
+The server keeps the last take per name as an **assignment**: the **assignee**
+that took it, the **previous assignee**, what to write, and — for a device —
+whether it `arrived`. Every other host **gives away** what the assignment names:
+it moves its screen or device to the assignee. Giving a screen away is a one-way
+door: after the write, the host that wrote can no longer reach the monitor.
+Three conditions gate an assignment, all required.
 
 - **The taker is the owner.** The server accepts `POST /take/{id}` only from the
   current owner, and only under the `activation` its ownership dates from (§7).
   A host that lost the ownership while its `-A` commands ran gets a 409. Without
   this, a slow activation lands its take after the flip back and pulls the
   monitor away from the keyboard.
-- **The take is new to this host.** The agent persists the `seq` of the last
-  take it handled per name (`$XDG_STATE_HOME/soft-kvm/agent.json`,
-  `~/Library/Application Support/soft-kvm/agent.json` on macOS) and runs a hold
-  only when its `seq` differs. An agent that starts with no local record adopts
-  every hold as handled and **never switches on that first reconcile**: a take
-  older than the agent says nothing about where the monitor is now. A name the
-  agent meets after that first reconcile is new, and runs.
-- **Holder liveness.** The server counts open `/wait` connections per host and
+- **The assignment is new to this host.** The agent persists the `seq` of the
+  last assignment it handled per name (`$XDG_STATE_HOME/soft-kvm/agent.json`,
+  `~/Library/Application Support/soft-kvm/agent.json` on macOS) and gives an
+  assignment away only when its `seq` differs. An agent that starts with no
+  local record adopts every assignment as handled and **never switches on that
+  first reconcile**: an assignment older than the agent says nothing about where
+  the monitor is now. A name the agent meets after that first reconcile is new,
+  and is given away.
+- **Assignee liveness.** The server counts open `/wait` connections per host and
   reports them in `/state` as `live`. A host stays live for a grace period after
   its last `/wait` closes (`server.LiveGraceTime`): every wake and every 204
   closes the long-poll, and the agent re-opens it one `/state` round trip later,
-  so without the grace a host reads `/state` inside the holder's gap. No host
-  runs a take whose holder has no live agent. It stays pending and is judged
-  again at the next state change: liveness alone wakes nobody.
+  so without the grace a host reads `/state` inside the assignee's gap. No host
+  gives away an assignment whose assignee has no live agent. It stays pending
+  and is judged again at the next state change: liveness alone wakes nobody.
 
-**Every host but the holder runs a take.** Only the host on the monitor's active
-input can move it (finding 1), the server's record of which host that is goes
-stale with one OSD press, and a device may be linked to any host. So each host
-tries, and a host with nothing to move does nothing: no monitor of that name
-attached, no declaration for that device, or the device not linked here.
+**Every host but the assignee gives an assignment away.** Only the host on the
+monitor's active input can move it (finding 1), the server's record of which
+host that is goes stale with one OSD press, and a device may be linked to any
+host. So each host tries, and a host with nothing to move does nothing: no
+monitor of that name attached, no declaration for that device, or the device not
+linked here.
 
 Nothing probes the monitor before the write. A read that says "my input is
 already inactive" cannot be told from a read that failed because DDC is not
@@ -188,75 +193,95 @@ wired up, and treating the second as the first makes a broken setup look like a
 finished handover. A write aimed at an input the monitor already shows costs a
 write the monitor ignores.
 
-**Circuit breaker, per name:** 5 s cooldown after a take of that name ran, and 3
-takes of one name within 30 s disable every take for 60 s with a log line. A
-misbehaving detector costs one manual OSD press, not a loop. The takes of one
-handover carry different names, so the mouse does not wait behind the screen,
-and a take with nothing to move here counts for neither: the keyboard that
-carried the gesture is absent on every handover.
+**Rate limit, per name.** Two things hold an assignment back, never a command: a
+5 s cooldown after an assignment of that name was given away, and a circuit
+breaker — 3 give-aways of one name within 30 s stop every give-away for 60 s,
+with a log line. A misbehaving detector costs one manual OSD press, not a loop.
+The assignments of one handover carry different names, so the mouse does not
+wait behind the screen, and an assignment with nothing to move here counts for
+neither: the keyboard that carried the gesture is absent on every handover.
 
 **Screens have no receipt.** The read-back from the host being left misreports
 in practice, and on the display that just became active the read races the link
-coming up. A screen take is written once; only a write that fails locally —
-`ddcutil` missing, no `i2c-dev`, no permission, a hung I²C transaction — is
+coming up. A screen assignment is written once; only a write that fails locally
+— `ddcutil` missing, no `i2c-dev`, no permission, a hung I²C transaction — is
 retried. A write the monitor ignores is silent and costs one press of the OSD
 Input button (§2).
 
-**A device's receipt is its arrival on the holder.** The holder polls each
+**A device's receipt is its arrival on the assignee.** The assignee polls each
 device it took — every 1 s, for 60 s after the take — and posts `/arrived` once
 it holds the link. A device already there when `take-hid` runs is posted as
 arrived, and no host moves it: the peripheral that carried the gesture never
 costs a write. A host that sent a device waits 10 s for `arrived`.
 
-One run of the takes is bounded twice: glue-side by `--switch-timeout` per write
-(default 30 s, SIGTERM then SIGKILL after `WaitDelay`), and machine-side by a 60
-s watchdog. A result is accepted only while its run is outstanding — a late one
-is ignored and logged.
+The decider tracks the work in flight as a **job**: **tasks** it **issues**
+together — the `-A` or `-D` commands of an ownership change, or the assignments
+a reconcile gives away — then, once every task is settled, success or not, a
+**record** of what the job handled: the ownership the commands ran for, or the
+seq of each assignment. A restart before the record runs the tasks again. Once
+the record is saved, the job logs what failed and notifies what still failed
+after the last retry. `--switch-timeout` bounds each write of an issue (default
+30 s, SIGTERM then SIGKILL after `WaitDelay`), so every issue reports, and the
+decider waits for that report with no deadline of its own: an issue is as long
+as its writes added up, and a decider-side bound would retry while the worker is
+still busy, then take the late result for the retry's. A result is accepted only
+while its issue is outstanding — a late one is ignored and logged.
 
-1. Run every pending take, in the order `/state` lists them. One failing does
-   not skip the rest: they target independent devices.
-2. Screen written, device arrived, or nothing to move here ⇒ that take is done.
+1. Give away every pending assignment, in the order `/state` lists them. One
+   failing does not skip the rest: they target independent devices.
+2. Screen written, device arrived, or nothing to move here ⇒ that assignment is
+   done.
 3. A write that failed, died or never reported, or a device that did not arrive
-   within 10 s ⇒ re-run **only those takes**, up to `--switch-retries 3`, at
-   least 1 s apart. A take superseded by a newer one of the same name is
-   dropped.
-4. Still failing after the last retry ⇒ the previous holder runs `--notify-cmd`;
-   every other host logs and stops.
+   within 10 s ⇒ retry **only those assignments**, up to `--switch-retries 3`,
+   each at least 1 s after its last attempt. An assignment superseded by a newer
+   take of the same name is dropped.
+4. Still failing after the last retry ⇒ the previous assignee runs
+   `--notify-cmd`; every other host logs and stops.
 
-The previous holder is the host the thing just left, which for a screen is the
+The previous assignee is the host the thing just left, which for a screen is the
 one still showing — the only host the user can read at that moment. A third
 host's failure is expected (its input is inactive) and its notification would
 sit unread until the next switch. The record is wrong after an OSD press: the
-host on screen then fails silently. A first take of a name has no previous
-holder and never notifies.
+host on screen then fails silently. The first assignment of a name has no
+previous assignee and never notifies.
 
 Nothing re-claims and nothing reverts: the shared bit is already right, the
 keyboard is already where the user put it, and only the pixels or the mouse are
 behind.
 
-**Activation and deactivation.** The edge `last_owner != me && owner == me` runs
-the `--on-activation` commands; `last_owner == me && owner != me` runs the
-`--on-deactivation` commands. Neither is a door, so no liveness gate, cooldown,
-breaker or notification applies. They share the `last_owner` record — an agent
-with no record adopts the owner and runs nothing — and the retry path: commands
-run in order, each bounded by `--switch-timeout`, and only those that failed
-re-run, up to `--switch-retries`. A failure after the last retry is logged.
+**Activation and deactivation.** The edge `handled_owner != me && owner == me`
+runs the `--on-activation` commands; `handled_owner == me && owner != me` runs
+the `--on-deactivation` commands. Neither is a door, so no liveness gate,
+cooldown, breaker or notification applies. They share the `handled_owner` record
+— an agent with no record adopts the owner and runs nothing — and the retry
+path: commands run in order, each bounded by `--switch-timeout`, and only those
+that failed re-run, up to `--switch-retries`, so a take the server already
+accepted is not posted again. A failure after the last retry is logged.
 `take-screen` and `take-hid` exit 0 when the server accepted the take; a 409 is
-a failure like any other. `last_owner` is saved when the commands end, success
-or not, so an agent restarted mid-run runs the commands again and one that ran
-them does not repeat them for the same transition.
+a failure like any other. Once the commands are over, success or not, the job
+records the ownership they ran for — `handled_owner` and `handled_activation`,
+from the `/state` that crossed the edge — so an agent restarted mid-run runs the
+commands again and one that ran them does not repeat them for the same
+transition.
 
 **Re-activation.** `soft-kvm activate ID` against the current owner bumps
-`activation` without changing the owner (§5.3). The owner's agent persists the
-activation it last ran (`last_activation`) and runs its `-A` commands again when
-the two differ. Its takes carry the new activation, so the server records them
-anew and every other host runs them again. This is the recovery for a mouse
-stranded on the wrong host and for a monitor moved by OSD. An attach-driven
-re-claim bumps nothing: a receiver flap or an agent restart moves no screen.
+`activation` without changing the owner (§5.3). The owner's agent compares it
+with the `handled_activation` it recorded and runs its `-A` commands again when
+the two differ. Its takes carry the new activation, so the server records the
+assignments anew and every other host gives them away again. This is the
+recovery for a mouse stranded on the wrong host and for a monitor moved by OSD.
+An attach-driven re-claim bumps nothing: a receiver flap or an agent restart
+moves no screen.
 
-One thing runs at a time — an activation, a deactivation, or a batch of takes. A
-state that arrives while one runs is reconciled when it ends, ownership edge
-first: a flip away during an activation deactivates right after it.
+One job is in flight at a time — an activation, a deactivation, or a batch of
+assignments. Whenever none is, the decider reconciles the newest state it has
+seen, ownership edge first: a state that arrives during a job is reconciled when
+it ends — a flip away during an activation deactivates right after it — and an
+assignment the rate limit deferred is given away once the limit lifts.
+Reconciling a state again changes nothing once its job is over, since every job
+records what it handled. Why an assignment is held back is logged once, and
+again only when the reason changes. A claim waits out `--settle` from the last
+attach, then for the job in flight to end.
 
 ## 5. CLI surface
 
@@ -327,12 +352,12 @@ Sharp edges, in the order they will bite:
 
 ### 5.2 `soft-kvm serve [IP:]PORT`
 
-The bit, the holds (§7), and nothing else. `IP` optional — omitted binds all
-interfaces (`soft-kvm serve 8700` ≡ `:8700`).
+The bit, the assignments (§7), and nothing else. `IP` optional — omitted binds
+all interfaces (`soft-kvm serve 8700` ≡ `:8700`).
 
 | Flag / env        | Default   | Meaning                                                        |
 | ----------------- | --------- | -------------------------------------------------------------- |
-| `--state PATH`    | see below | Persisted owner, epoch, activation and holds (§7)              |
+| `--state PATH`    | see below | Persisted owner, epoch, activation and assignments (§7)        |
 | `--instance NAME` | hostname  | mDNS instance name under `_soft-kvm._tcp`                      |
 | `--no-advertise`  | off       | Skip the mDNS registration; clients must be given an address   |
 | `SOFTKVM_TOKEN`   | required  | Shared secret; derives the TLS identity and client certificate |
@@ -356,10 +381,11 @@ which is also how its liveness gets registered (§4.3).
 Makes `ID` the owner and has it take — one-shot `POST /claim/ID?retake=true`,
 exits non-zero on failure. Server resolution as §5.1, so it works from any LAN
 host with only the token. When `ID` already owns, its agent runs its `-A`
-commands again and every other host runs the takes again (§4.3). `--force` is
-required when `ID` has no live agent: the bit flips and nothing moves until that
-agent starts, sees the ownership come to it and takes. Use cases: a mouse left
-on the wrong host, a monitor moved by OSD, testing, "just switch now".
+commands again and every other host gives the assignments away again (§4.3).
+`--force` is required when `ID` has no live agent: the bit flips and nothing
+moves until that agent starts, sees the ownership come to it and takes. Use
+cases: a mouse left on the wrong host, a monitor moved by OSD, testing, "just
+switch now".
 
 ### 5.4 `soft-kvm connect --trigger LIST [--declare-screen DECL]... [--declare-hid DECL]... [-A COMMAND]... [-D COMMAND]... [flags]`
 
@@ -376,10 +402,10 @@ else knows it: `soft-kvm detect` prints them.
 | `--declare-hid DECL`              | none                                                       | none                                                                                          | `NAME VID:PID[:SLOT] [host=N]`: the device every host calls `NAME` reaches this host at that address, on Easy-Switch channel `N` (§5.5). Repeat per device. `--trigger` names one; `take-hid` takes those with a `host=N`, and this host gives the others away without taking them                                                                                                                                                                  |
 | `-A`, `--on-activation COMMAND`   | none                                                       | none                                                                                          | Run when this host becomes the owner (§4.3). Repeat for several; they run in order. `take-screen` and `take-hid` are commands of this list only                                                                                                                                                                                                                                                                                                     |
 | `-D`, `--on-deactivation COMMAND` | none                                                       | none                                                                                          | Run when this host stops being the owner (§4.3). Repeat for several; they run in order                                                                                                                                                                                                                                                                                                                                                              |
-| `--switch-timeout 30s`            | 30s                                                        | 30s                                                                                           | Bound on one `-A` or `-D` command, and on one write of a take — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                                                                                                   |
+| `--switch-timeout 30s`            | 30s                                                        | 30s                                                                                           | Bound on one `-A` or `-D` command, and on one write giving an assignment away — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                                                                                   |
 | `--settle 2s`                     | 2s                                                         | 2s                                                                                            | Attach must persist this long before claiming                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `--switch-retries 3`              | 3                                                          | 3                                                                                             | Re-runs of the commands or takes that failed, at least 1 s apart, before giving up                                                                                                                                                                                                                                                                                                                                                                  |
-| `--notify-cmd CMD`                | `notify-send 'soft-kvm' 'Handover failed: switch by hand'` | `osascript -e 'display notification "Handover failed: switch by hand" with title "soft-kvm"'` | Run by the previous holder when a take still fails after the last retry (§4.3)                                                                                                                                                                                                                                                                                                                                                                      |
+| `--switch-retries 3`              | 3                                                          | 3                                                                                             | Re-runs of the commands, and new attempts at giving assignments away, that failed, at least 1 s apart, before giving up                                                                                                                                                                                                                                                                                                                             |
+| `--notify-cmd CMD`                | `notify-send 'soft-kvm' 'Handover failed: switch by hand'` | `osascript -e 'display notification "Handover failed: switch by hand" with title "soft-kvm"'` | Run by the previous assignee when giving an assignment away still fails after the last retry (§4.3)                                                                                                                                                                                                                                                                                                                                                 |
 | `--no-guards`                     | implicit                                                   | —                                                                                             | macOS guards: AC power + dock present (§6.2)                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `SOFTKVM_TOKEN`                   | required                                                   | required                                                                                      | Shared secret                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -416,16 +442,16 @@ soft-kvm connect --trigger keyboard \
    backoff with full jitter to 30 s; failure logged, never fatal).
 3. Watcher: `GET /wait?epoch=N&id=<me>` (client timeout 60 s) → on wake,
    reconcile as in (1). A connection error is a reconcile trigger, not a fatal.
-4. Arrival watcher: while a device hold names this host as holder and is not
-   `arrived`, poll the declared device every 1 s for 60 s and `POST /arrived`
-   when it holds the link (§4.3).
+4. Arrival watcher: while a device assignment names this host as assignee and is
+   not `arrived`, poll the declared device every 1 s for 60 s and
+   `POST /arrived` when it holds the link (§4.3).
 5. Guards re-evaluated every cycle; off-guard ⇒ fully dormant, zero traffic,
    re-checking the guards every 15 s (macOS).
 6. **Sleep detection:** after each `/wait` long-poll, compare wall-clock
    progress against monotonic elapsed time. A wall-clock jump greater than twice
-   the client's internal `/wait` timeout means the machine slept through the
-   poll: reconcile immediately rather than waiting out the dead socket, which
-   can hang for minutes after a lid-open.
+   the client's internal `/wait` timeout means the host slept through the poll:
+   reconcile immediately rather than waiting out the dead socket, which can hang
+   for minutes after a lid-open.
 
 ### 5.5 HID declarations and `take-hid`
 
@@ -438,8 +464,8 @@ to watch (§5.4). `take-hid` posts every one that carries a `host=N`, and each
 other host that declares the same `NAME` sends its end of the device over with
 HID++ 2.0 `changeHost` (`0x1814`). In a setup without the USB switch, an
 Easy-Switch key (keyboard) or host button (mouse) press remains the gesture —
-the moved device's attach is the §6.1 trigger — and the take makes the other
-peripherals follow.
+the moved device's attach is the §6.1 trigger — and giving the assignments away
+makes the other peripherals follow.
 
 - **`NAME`** is the device's identity across hosts: 1-64 characters of
   `[A-Za-z0-9._-]`, the same on every host. No address can serve: one mouse is
@@ -469,18 +495,18 @@ peripherals follow.
   moved by a USB switch — which `detect` prints for those. **No other host can
   derive it** — `changeHost` reports how many hosts a device supports and which
   one it is on, never which of the others is the peer, and a device may report
-  three paired hosts for two machines — and the holder has to say it before the
-  device is there to ask. The channel differs per device: one host is 2 on the
-  keyboard and 3 on the mouse. `detect` prints it for a device linked here. A
-  device paired but linked elsewhere stays out of the suggested `connect` line,
-  which runs as printed: `detect` prints its flag below the line as a comment
-  marked ⚠️, with `host=N` left to fill in.
+  three paired hosts for two computers — and the assignee has to say it before
+  the device is there to ask. The channel differs per device: one host is 2 on
+  the keyboard and 3 on the mouse. `detect` prints it for a device linked here.
+  A device paired but linked elsewhere stays out of the suggested `connect`
+  line, which runs as printed: `detect` prints its flag below the line as a
+  comment marked ⚠️, with `host=N` left to fill in.
 
-A host runs a device take against its own declaration of `NAME`. A device not
+A host gives a device away against its own declaration of `NAME`. A device not
 linked here — HID node absent, receiver absent, slot off the link — is nothing
 to move, not a failure: otherwise the peripheral that carried the gesture would
 trip the §4.3 breaker on every switch. A linked one gets `setHost(N-1)`, and the
-host waits for its arrival on the holder (§4.3).
+host waits for its arrival on the assignee (§4.3).
 
 Mechanics: the host probes the device's HID interfaces for one that answers
 HID++. Vendor-defined interfaces are tried first (usage page `0xFF43` on
@@ -528,7 +554,7 @@ this OS has — `ddcutil` on Linux, `IOAVService` on macOS.
 - **`NAME`** is the monitor's EDID name (descriptor `0xFC`), compared ignoring
   case. Every host attached to a monitor reads the same EDID, so the name
   matches across hosts with nothing to agree on; `detect` prints it. A host with
-  two attached monitors of one name fails the take rather than pick.
+  two attached monitors of one name fails to give it away rather than pick.
   TODO(edid-serial): tell them apart by EDID serial where the monitor has one —
   not every EDID does.
 - **`INPUT`** is the port *this* host is plugged into: one of the table's
@@ -552,9 +578,9 @@ what a raw `INPUT` is for. A vendor is one more row.
 address, the value. `usbc1 lg` travels as `F4:50=D1`, `dp1` as `60:51=0F`. The
 taker resolves its alias; the writer needs no table for another host's port. A
 writer accepts only the `VCP:SRC` pairs its own tables list (`60:51`, `F4:50`),
-with any value, and fails the take on anything else: the features next to Input
-Source include factory reset (`0x04`) and power (`0xD6`), and the token must not
-reach them (§9).
+with any value, and refuses an assignment that carries anything else: the
+features next to Input Source include factory reset (`0x04`) and power (`0xD6`),
+and the token must not reach them (§9).
 
 **Writing.** A host looks for a monitor named `NAME` among its attached displays
 — the EDIDs under `/sys/class/drm/*/edid` on Linux, the IORegistry on macOS,
@@ -572,8 +598,8 @@ one write, never read back (§4.3):
   DDC/CI `setVCP` packet (`0x03`) through `IOAVServiceWriteI2C`.
 
 A write that fails — `ddcutil` missing, no `i2c-dev`, no permission, or no
-matching `IOAVService` — fails the take with the backend's own error and is
-retried (§4.3).
+matching `IOAVService` — fails to give the screen away with the backend's own
+error and is retried (§4.3).
 
 **What `detect` contributes.** It runs the backend once and prints the
 `--declare-screen` flag inside each suggested `connect` line. On both OSes it
@@ -640,7 +666,7 @@ unit; the env files and `/usr/local/bin/soft-kvm` stay.
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Detector (primary) | Two sources, fanned into one attach channel. `VID:PID`: HID device add/remove events via `telesma-app/hid` (netlink kernel uevents on `hidraw`, VID:PID from sysfs) — the same library and code path as macOS (§6.2). `VID:PID:SLOT`: the receiver's own device-connection notifications, read from its HID++ interface (needs the §5.5 hidraw rule) |
 | Guards             | None (always-on desktop)                                                                                                                                                                                                                                                                                                                             |
-| Screen write       | A take's write through `ddcutil` (§5.6); user in `i2c` group — no sudo                                                                                                                                                                                                                                                                               |
+| Screen write       | A screen assignment's write through `ddcutil` (§5.6); user in `i2c` group — no sudo                                                                                                                                                                                                                                                                  |
 | Packaging          | Canonical units in `units/`, rendered and installed by `soft-kvm service install` (§5.7); the agent's env file is `~/.config/soft-kvm/env` (§6.4)                                                                                                                                                                                                    |
 
 **Detector specifics** — the parts that are easy to get wrong:
@@ -678,9 +704,9 @@ unit; the env files and `/usr/local/bin/soft-kvm` stay.
   `/sys/class/hidraw/*/device/uevent`, world-readable: no udev rule.
 - The Unifying receiver `046d:c52b` is on the same bus. Filter exactly.
 - **Sending a device needs hidraw write access** (§5.5). The detector only reads
-  uevents, but a device take, the arrival poll and `detect` open the receiver's
-  hidraw node `O_RDWR`: add a udev rule (`TAG+="uaccess"` or a group), as
-  Solaar's packaging does.
+  uevents, but giving a device away, `take-hid`, the arrival poll and `detect`
+  open the receiver's hidraw node `O_RDWR`: add a udev rule (`TAG+="uaccess"` or
+  a group), as Solaar's packaging does.
 
 **NixOS prerequisites** (none of which are in place today, finding 12):
 
@@ -703,15 +729,16 @@ with `--model NAME` (§5.6), and ddcutil's scan costs ~1–3 s.
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Guards             | `pmset -g ps` contains `AC Power`, and the LG is present                                                                                                                                                                                                                                        |
 | Detector (primary) | `IOHIDManager` device-matching events filtered to VID:PID, via `telesma-app/hid` (purego — dynamic FFI, no cgo, static binary preserved); the same library and code path as Linux (§6.1). No `IOHIDManagerOpen`: enumeration callbacks need no device access, so no Input-Monitoring TCC prompt |
-| Screen write       | A take's write through `IOAVService` (§5.6) — in-process via `purego`, no external helper                                                                                                                                                                                                       |
+| Screen write       | A screen assignment's write through `IOAVService` (§5.6) — in-process via `purego`, no external helper                                                                                                                                                                                          |
 | Packaging          | `~/Library/LaunchAgents/local.soft-kvm.plist` (`RunAtLoad`, `KeepAlive`), token in a `0600` env file, log to `~/Library/Logs/`                                                                                                                                                                  |
 | Installs           | One binary + one plist. `pmset` is stock; the guard lists the monitors from the IORegistry in-process (§5.6), with no external helper                                                                                                                                                           |
 
 - **Sending a device needs Input Monitoring** (§5.5). Enumeration and the attach
-  events need no TCC grant, but a device take — like `detect`'s scan — opens the
-  keyboard or mouse HID node for the HID++ write, and macOS gates that on the
-  terminal's Input Monitoring permission (System Settings → Privacy & Security →
-  Input Monitoring). `detect` names the setting when a scan is denied.
+  events need no TCC grant, but giving a device away — like `detect`'s scan —
+  opens the keyboard or mouse HID node for the HID++ write, and macOS gates that
+  on the terminal's Input Monitoring permission (System Settings → Privacy &
+  Security → Input Monitoring). `detect` names the setting when a scan is
+  denied.
 - **The display-presence guard is a trap.** With Deep Sleep on, the LG drops the
   link on the input it is not showing, so "LG present" is false exactly when the
   Mac is docked but not active — and the guard would make the Mac permanently
@@ -798,22 +825,24 @@ one ownership bit, and ask the other hosts for one of two bounded writes (§9).
 | Endpoint                                  | Behavior                                                                                                                                                                                                                                                                                      |
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /claim/{id}?retake=true&force=true` | Idempotent. A change of owner increments `activation` and `epoch` and wakes waiters. With `retake` (sent by `activate` only) an unchanged owner increments both and wakes too. `force` admits an `id` with no live agent. → `200 {owner, epoch, changed}` · `400` invalid id or no live agent |
-| `POST /take/{id}`                         | Body `{activation, takes: [{kind, name, input \| channel, arrived}]}`. Records one hold per take. → `200 {epoch, changed}` · `409` when `id` is not the owner or `activation` is not the current one · `400` on a malformed take                                                              |
-| `POST /arrived/{id}`                      | Body `{arrivals: [{kind, name, seq}]}`. Marks a hold `arrived` when `id` is its holder and `seq` is its current one; anything else is ignored. → `200 {epoch, changed}`                                                                                                                       |
-| `GET /state`                              | → `200 {owner, epoch, since, activation, live, server_id, holds}`                                                                                                                                                                                                                             |
+| `POST /take/{id}`                         | Body `{activation, takes: [{kind, name, input \| channel, arrived}]}`. Records one assignment per take. → `200 {epoch, changed}` · `409` when `id` is not the owner or `activation` is not the current one · `400` on a malformed take                                                        |
+| `POST /arrived/{id}`                      | Body `{arrivals: [{kind, name, seq}]}`. Marks an assignment `arrived` when `id` is its assignee and `seq` is its current one; anything else is ignored. → `200 {epoch, changed}`                                                                                                              |
+| `GET /state`                              | → `200 {owner, epoch, since, activation, live, server_id, assignments}`                                                                                                                                                                                                                       |
 | `GET /wait?epoch=N&id=<me>`               | Long-poll. Returns `200 {owner, epoch}` immediately when `epoch ≠ N`; `204` after 50 s. Registers `id` as live for the duration, plus the grace of §4.3                                                                                                                                       |
 
-- **A hold** is `{kind, name, holder, prev, seq, input, channel, arrived}`.
-  `kind` is `screen` or `hid`, and `(kind, name)` is the key: a monitor and a
-  device may share a name. `prev` is the holder before this one, empty on a
-  first take. `input` is a screen's `VCP:SRC=VAL` (§5.6); `channel` is a
-  device's Easy-Switch channel, 1-3 (§5.5). `holds` is sorted by kind, then
-  name, and always present.
-- **Recording a take.** The same holder, the same `input` or `channel` and the
-  same `activation` as the hold already there change nothing — a restarted agent
-  re-posts its takes for free. Anything else replaces the hold: `prev` becomes
-  the old holder when the holder changes and stays otherwise, `seq` becomes the
-  new `epoch`, `arrived` is what the take said, and waiters wake.
+- **An assignment** is
+  `{kind, name, assignee, prev, seq, input, channel, arrived}`. `kind` is
+  `screen` or `hid`, and `(kind, name)` is the key: a monitor and a device may
+  share a name. `prev` is the assignee before this one, empty on a first take.
+  `input` is a screen's `VCP:SRC=VAL` (§5.6); `channel` is a device's
+  Easy-Switch channel, 1-3 (§5.5). `assignments` is sorted by kind, then name,
+  and always present.
+- **Recording a take.** The same assignee, the same `input` or `channel` and the
+  same `activation` as the assignment already there change nothing — a restarted
+  agent re-posts its takes for free. Anything else replaces the assignment:
+  `prev` becomes the old assignee when the assignee changes and stays otherwise,
+  `seq` becomes the new `epoch`, `arrived` is what the take said, and waiters
+  wake.
 - **What the server validates** is shape, not meaning: `name` is 1-64 printable
   characters, `input` is three hex bytes as `VCP:SRC=VAL`, `channel` is 1-3, a
   request carries at most 16 takes. Which `VCP:SRC` pairs are safe to write is
@@ -826,7 +855,8 @@ one ownership bit, and ask the other hosts for one of two bounded writes (§9).
   `{"linux": true, "mac": false}`, derived from open `/wait` connections plus
   the grace of §4.3. `server_id` is a UUID regenerated on every process start,
   so an agent can tell a restart from a state change.
-- `state.json` persists `owner`, `epoch`, `since`, `activation` and `holds`.
+- `state.json` persists `owner`, `epoch`, `since`, `activation` and
+  `assignments`.
 - LAN bind, HTTPS only. TLS 1.3, identity derived from the shared secret (§9).
 
 ## 8. Edge cases
@@ -836,30 +866,30 @@ one ownership bit, and ask the other hosts for one of two bounded writes (§9).
 | Claimant writes nothing to the monitor                            | By design — DDC unreachable from inactive input                                                                                                                                                                                                                                                                                      |
 | Simultaneous claims                                               | Serialized; last wins; both agents reconcile. The loser of the race gets a 409 on its take                                                                                                                                                                                                                                           |
 | Flip back while the activation commands still run                 | The late take carries a stale `activation` and gets a 409; the activation fails its retries, is logged, and the deactivation runs right after (§4.3)                                                                                                                                                                                 |
-| A host asleep/off when a take is recorded                         | It runs the take at resume, once, if the holder is still live — the self-heal for a monitor it was left showing. A device take already `arrived` is skipped                                                                                                                                                                          |
-| Agent starts with no `agent.json`                                 | Adopts the owner, the activation and every hold as handled; runs nothing                                                                                                                                                                                                                                                             |
-| Monitor moved by OSD, then a take                                 | The record names the wrong previous holder. Every host writes, so the host really on screen moves the monitor; if its write fails, it stays silent and the recorded previous holder notifies where nobody looks (§4.3)                                                                                                               |
+| A host asleep/off when a take is recorded                         | It gives away what the assignment names at resume, once, if the assignee is still live — the self-heal for a monitor it was left showing. A device assignment already `arrived` is skipped                                                                                                                                           |
+| Agent starts with no `agent.json`                                 | Adopts the owner, the activation and every assignment as handled; runs nothing                                                                                                                                                                                                                                                       |
+| Monitor moved by OSD, then a take                                 | The record names the wrong previous assignee. Every host writes, so the host really on screen moves the monitor; if its write fails, it stays silent and the recorded previous assignee notifies where nobody looks (§4.3)                                                                                                           |
 | Device linked to a host the record does not name                  | Same: every host that declares it tries, the one that holds the link sends it                                                                                                                                                                                                                                                        |
-| Mouse stranded on the other host while this one owns              | No attach re-takes it: an attach-driven claim is idempotent. `soft-kvm activate <owner>` re-runs the takes (§4.3)                                                                                                                                                                                                                    |
+| Mouse stranded on the other host while this one owns              | No attach re-takes it: an attach-driven claim is idempotent. `soft-kvm activate <owner>` re-posts the takes, and the assignments are given away again (§4.3)                                                                                                                                                                         |
 | Peripheral powered off or asleep at the take                      | Not linked anywhere: no host has anything to move, nothing arrives, nothing notifies. It links wherever its own channel selector points when it wakes                                                                                                                                                                                |
-| Device sent, never arrives                                        | The sender re-sends after 10 s, up to `--switch-retries`; the previous holder then notifies. The holder stops polling 60 s after the take, so a later arrival leaves the hold un-`arrived` — harmless: a host that runs it later finds nothing linked                                                                                |
-| `host=N` wrong in a declaration                                   | The device goes to a channel nobody listens on, never arrives, and the previous holder notifies. The user brings it back with its own selector                                                                                                                                                                                       |
+| Device sent, never arrives                                        | The sender re-sends after 10 s, up to `--switch-retries`; the previous assignee then notifies. The assignee stops polling 60 s after the take, so a later arrival leaves the assignment un-`arrived` — harmless: a host that gives it away later finds nothing linked                                                                |
+| `host=N` wrong in a declaration                                   | The device goes to a channel nobody listens on, never arrives, and the previous assignee notifies. The user brings it back with its own selector                                                                                                                                                                                     |
 | Receiver declared without `:SLOT`                                 | Always present, so `take-hid` posts it as arrived and nothing moves (§5.5)                                                                                                                                                                                                                                                           |
 | A host has no monitor of the taken name                           | Nothing to move; silent. Also the outcome of a mistyped `NAME` on the taker: no host matches, the monitor stays, nobody notifies — `detect` fills the name in so it is not typed                                                                                                                                                     |
-| Two attached monitors share the taken name                        | The write fails rather than pick; retried, then the previous holder notifies (§5.6)                                                                                                                                                                                                                                                  |
-| Take carries a `VCP:SRC` no table lists                           | Every writer refuses it and fails the take; the previous holder notifies (§5.6)                                                                                                                                                                                                                                                      |
+| Two attached monitors share the taken name                        | The write fails rather than pick; retried, then the previous assignee notifies (§5.6)                                                                                                                                                                                                                                                |
+| Take carries a `VCP:SRC` no table lists                           | Every writer refuses it and fails to give the screen away; the previous assignee notifies (§5.6)                                                                                                                                                                                                                                     |
 | Receiver unplugged while `connect` runs                           | `watchReceiver` fails, which returns from `Detector.Run`; `detectorLoop` restarts every source on backoff. The HID detector's startup snapshot then re-fires one attach edge for targets that were already present, so a receiver flap costs one extra claim — idempotent and coalesced, so it changes no owner and re-takes nothing |
 | Coordinator unreachable                                           | Claims and takes logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                            |
 | Mac away / on battery / undocked                                  | Guards suppress everything; the bit may change without the Mac, and nothing is taken towards it — a take needs its agent                                                                                                                                                                                                             |
 | Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                          |
-| Monitor already on the taker's input                              | Every host writes anyway: nothing probes first (§4.3). The monitor ignores a write from an inactive input; where the backend errors on it instead, the retries run and the previous holder notifies once                                                                                                                             |
+| Monitor already on the taker's input                              | Every host writes anyway: nothing probes first (§4.3). The monitor ignores a write from an inactive input; where the backend errors on it instead, the retries run and the previous assignee notifies once                                                                                                                           |
 | Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                              |
-| Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change. Holds are persisted, so no take replays                                                                                                                                                                                             |
-| Server state lost                                                 | `owner=""`, no holds. Agents keep their records; the next take of each name is new to them and runs — unless its `seq` lands on the one on record, since epochs restart at 0                                                                                                                                                         |
+| Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change. Assignments are persisted, so no assignment is given away twice                                                                                                                                                                     |
+| Server state lost                                                 | `owner=""`, no assignments. Agents keep their records; the next assignment of each name is new to them and is given away — unless its `seq` lands on the one on record, since epochs restart at 0                                                                                                                                    |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network: the host on screen is the one that would have to write. With Auto Input Switch off, the OSD button is the only recovery, and no agent is left able to notify. A take only ever comes from a running agent (§4.3), which is what keeps this state out of reach                                        |
-| Screen write succeeds but the monitor does not move               | Silent: a screen has no receipt (§4.3). The bit and the holds stay correct and the user presses OSD                                                                                                                                                                                                                                  |
-| Write hangs / its result is lost                                  | `--switch-timeout` SIGTERMs the child; if the result still never arrives, the 60 s machine watchdog counts the attempt as failed, retries, then notifies on the previous holder and logs (§4.3)                                                                                                                                      |
-| Result arrives after its run ended                                | Ignored and logged; the machine only accepts a result while its run is outstanding (§4.3)                                                                                                                                                                                                                                            |
+| Screen write succeeds but the monitor does not move               | Silent: a screen has no receipt (§4.3). The bit and the assignments stay correct and the user presses OSD                                                                                                                                                                                                                            |
+| Write hangs / its result is lost                                  | `--switch-timeout` SIGTERMs the child and the write counts as failed: retried, then notified on the previous assignee and logged (§4.3)                                                                                                                                                                                              |
+| Result arrives after its issue ended                              | Ignored and logged; the decider only accepts a result while its issue is outstanding (§4.3)                                                                                                                                                                                                                                          |
 | Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the host being left: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                        |
 | mDNS browse returns nothing                                       | Cached address is tried first and usually still valid; otherwise back off to 60 s and keep browsing. No claims are lost that a `SOFTKVM_SERVER` override would not also have lost                                                                                                                                                    |
 | mDNS returns a stale or rogue record                              | Connection fails TLS verification — a rogue record points at a host that does not hold the secret and cannot present the derived certificate (§5.1, §9). Agents re-browse on any connection error rather than pinning the first answer                                                                                               |
@@ -871,7 +901,7 @@ one ownership bit, and ask the other hosts for one of two bounded writes (§9).
   `HKDF-SHA256(SOFTKVM_TOKEN, info="soft-kvm tls v1")` into an Ed25519 seed. The
   same key and seed self-sign a fixed-template CA certificate (serial 1) and
   sign a fixed-template client certificate (serial 2). Both templates are
-  constant and Ed25519 signing is deterministic, so all holders of the secret
+  constant and Ed25519 signing is deterministic, so all assignees of the secret
   generate byte-identical certificates. The server presents the CA certificate;
   clients trust exactly it (the derived certificate is their only root,
   `ServerName` pinned to its SAN) and present the client certificate back. No
@@ -923,9 +953,9 @@ that does not exist yet.
       absent) — clean attach/detach, < 2 s, on **both** hosts. If this fails
       there is no detector, and no detector means no trigger
 - [ ] Per-port VCP codes recorded for every input in use, from both hosts
-- [ ] Device take fails on purpose (declare a `host=N` no host is paired on):
-      the sender retries, the notification appears on the previous holder, no
-      reclaim loop
+- [ ] Giving a device away fails on purpose (declare a `host=N` no host is
+      paired on): the sender retries, the notification appears on the previous
+      assignee, no reclaim loop
 - [ ] `ddcutil getvcp 60` succeeds **iff** the Linux input is active — and
       confirm it still succeeds after the monitor sleeps and wakes, since §13's
       detector and `detect`'s own-port read rest on it
@@ -946,10 +976,10 @@ that does not exist yet.
 - [ ] The monitor is already on the other input when a host writes: note whether
       `ddcutil setvcp --noverify` errors or is silently ignored (§8)
 - [ ] Fifty switches back and forth: count the screen writes that did not land
-      and the device takes that needed a retry. If devices commonly arrive later
-      than 10 s, the arrival window and the holder's 60 s poll need different
-      numbers than the guessed ones
-- [ ] Arrival is seen on the holder for each kind of declaration: a receiver
+      and the device give-aways that needed a retry. If devices commonly arrive
+      later than 10 s, the arrival window and the assignee's 60 s poll need
+      different numbers than the guessed ones
+- [ ] Arrival is seen on the assignee for each kind of declaration: a receiver
       slot taking the link, a Bluetooth HID node appearing, on both OSes
 - [ ] `soft-kvm activate <owner>` brings back a mouse moved away by hand, and a
       monitor moved by OSD
@@ -964,13 +994,13 @@ that does not exist yet.
 - [ ] A trigger declared by `VID:PID:SLOT`: Easy-Switch away and back fires an
       attach edge every time, not only on the first, with the receiver left
       plugged in
-- [ ] A device take (§5.5) moves the mouse from each host: over Bluetooth from
-      the Mac (bare `VID:PID`), through the Bolt receiver from Linux (`:SLOT`).
-      `detect`'s slot map matches `solaar show`
-- [ ] A device take from the Mac reaches a Bluetooth LE peripheral that declares
-      no `0x10` (Ergo K860, Lift): `SOFTKVM_LOG=debug` shows `0x10` refused with
-      `0xe00002f0`, then `0x11`. Paired with Linux, the same peripheral times
-      out (§5.5)
+- [ ] Giving a device away (§5.5) moves the mouse from each host: over Bluetooth
+      from the Mac (bare `VID:PID`), through the Bolt receiver from Linux
+      (`:SLOT`). `detect`'s slot map matches `solaar show`
+- [ ] A device given away from the Mac reaches a Bluetooth LE peripheral that
+      declares no `0x10` (Ergo K860, Lift): `SOFTKVM_LOG=debug` shows `0x10`
+      refused with `0xe00002f0`, then `0x11`. Paired with Linux, the same
+      peripheral times out (§5.5)
 - [ ] Agent silent on battery; silent with display unplugged; resumes < 30 s
       after dock, including after a multi-hour lid-closed sleep
 - [ ] Off-LAN test (laptop on hotspot): zero claims, no error spam
@@ -1027,15 +1057,16 @@ detectors both OSes share), `hidpp` (Logitech HID++: device declarations,
 `changeHost`, link presence, §5.5), `screen` (screen declarations, the mapping
 tables, the `VCP:SRC=VAL` wire form and the per-OS write backends, §5.6),
 `client`, `server`, and `agent` (supervisor, generations, decision loop, claims,
-takes, the arrival watcher; the `Detector` and `Guard` interfaces and the func
-seams of §11.2 live here, in their only consumer). `main` keeps flag parsing and
-wiring. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
-`platform`, `hidpp`, `screen`) import nothing internal; `detect` imports
-`hidpp`, `platform` and `screen`; `model` imports `state`; `client` imports
-`state` and `identity`; `server` those two and `hidpp` (the channel bound it
-validates on a take); `agent` imports `model`, `state`, `client`, `discover`,
-`hidpp` and `screen`. Build tags in filenames, not in `//go:build` lines,
-wherever the split is per-OS (`platform`, `screen`).
+the worker that runs commands and gives assignments away, the arrival watcher;
+the `Detector` and `Guard` interfaces and the func seams of §11.2 live here, in
+their only consumer). `main` keeps flag parsing and wiring. Layering is a DAG:
+the leaves (`state`, `identity`, `discover`, `platform`, `hidpp`, `screen`)
+import nothing internal; `detect` imports `hidpp`, `platform` and `screen`;
+`model` imports `state`; `client` imports `state` and `identity`; `server` those
+two and `hidpp` (the channel bound it validates on a take); `agent` imports
+`model`, `state`, `client`, `discover`, `hidpp` and `screen`. Build tags in
+filenames, not in `//go:build` lines, wherever the split is per-OS (`platform`,
+`screen`).
 
 **Logging is `log/slog`** to stderr, text handler — journald on Linux, the
 LaunchAgent log file on macOS. Every switch decision logs at Info with the
@@ -1066,11 +1097,12 @@ Supervision is `errgroup` (`golang.org/x/sync`): one group per guards-up
 generation — the detector, watcher, guard watcher, and decision loop — whose
 first error, the `errGuardsDown` sentinel or `ctx.Err()`, cancels the rest, so a
 guard flap tears down and rebuilds the generation. Two more groups are
-run-level, cancelled only by process shutdown: the action worker (so a switch
-that started guards-up finishes guards-up — a guard flap must not SIGTERM a
-switch mid-I2C) and a `SetLimit(1)` group holding claims, so a redundant claim
-trigger coalesces instead of overlapping an in-flight retry. The guard poll no
-longer blocks the decision loop.
+run-level, cancelled only by process shutdown: the worker (so a switch that
+started guards-up finishes guards-up — a guard flap must not SIGTERM a switch
+mid-I2C) and the claimer, which takes a claim over an unbuffered channel only
+while none is in flight, so a redundant claim trigger coalesces instead of
+overlapping an in-flight retry. The guard poll no longer blocks the decision
+loop.
 
 ### 11.2 What is an interface, and what is not
 
@@ -1113,58 +1145,66 @@ of them is time-dependent: settle, retry spacing, the arrival window, cooldown,
 circuit breaker, sleep detection. Testing that through goroutines and real
 clocks gives slow, flaky tests for exactly the logic that must not be wrong.
 
-So the decisions live in a function with no I/O, no goroutines, and no clock:
+So the decisions live in a function with no I/O, no goroutines, and no clock.
+The agent observes, the decider decides, the agent carries the decision out:
+each `Decision` field is an imperative, and each kind of work it starts comes
+back as the `Observation` field of the same name in the past tense.
 
 ```go
-type Event struct {          // exactly one field set, plus Now
-    Now    time.Time
-    Attach bool
-    State  *state.ServerState // from /state or a /wait wake
-    Exit   *Exit              // result of the run in flight
+type Observation struct {    // at most one field set: none when only time passed
+    Attach   bool
+    State    *state.ServerState // from /state or a /wait wake
+    Ran      *CommandsRun          // the commands in flight finished
+    GaveAway *AssignmentsGivenAway // the assignments in flight were given away
 }
 
-type Exit struct {
-    Err   error                     // -A or -D commands: nil when all exit 0
-    Takes map[state.HoldKey]Outcome // a batch of takes: one outcome per hold
+type CommandsRun struct {
+    Results []error // one per command, in the order they ran: nil when it exited 0
 }
 
-type Outcome struct {
-    NotHere bool  // nothing to move on this host
-    Err     error // the write failed
+type AssignmentsGivenAway struct {
+    Results map[state.AssignmentKey]error // one per assignment: nil moved, ErrNotHere nothing to move
 }
 
-type Action struct {
-    Claim      string            // non-empty: POST /claim/<id>
-    Activate   bool              // run the --on-activation commands
-    Activation int64             // with Activate: the activation its takes carry
-    Deactivate bool              // run the --on-deactivation commands
-    Run        []state.Hold      // run these takes
-    Retry      bool              // with Activate or Deactivate: re-run only the commands that failed
-    Notify     bool              // run --notify-cmd
-    WakeAt     time.Time         // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it
-    Save       *state.AgentState // non-nil: persist this as agent.json
-    Log        string            // non-empty: glue logs at Info
+type Decision struct {
+    Claim    string             // non-empty: POST /claim/<id>
+    Run      []Command          // run these commands, in order
+    GiveAway []state.Assignment // give away what these assignments name: move each screen or device to its assignee
+    Notify   bool               // run --notify-cmd
+    Save     *state.AgentState  // non-nil: persist this as agent.json
+    Log      string             // non-empty: the decision loop logs it at Info
 }
 
-func (m *Machine) Step(e Event) []Action
+type Command struct {        // exactly one field set
+    Argv       []string // exec this argv
+    TakeScreen int64    // non-zero: post this host's screen declarations as takes, under this activation
+    TakeHID    int64    // non-zero: post this host's device declarations as takes, under this activation
+}
+
+// Decide also returns when to call it again with nothing observed: the
+// earliest deadline the decider tracks, zero when there is none.
+func (m *Decider) Decide(now time.Time, o Observation) (ds []Decision, wake time.Time)
 ```
 
-A device take that was sent is not done at its `Exit`: the machine waits for a
-`State` whose hold says `arrived`, or for the 10 s window to close.
+A device that was given away is not done at its result: the decider waits for a
+`State` whose assignment says `arrived`, or for the 10 s window to close.
 
 `agent/agent.go` is the supervisor: it waits for guards up, runs one generation,
-and recycles on `errGuardsDown`. The decision loop stamps `Now` at processing
-time for every event, dispatches the `Action`s to a run-level worker in
-`agent/actions.go`, and posts results back as ordinary events. One action worker
-runs Activate, Deactivate, Run and Notify one at a time and posts `Exit` to the
-loop. The arrival watcher (§5.4) is glue as well: it polls and posts, and
+and recycles on `errGuardsDown`. The decision loop reads the clock when it
+processes each observation and passes it to `Decide`, rearms its timer for the
+wake `Decide` returns, hands each `Decision` with work in it to a run-level
+worker in `agent/worker.go`, and posts results back as ordinary observations.
+The worker runs commands, gives assignments away and notifies one decision at a
+time and posts each result to the loop. It keeps no progress of its own: a retry
+is a decision that names only the commands or assignments that failed. The
+arrival watcher (§5.4) is part of the agent as well: it polls and posts, and
 decides nothing. Channels are scoped by freshness — `attachCh` and `stateCh` are
-created per generation, while `results` and the action worker are run-level. It
+created per generation, while `results` and the worker are run-level. It
 contains no policy.
 
 ### 11.4 Tests
 
-- **`Step` table tests are the bulk of the suite.** Every row of §8 is a case,
+- **`Decide` table tests are the bulk of the suite.** Every row of §8 is a case,
   and so is every combination of the §4.3 gates. Cheap enough to be exhaustive:
   no clock, no processes, no sockets.
 - **Server tests run the real handler** under `httptest`, including two
@@ -1213,7 +1253,7 @@ disconnected, so the kernel sees nothing. DDC is the only witness.
 
 Act on the edge only when `owner != me`. A rising edge while `owner == me` is
 the monitor coming out of standby, which happens far more often than an OSD
-press. Debounce 5 s, and suppress for 15 s after this host writes a take.
+press. Debounce 5 s, and suppress for 15 s after this host gives a screen away.
 
 **Actuator: `--flip-cmd`, run locally on Linux.** An optocoupler or reed relay
 across the USB switch's momentary button, driven from a USB relay board on the

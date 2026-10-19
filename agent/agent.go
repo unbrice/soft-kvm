@@ -7,25 +7,26 @@
 //
 // Invariants this file is responsible for:
 //
-//  1. *Machine is owned by the loop goroutine and never shared: it lives on
+//  1. *Decider is owned by the loop goroutine and never shared: it lives on
 //     the loop, not on agent.
-//  2. No event carries a timestamp; the loop stamps Now at processing time.
+//  2. No observation carries a timestamp: the loop passes the time to Decide
+//     when it processes the observation.
 //  3. Channels are scoped by freshness (§4.1): attachCh/stateCh/arrivalCh are
-//     created per generation; results is run-level, capacity 1; actionCh is
-//     run-level, chan effect, capacity 4 (the worst case is a notification and
-//     the next run in one batch while an earlier effect still runs). State,
-//     result and effect sends are blocking (must not be lost); attach sends
-//     inside a generation are non-blocking and coalescing (idempotent
-//     triggers); arrivalCh is capacity 1 and latest-wins, so the arrival
-//     watcher can never stall the loop.
+//     created per generation; results is run-level, capacity 1; decisions is
+//     run-level, capacity 4 (the worst case is a notification and the next
+//     issue in one batch while an earlier decision is still carried out);
+//     claims is run-level and unbuffered. State, result and decision sends are
+//     blocking (must not be lost); attach and claim sends are non-blocking and
+//     coalescing (idempotent triggers); arrivalCh is capacity 1 and
+//     latest-wins, so the arrival watcher can never stall the loop.
 //  4. Every goroutine belongs to exactly one errgroup and exits only on its
 //     context or a sentinel. No goroutine outlives run.
 //  5. No blocking I/O on the loop goroutine. Exception: Save does a small
 //     atomic file write inline; nothing downstream depends on it synchronously,
 //     and moving it would reorder it against logs for no gain.
-//  6. The loop decides nothing: every decision is a model.Action. The action
-//     worker and the arrival watcher execute and report, and a result is an
-//     ordinary event.
+//  6. The loop decides nothing: every decision is a model.Decision. The
+//     worker and the arrival watcher carry out and report, and a result is an
+//     ordinary observation.
 
 package agent
 
@@ -48,13 +49,13 @@ import (
 )
 
 // DefaultSwitchTimeout bounds one --on-activation or --on-deactivation command
-// run, and one write of a take. A hung I²C write must not freeze the agent
-// (§4.3).
+// run, and one write giving an assignment away. A hung I²C write must not
+// freeze the agent (§4.3).
 const DefaultSwitchTimeout = 30 * time.Second
 
 const (
 	// DefaultArrivalPoll and DefaultArrivalFor are how often, and for how
-	// long after a take, the holder polls a device it took (SPEC §4.3).
+	// long after a take, the assignee polls a device it took (SPEC §4.3).
 	DefaultArrivalPoll = 1 * time.Second
 	DefaultArrivalFor  = 60 * time.Second
 )
@@ -144,7 +145,7 @@ type DeviceSender func(ctx context.Context, t hidpp.Target, channel uint8) (sent
 type DevicePresence func(ctx context.Context, t hidpp.Target) (bool, error)
 
 // Config is the wiring the agent loop needs. It contains no policy; that
-// lives in Machine (SPEC §11.3).
+// lives in Decider (SPEC §11.3).
 type Config struct {
 	ID             string
 	ExplicitServer string
@@ -153,14 +154,8 @@ type Config struct {
 	Guard          Guard
 	Client         *client.Client
 	Runner         Runner
-	Machine        *model.MachineConfig
+	Decider        *model.DeciderConfig
 	AgentStatePath string
-	// OnActivation runs when this host becomes the owner, OnDeactivation when
-	// it stops being the owner; each is an ordered list of argv slices
-	// (SPEC §4.3, §5.4). Either may be empty. In OnActivation the argv
-	// take-screen and take-hid run in-process.
-	OnActivation   [][]string
-	OnDeactivation [][]string
 	// Screens and HIDs are this host's declarations: what take-screen and
 	// take-hid post, and — for HIDs, by name — how this host reaches a device
 	// another host took (SPEC §5.5, §5.6).
@@ -219,16 +214,13 @@ func (c Config) backoffBaseOrDefault() time.Duration {
 
 // agent runs the connect loop until ctx is cancelled.
 type agent struct {
-	cfg      Config
-	claims   errgroup.Group
-	actionCh chan effect
-	results  chan model.Event
+	cfg       Config
+	claims    chan string // unbuffered: a claim is only handed over while none is in flight
+	decisions chan model.Decision
+	results   chan model.Observation
 
 	// hids indexes the local device declarations by name.
 	hids map[string]hidpp.Declaration
-	// activation and deactivation are the two command lists with their
-	// progress in the current command run. Only the action worker touches them.
-	activation, deactivation commands
 }
 
 // newBackoff returns a backoff using the configured base.
@@ -241,48 +233,46 @@ var errGuardsDown = errors.New("guards down")
 // Run starts the connect agent and blocks until ctx is cancelled. Returns nil
 // on ctx cancellation.
 func Run(ctx context.Context, cfg Config) error {
-	as := state.AgentState{}
-	_, statErr := os.Stat(cfg.AgentStatePath)
-	hasRecord := statErr == nil
-	if err := state.Load(cfg.AgentStatePath, &as); err != nil {
-		slog.Warn("corrupt agent state, starting fresh", "path", cfg.AgentStatePath, "error", err)
-		as = state.AgentState{}
-		hasRecord = false
+	// rec stays nil when there is no usable agent.json: the decider then adopts
+	// the first state.
+	var rec *state.AgentState
+	if _, err := os.Stat(cfg.AgentStatePath); err == nil {
+		var as state.AgentState
+		if err := state.Load(cfg.AgentStatePath, &as); err != nil {
+			slog.Warn("corrupt agent state, starting fresh", "path", cfg.AgentStatePath, "error", err)
+		} else {
+			rec = &as
+		}
 	}
 
-	// Invariant 1: the Machine lives on the loop goroutine, never on agent.
-	m := model.NewMachine(*cfg.Machine, as, hasRecord)
+	// Invariant 1: the Decider lives on the loop goroutine, never on agent.
+	m := model.NewDecider(*cfg.Decider, rec)
 
 	a := &agent{cfg: cfg, hids: make(map[string]hidpp.Declaration, len(cfg.HIDs))}
 	for _, d := range cfg.HIDs {
 		a.hids[d.Name] = d
 	}
-	a.activation.argv = cfg.OnActivation
-	a.deactivation.argv = cfg.OnDeactivation
-	a.actionCh = make(chan effect, 4)
-	a.results = make(chan model.Event, 1)
+	a.claims = make(chan string)
+	a.decisions = make(chan model.Decision, 4)
+	a.results = make(chan model.Observation, 1)
 
 	return a.run(ctx, m)
 }
 
-// run starts the action worker and claims group, then loops over guards-up
-// generations until ctx is cancelled.
-func (a *agent) run(ctx context.Context, m *model.Machine) error {
+// run starts the worker and the claimer, then loops over guards-up generations
+// until ctx is cancelled. Both are run-level, so a guard flap cancels neither a
+// switch mid-I²C nor an in-flight claim.
+func (a *agent) run(ctx context.Context, m *model.Decider) error {
 	ctx, cancel := context.WithCancel(ctx)
 
-	// Claims are supervised one-shots. SetLimit(1) + TryGo coalesces a
-	// redundant trigger while a claim is still retrying — the claim is always
-	// for cfg.id and idempotent server-side, so the dropped trigger loses
-	// nothing. cancel must run before Wait, else a claim mid-backoff holds
-	// shutdown for the rest of its retry schedule.
-	a.claims.SetLimit(1)
-
 	var workers errgroup.Group
-	workers.Go(func() error { return a.actionLoop(ctx) })
+	workers.Go(func() error { return a.workerLoop(ctx) })
+	workers.Go(func() error { return a.claimLoop(ctx) })
 
+	// cancel must run before Wait, else a claim mid-backoff holds shutdown for
+	// the rest of its retry schedule.
 	defer func() {
 		cancel()
-		_ = a.claims.Wait() // claims never return an error
 		_ = workers.Wait()
 	}()
 
@@ -326,20 +316,18 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 // generation runs one guards-up generation. Its five goroutines share a
 // context cancelled on first error. The only non-nil errors a generation
 // goroutine may return are errGuardsDown and ctx.Err(); transient failures
-// (HTTP, HID) are retried in place. runCtx is the run-level context the loop
-// uses for claims: a guard flap must not cancel an in-flight claim.
-func (a *agent) generation(ctx context.Context, m *model.Machine) error {
+// (HTTP, HID) are retried in place.
+func (a *agent) generation(ctx context.Context, m *model.Decider) error {
 	attachCh := make(chan struct{}, 1)
 	stateCh := make(chan *state.ServerState, 1)
 	arrivalCh := make(chan *state.ServerState, 1)
 
-	runCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return a.detectorLoop(ctx, attachCh) })
 	g.Go(func() error { return a.watch(ctx, stateCh) })
 	g.Go(func() error { return a.guardWatch(ctx) })
 	g.Go(func() error { return a.arrivalWatch(ctx, arrivalCh) })
-	g.Go(func() error { return a.loop(ctx, m, attachCh, stateCh, arrivalCh, runCtx) })
+	g.Go(func() error { return a.loop(ctx, m, attachCh, stateCh, arrivalCh) })
 	return g.Wait()
 }
 
@@ -381,84 +369,71 @@ func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) erro
 	}
 }
 
-// loop is the only goroutine that touches m. It stamps Now at processing time
-// and dispatches the Actions the Machine returns. runCtx is the run-level
-// context claims run under; everything else uses the generation ctx.
-func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, arrivalCh chan *state.ServerState, runCtx context.Context) error {
+// loop is the only goroutine that touches m. It reads the clock at processing
+// time, dispatches the Decisions the Decider returns, and rearms its timer for
+// the decider's next deadline.
+func (a *agent) loop(ctx context.Context, m *model.Decider, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, arrivalCh chan *state.ServerState) error {
 	timer := stoppedTimer()
-	send := func(e effect) error {
+	send := func(d model.Decision) error {
 		select {
-		case a.actionCh <- e:
+		case a.decisions <- d:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	step := func(ev model.Event) error {
-		ev.Now = time.Now() // the loop is the only clock (§11.3)
-		sawWake := false
-		for _, act := range m.Step(ev) {
-			if act.Log != "" {
-				slog.Info(act.Log)
+	decide := func(o model.Observation) error {
+		ds, wake := m.Decide(time.Now(), o) // the loop is the only clock (§11.3)
+		for _, d := range ds {
+			if d.Log != "" {
+				slog.Info(d.Log)
 			}
-			if act.Save != nil {
-				if err := state.Save(a.cfg.AgentStatePath, *act.Save); err != nil {
+			if d.Save != nil {
+				if err := state.Save(a.cfg.AgentStatePath, *d.Save); err != nil {
 					slog.Error("failed to save agent state", "path", a.cfg.AgentStatePath, "error", err)
 				}
 			}
-			if act.Claim != "" {
-				if !a.claims.TryGo(func() error { a.claim(runCtx, act.Claim); return nil }) {
-					slog.Debug("claim already in flight, coalesced", "id", act.Claim)
+			if d.Claim != "" {
+				// The claim is idempotent server-side: one dropped while
+				// another is in flight loses nothing.
+				select {
+				case a.claims <- d.Claim:
+				default:
+					slog.Debug("claim already in flight, coalesced", "id", d.Claim)
 				}
 			}
-			if e, ok := commandEffect(act); ok {
-				if err := send(e); err != nil {
+			if hasWork(d) {
+				if err := send(d); err != nil {
 					return err
 				}
-			}
-			if len(act.Run) > 0 {
-				if err := send(effect{kind: effectRun, holds: act.Run}); err != nil {
-					return err
-				}
-			}
-			if act.Notify {
-				if err := send(effect{kind: effectNotify}); err != nil {
-					return err
-				}
-			}
-			if !act.WakeAt.IsZero() {
-				d := time.Until(act.WakeAt)
-				if d <= 0 {
-					d = time.Nanosecond
-				}
-				timer.Reset(d)
-				sawWake = true
 			}
 		}
-		if !sawWake {
+		if wake.IsZero() {
 			timer.Stop()
+			return nil
 		}
+		timer.Reset(max(time.Until(wake), time.Nanosecond))
 		return nil
 	}
-	// Deadlines may have elapsed while dormant; let the machine catch up.
-	if err := step(model.Event{}); err != nil {
+	// Deadlines may have elapsed while dormant; let the decider catch up.
+	if err := decide(model.Observation{}); err != nil {
 		return err
 	}
 	for {
-		var ev model.Event
+		var o model.Observation
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-attachCh:
-			ev = model.Event{Attach: true}
+			o = model.Observation{Attach: true}
 		case s := <-stateCh:
 			offerLatest(arrivalCh, s)
-			ev = model.Event{State: s}
+			o = model.Observation{State: s}
 		case r := <-a.results:
-			ev = r
+			o = r
 		case <-timer.C:
 		}
-		if err := step(ev); err != nil {
+		if err := decide(o); err != nil {
 			return err
 		}
 	}
@@ -486,6 +461,20 @@ func stoppedTimer() *time.Timer {
 	t := time.NewTimer(time.Duration(math.MaxInt64))
 	t.Stop()
 	return t
+}
+
+// claimLoop runs one claim at a time until ctx is cancelled. The loop hands it
+// a claim only while it waits here, so a trigger during a claim's retries is
+// coalesced.
+func (a *agent) claimLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case id := <-a.claims:
+			a.claim(ctx, id)
+		}
+	}
 }
 
 // claim posts /claim/<id> with force=false, retrying up to four times with

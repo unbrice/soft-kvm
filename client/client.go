@@ -99,9 +99,9 @@ func (c *Client) Take(ctx context.Context, base, id string, activation int64, ta
 	}{activation, takes})
 }
 
-// Arrived POSTs /arrived/<id>: the holder reports that the devices it took
-// are linked to it. The server ignores any arrival that no longer matches a
-// hold.
+// Arrived POSTs /arrived/<id>: the assignee reports that the devices it took
+// are linked to it. The server ignores any arrival that no longer matches an
+// assignment.
 func (c *Client) Arrived(ctx context.Context, base, id string, arrivals ...state.Arrival) error {
 	if arrivals == nil {
 		arrivals = []state.Arrival{}

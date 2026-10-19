@@ -183,7 +183,7 @@ var nameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 func ValidName(s string) bool { return nameRE.MatchString(s) }
 
 // ParseDeclaration validates the words of a device declaration. Taking the
-// device needs the channel: no other host can derive it, and the holder has
+// device needs the channel: no other host can derive it, and the assignee has
 // to say it before the device is there to ask (SPEC §5.5). It is the channel
 // as printed on the key (1-MaxChannel), matching the 1-based pairing slots.
 func ParseDeclaration(args []string) (Declaration, error) {
@@ -290,7 +290,8 @@ func (c *conn) moveTo(ctx context.Context, t Target, channel uint8) (bool, error
 // device.
 //
 // A host can always learn its *own* channel, never the peer's: `detect` prints
-// it for the declaration, which is how the holder tells the others (SPEC §5.5).
+// it for the declaration, which is how the assignee tells the others (SPEC
+// §5.5).
 func CurrentChannel(ctx context.Context, vid, pid uint16, slot uint8) (uint8, error) {
 	c, err := openInterface(ctx, vid, pid)
 	if err != nil {

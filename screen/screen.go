@@ -152,9 +152,9 @@ var ErrNoDisplay = errors.New("no attached monitor of that name")
 type Write struct{ VCP, Source, Value uint8 }
 
 // ParseWrite reads the VCP:SRC=VAL wire form: exactly three two-digit hex
-// bytes, in either case, that are IsValid. It is the only way in from the
-// wire, and where a take is refused: a backend only panics on what should
-// never reach it.
+// bytes, in either case, that are IsValid. It is the only way in from the wire,
+// and where giving away an assignment that names it is refused: a backend only
+// panics on what should never reach it.
 func ParseWrite(s string) (Write, error) {
 	bad := fmt.Errorf("invalid write %q: want VCP:SRC=VAL as three hex bytes, e.g. F4:50=D1", s)
 	vcp, rest, ok := strings.Cut(s, ":")
