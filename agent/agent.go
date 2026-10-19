@@ -33,6 +33,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -233,20 +235,25 @@ var errGuardsDown = errors.New("guards down")
 // Run starts the connect agent and blocks until ctx is cancelled. Returns nil
 // on ctx cancellation.
 func Run(ctx context.Context, cfg Config) error {
-	// rec stays nil when there is no usable agent.json: the decider then adopts
-	// the first state.
+	// rec stays nil when there is no agent.json: the decider then adopts the
+	// first state. An agent.json that cannot be read or parsed stops the agent
+	// rather than silently forgetting what it handled.
 	var rec *state.AgentState
 	if _, err := os.Stat(cfg.AgentStatePath); err == nil {
 		var as state.AgentState
 		if err := state.Load(cfg.AgentStatePath, &as); err != nil {
-			slog.Warn("corrupt agent state, starting fresh", "path", cfg.AgentStatePath, "error", err)
-		} else {
-			rec = &as
+			return fmt.Errorf("agent state %s: %w", cfg.AgentStatePath, err)
 		}
+		rec = &as
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("agent state %s: %w", cfg.AgentStatePath, err)
 	}
 
 	// Invariant 1: the Decider lives on the loop goroutine, never on agent.
-	m := model.NewDecider(*cfg.Decider, rec)
+	m, err := model.NewDecider(*cfg.Decider, rec)
+	if err != nil {
+		return fmt.Errorf("agent state %s: %w", cfg.AgentStatePath, err)
+	}
 
 	a := &agent{cfg: cfg, hids: make(map[string]hidpp.Declaration, len(cfg.HIDs))}
 	for _, d := range cfg.HIDs {

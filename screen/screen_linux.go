@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,20 +30,32 @@ func DisplayNames() ([]string, error) { return nil, errors.ErrUnsupported }
 
 // attachedNames lists the EDID names of the monitors attached now. It reads
 // files only — no DDC traffic — so it costs milliseconds. A connector with no
-// monitor has an empty EDID, and one that does not parse is skipped.
-func attachedNames() []string {
-	paths, _ := filepath.Glob(drmEDIDs)
+// monitor has an empty EDID and is skipped; an EDID that cannot be read fails
+// the call, and one that does not parse is skipped with a warning.
+func attachedNames() ([]string, error) {
+	paths, err := filepath.Glob(drmEDIDs)
+	if err != nil {
+		return nil, err
+	}
 	var names []string
 	for _, p := range paths {
 		edid, err := os.ReadFile(p)
 		if err != nil {
+			return nil, err
+		}
+		if len(edid) == 0 {
 			continue
 		}
-		if _, name, ok := parseEDID(edid); ok && name != "" {
+		_, name, ok := parseEDID(edid)
+		if !ok {
+			slog.Warn("ignoring an EDID that does not parse", "path", p)
+			continue
+		}
+		if name != "" {
 			names = append(names, name)
 		}
 	}
-	return names
+	return names, nil
 }
 
 // Do writes w once to the attached monitor named name, ignoring case, and
@@ -53,7 +66,10 @@ func attachedNames() []string {
 // succeeding. The monitor is selected by --model rather than a bus number,
 // which changes on hotplug and across reboots (SPEC §6.1).
 func (w Write) Do(ctx context.Context, run Runner, name string) error {
-	names := attachedNames()
+	names, err := attachedNames()
+	if err != nil {
+		return fmt.Errorf("screen write: %w", err)
+	}
 	i, err := pickByName(names, name)
 	if err != nil {
 		return err
@@ -100,9 +116,12 @@ func Probe(ctx context.Context, run Runner) Report {
 		d := &r.Displays[i]
 		out, err := run(ctx, []string{backend, "--terse", "getvcp", "60", "--model", d.Model})
 		if err != nil {
+			d.InputErr = err
 			continue
 		}
-		d.Input, d.InputOK = parseInputSource(out)
+		if d.Input, d.InputOK = parseInputSource(out); !d.InputOK {
+			d.InputErr = fmt.Errorf("%s getvcp 60: unrecognised output %q", backend, bytes.TrimSpace(out))
+		}
 	}
 	return r
 }
