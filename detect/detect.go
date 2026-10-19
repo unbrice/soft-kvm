@@ -466,6 +466,9 @@ func renderNotes(w io.Writer, r screen.Report, wiring hostWiring) error {
 		if a, ok := t.AliasFor(d.Input); ok && d.InputOK {
 			line += ", showing this host on " + a
 		}
+		if d.InputErr != nil {
+			line += ", input unread: " + d.InputErr.Error()
+		}
 		b.WriteString(line + ".\n")
 	}
 	// pending lists declarations the command left out, with the take they

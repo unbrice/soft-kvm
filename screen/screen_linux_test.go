@@ -130,8 +130,29 @@ func TestAttachedNamesSkipsGarbage(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(junk, "edid"), []byte("not an edid"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := attachedNames(); !slices.Equal(got, []string{"LG HDR WQHD"}) {
+	got, err := attachedNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"LG HDR WQHD"}) {
 		t.Errorf("attachedNames = %q, want only the LG", got)
+	}
+}
+
+func TestAttachedNamesFailsOnUnreadable(t *testing.T) {
+	attach(t, "LG HDR WQHD")
+	// A directory where the EDID file should be: ReadFile fails, as it would
+	// on a permission error.
+	bad := filepath.Join(filepath.Dir(filepath.Dir(drmEDIDs)), "card0-DP-9")
+	if err := os.MkdirAll(filepath.Join(bad, "edid"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachedNames(); err == nil {
+		t.Error("attachedNames = nil error, want the read failure")
+	}
+	err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), nil, "LG HDR WQHD")
+	if err == nil || errors.Is(err, ErrNoDisplay) {
+		t.Errorf("Do = %v, want the read failure, not ErrNoDisplay", err)
 	}
 }
 
@@ -164,6 +185,20 @@ func TestProbe(t *testing.T) {
 		r := Probe(t.Context(), func(context.Context, []string) ([]byte, error) { return []byte(out), nil })
 		if r.Err == nil || !strings.Contains(r.Err.Error(), "LG ULTRAWIDE does not answer DDC/CI") {
 			t.Errorf("Probe error = %v, want the monitor named", r.Err)
+		}
+	})
+
+	t.Run("an input that cannot be read says why", func(t *testing.T) {
+		boom := errors.New("ddcutil: busy")
+		run := func(_ context.Context, argv []string) ([]byte, error) {
+			if slices.Contains(argv, "detect") {
+				return []byte("Display 1\n   Monitor:   GSM:LG ULTRAWIDE:1\n"), nil
+			}
+			return nil, boom
+		}
+		r := Probe(t.Context(), run)
+		if len(r.Displays) != 1 || r.Displays[0].InputOK || !errors.Is(r.Displays[0].InputErr, boom) {
+			t.Fatalf("Probe = %+v, want the display with the read error", r)
 		}
 	})
 

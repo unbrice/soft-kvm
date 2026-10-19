@@ -606,24 +606,27 @@ type Decider struct {
 // rec is nil when there is no agent.json: the first State observation adopts
 // the server's owner, activation and assignments as handled and never switches
 // (SPEC §4.3).
-func NewDecider(cfg DeciderConfig, rec *state.AgentState) *Decider {
+func NewDecider(cfg DeciderConfig, rec *state.AgentState) (*Decider, error) {
 	m := &Decider{
 		cfg:     cfg,
 		limiter: newRateLimiter(cfg),
 		reasons: make(map[state.AssignmentKey]string),
 	}
-	if rec != nil {
-		m.handled = &handled{
-			ownership: ownership{owner: rec.HandledOwner, activation: rec.HandledActivation},
-			seqs:      make(map[state.AssignmentKey]state.Seq, len(rec.HandledSeqs)),
-		}
-		for k, seq := range rec.HandledSeqs {
-			if key, ok := state.ParseAssignmentKey(k); ok {
-				m.handled.seqs[key] = seq
-			}
+	if rec == nil {
+		return m, nil
+	}
+	m.handled = &handled{
+		ownership: ownership{owner: rec.HandledOwner, activation: rec.HandledActivation},
+		seqs:      make(map[state.AssignmentKey]state.Seq, len(rec.HandledSeqs)),
+	}
+	for k, seq := range rec.HandledSeqs {
+		if key, ok := state.ParseAssignmentKey(k); ok {
+			m.handled.seqs[key] = seq
+		} else {
+			return nil, fmt.Errorf("invalid assignment key: %q", k)
 		}
 	}
-	return m
+	return m, nil
 }
 
 // Decide records one observation made at now and returns what to do about it,

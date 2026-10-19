@@ -287,9 +287,11 @@ type Display struct {
 	Mfg   string // EDID manufacturer ID, e.g. GSM
 	Model string // the name display=MATCH selects it by
 	// Input is the monitor's current Input Source value — this host's own
-	// port, since it is the one on screen. InputOK is false when unread.
-	Input   uint8
-	InputOK bool
+	// port, since it is the one on screen. InputOK is false when unread, and
+	// InputErr says why.
+	Input    uint8
+	InputOK  bool
+	InputErr error
 }
 
 // Report is what Probe learned for `detect`: whether the backend works at all

@@ -78,8 +78,19 @@ func agentAt(owner string, activation int64, seen map[state.AssignmentKey]state.
 	return rec
 }
 
-func newDecider(id string, rec state.AgentState) *Decider {
-	return NewDecider(testConfig(id), &rec)
+func newDecider(t *testing.T, id string, rec state.AgentState) *Decider {
+	t.Helper()
+	return mustDecider(t, testConfig(id), &rec)
+}
+
+// mustDecider is NewDecider that fails the test on error.
+func mustDecider(t *testing.T, cfg DeciderConfig, rec *state.AgentState) *Decider {
+	t.Helper()
+	m, err := NewDecider(cfg, rec)
+	if err != nil {
+		t.Fatalf("NewDecider: %v", err)
+	}
+	return m
 }
 
 // outcome is what one Decide returns.
@@ -198,7 +209,7 @@ func given(results map[state.AssignmentKey]error) *AssignmentsGivenAway {
 var errWrite = errors.New("ddcutil: no i2c-dev")
 
 func TestFirstReconcileAdopts(t *testing.T) {
-	m := NewDecider(testConfig("linux"), nil)
+	m := mustDecider(t, testConfig("linux"), nil)
 	s := mk("mac", 4, screenAssignment("LG", "mac", "linux", 3), hidAssignment("mouse", "mac", "linux", 4, false))
 
 	ds := m.decide(at(0), state_(s))
@@ -230,20 +241,20 @@ func TestFirstReconcileAdopts(t *testing.T) {
 // A restarted agent builds its decider from agent.json: what it handled stays
 // handled.
 func TestRecordSurvivesARestart(t *testing.T) {
-	m := newDecider("linux", agentAt("mac", 2, nil))
+	m := newDecider(t, "linux", agentAt("mac", 2, nil))
 	s := mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))
 	ds := m.decide(at(0), state_(s))
 	want(t, ds, "give:screen/LG")
 	ds = m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
 	want(t, ds, "save")
 
-	again := NewDecider(testConfig("linux"), saved(t, ds))
+	again := mustDecider(t, testConfig("linux"), saved(t, ds))
 	want(t, again.decide(at(100), state_(s)))
 }
 
 func TestActivation(t *testing.T) {
 	t.Run("ownership comes here: run, then save the record", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		ds := m.decide(at(0), state_(mk("linux", 2)))
 		want(t, ds, "run:take-screen@2")
 		if c := ds.d[1].Run; len(c) != 1 || c[0].TakeScreen != 2 {
@@ -259,7 +270,7 @@ func TestActivation(t *testing.T) {
 	})
 
 	t.Run("a re-activation of the owner runs the commands again", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 2, nil))
+		m := newDecider(t, "linux", agentAt("linux", 2, nil))
 		want(t, m.decide(at(0), state_(mk("linux", 2))))
 		ds := m.decide(at(1), state_(mk("linux", 3)))
 		want(t, ds, "run:take-screen@3")
@@ -271,12 +282,12 @@ func TestActivation(t *testing.T) {
 	})
 
 	t.Run("an agent that never activated runs on an owner it already was", func(t *testing.T) {
-		m := newDecider("linux", agentAt("", 0, nil))
+		m := newDecider(t, "linux", agentAt("", 0, nil))
 		want(t, m.decide(at(0), state_(mk("linux", 1))), "run:take-screen@1")
 	})
 
 	t.Run("a failure retries only after the spacing, then is saved without a notification", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 
 		// Fast failure: the retry waits for 1 s after the previous start.
@@ -303,14 +314,14 @@ func TestActivation(t *testing.T) {
 	})
 
 	t.Run("never waits behind the cooldown or the breaker", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		m.limiter.cooldownUntil[lgKey] = at(100)
 		m.limiter.pausedUntil = at(100)
 		want(t, m.decide(at(0), state_(mk("linux", 2))), "run:take-screen@2")
 	})
 
 	t.Run("a flip away during the activation deactivates when it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 		// Stashed: the activation is still running.
 		want(t, m.decide(at(1), state_(mk("mac", 3))))
@@ -327,7 +338,7 @@ func TestActivation(t *testing.T) {
 	})
 
 	t.Run("a flip away during a successful activation deactivates right after", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 		want(t, m.decide(at(1), state_(mk("mac", 3))))
 		ds := m.decide(at(2), Observation{Ran: ran(nil)})
@@ -337,7 +348,7 @@ func TestActivation(t *testing.T) {
 
 func TestDeactivation(t *testing.T) {
 	t.Run("ownership goes away: run, then save the new owner", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		ds := m.decide(at(0), state_(mk("mac", 2)))
 		want(t, ds, "run:down")
 		ds = m.decide(at(2), Observation{Ran: ran(nil)})
@@ -349,34 +360,34 @@ func TestDeactivation(t *testing.T) {
 	})
 
 	t.Run("no liveness gate", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		want(t, m.decide(at(0), state_(notLive(mk("mac", 2), "mac"))), "run:down")
 	})
 
 	t.Run("no cooldown and no breaker", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.limiter.cooldownUntil[lgKey] = at(100)
 		m.limiter.pausedUntil = at(100)
 		want(t, m.decide(at(0), state_(mk("mac", 2))), "run:down")
 	})
 
 	t.Run("an empty owner deactivates nothing", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		want(t, m.decide(at(0), state_(mk("", 0))))
 	})
 
 	t.Run("a host that was not the owner has nothing to deactivate", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 1, nil))
+		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		want(t, m.decide(at(0), state_(mk("third", 2))))
 	})
 
 	t.Run("a third host as owner deactivates the previous one", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		want(t, m.decide(at(0), state_(mk("third", 2))), "run:down")
 	})
 
 	t.Run("failure retries, is logged, never notified, and the record moves on", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(0), Observation{Ran: ran(errors.New("x"))}), "wake:1")
 		want(t, m.decide(at(1), Observation{}), "run:down")
@@ -388,7 +399,7 @@ func TestDeactivation(t *testing.T) {
 	})
 
 	t.Run("a flip back during the deactivation activates when it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(1), state_(mk("linux", 3))))
 		ds := m.decide(at(2), Observation{Ran: ran(nil)})
@@ -396,7 +407,7 @@ func TestDeactivation(t *testing.T) {
 	})
 
 	t.Run("a flip back during a failing deactivation activates when it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(1), state_(mk("linux", 3))))
 		m.decide(at(2), Observation{Ran: ran(errors.New("x"))})
@@ -411,14 +422,14 @@ func TestDeactivation(t *testing.T) {
 // Each -A or -D command is a task of its own: a retry re-runs only those that
 // failed, in their order (SPEC §4.3).
 func TestCommands(t *testing.T) {
-	two := func(id string, rec state.AgentState) *Decider {
+	two := func(t *testing.T, id string, rec state.AgentState) *Decider {
 		cfg := testConfig(id)
 		cfg.OnActivation = [][]string{{"a"}, {"b"}, {"c"}}
-		return NewDecider(cfg, &rec)
+		return mustDecider(t, cfg, &rec)
 	}
 
 	t.Run("a retry re-runs only the commands that failed", func(t *testing.T) {
-		m := two("linux", agentAt("mac", 1, nil))
+		m := two(t, "linux", agentAt("mac", 1, nil))
 		want(t, m.decide(at(0), state_(mk("linux", 2))), "run:a,b,c")
 		want(t, m.decide(at(0), Observation{Ran: ran(errors.New("x"), nil, errors.New("y"))}), "wake:1")
 		want(t, m.decide(at(1), Observation{}), "run:a,c")
@@ -428,13 +439,13 @@ func TestCommands(t *testing.T) {
 	})
 
 	t.Run("a command with no result counts as failed", func(t *testing.T) {
-		m := two("linux", agentAt("mac", 1, nil))
+		m := two(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 		want(t, m.decide(at(5), Observation{Ran: ran(nil)}), "run:b,c")
 	})
 
 	t.Run("a command still failing is logged by name, and the record moves on", func(t *testing.T) {
-		m := two("linux", agentAt("mac", 1, nil))
+		m := two(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 		fail := ran(nil, errors.New("exit 1"), nil)
 		var ds outcome
@@ -453,7 +464,7 @@ func TestCommands(t *testing.T) {
 		cfg := testConfig("linux")
 		cfg.OnDeactivation = nil
 		rec := agentAt("linux", 1, nil)
-		m := NewDecider(cfg, &rec)
+		m := mustDecider(t, cfg, &rec)
 		ds := m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		want(t, ds, "save", "give:screen/LG")
 		if strings.Contains(logs(ds), "running") {
@@ -482,7 +493,7 @@ func TestGiveAwayGates(t *testing.T) {
 								} else {
 									seen[mouseKey] = 6
 								}
-								m := newDecider("linux", agentAt("mac", 2, seen))
+								m := newDecider(t, "linux", agentAt("mac", 2, seen))
 								assignee := "mac"
 								if assigneeIsMe {
 									assignee = "linux"
@@ -530,7 +541,7 @@ func TestGiveAwayGates(t *testing.T) {
 // A reason for holding an assignment back is logged once, however often the
 // decider reconciles while idle, and again only once it changed.
 func TestHoldBackReasonsLogOnce(t *testing.T) {
-	m := newDecider("linux", agentAt("mac", 2, nil))
+	m := newDecider(t, "linux", agentAt("mac", 2, nil))
 	s := notLive(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3)), "mac")
 	ds := m.decide(at(0), state_(s))
 	want(t, ds)
@@ -550,7 +561,7 @@ func TestHoldBackReasonsLogOnce(t *testing.T) {
 
 func TestGiveAway(t *testing.T) {
 	t.Run("a live assignee's new assignment is given away and handled once", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))
 		ds := m.decide(at(0), state_(s))
 		want(t, ds, "give:screen/LG")
@@ -566,14 +577,14 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("one run in the order /state lists them", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, hidAssignment("keyboard", "mac", "linux", 3, false),
 			hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))
 		want(t, m.decide(at(0), state_(s)), "give:hid/keyboard,hid/mouse,screen/LG")
 	})
 
 	t.Run("nothing to move here is done, silently", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		ds := m.decide(at(1), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: ErrNotHere})})
 		want(t, ds, "save")
@@ -583,7 +594,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("a failed write retries only that assignment, spaced by the retry spacing", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))
 		m.decide(at(0), state_(s))
 		ds := m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{
@@ -601,14 +612,14 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("an assignment that reports nothing counts as failed", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		ds := m.decide(at(5), Observation{GaveAway: given(map[state.AssignmentKey]error{})})
 		want(t, ds, "give:screen/LG")
 	})
 
 	t.Run("failing after the last retry notifies the previous assignee", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))
 		m.decide(at(0), state_(s))
 		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
@@ -629,7 +640,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("a host that is not the previous assignee only logs", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "third", 3))))
 		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
 		var ds outcome
@@ -641,7 +652,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("a first assignment has no previous assignee and never notifies", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "", 3))))
 		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
 		var ds outcome
@@ -652,7 +663,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("one failing assignment does not skip or fail the rest", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
 		m.decide(at(2), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite, lgKey: nil})})
 		m.decide(at(4), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})})
@@ -666,7 +677,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("a state during the job is stashed, and reconciled when it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		want(t, m.decide(at(1), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3), hidAssignment("mouse", "mac", "linux", 4, false)))))
 		ds := m.decide(at(2), Observation{GaveAway: okAll(lgKey)})
@@ -674,7 +685,7 @@ func TestGiveAway(t *testing.T) {
 	})
 
 	t.Run("a flip back to me during a batch of assignments activates when it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		third := func(owner string, activation int64) *state.ServerState {
 			s := mk(owner, activation, screenAssignment("LG", "third", "linux", 3))
 			s.Live["third"] = true
@@ -691,7 +702,7 @@ func TestGiveAway(t *testing.T) {
 func TestArrival(t *testing.T) {
 	sent := func(t *testing.T) *Decider {
 		t.Helper()
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		want(t, m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false)))), "give:hid/mouse")
 		return m
 	}
@@ -776,7 +787,7 @@ func TestArrival(t *testing.T) {
 	})
 
 	t.Run("a failed assignment superseded before its retry is not retried", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false))))
 		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})}), "wake:1")
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "linux", "mac", 4, false))))
@@ -791,7 +802,7 @@ func TestArrival(t *testing.T) {
 	})
 
 	t.Run("a screen failing while a device awaits retries without waiting for the window", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
 		ds := m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: nil, lgKey: errWrite})})
 		want(t, ds, "wake:1")
@@ -803,13 +814,13 @@ func TestArrival(t *testing.T) {
 	})
 
 	t.Run("a device already on the assignee is never sent", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true))))
 		want(t, ds, "save")
 	})
 
 	t.Run("a device already arrived is recorded with the screen given away beside it", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true), screenAssignment("LG", "mac", "linux", 3))))
 		want(t, ds, "give:screen/LG")
 		wantLog(t, ds, "already arrived")
@@ -827,7 +838,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 	}
 
 	t.Run("cooldown is per name", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		handled(m, 0, screenAssignment("LG", "mac", "linux", 3))
 		m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
 		// 2 s later: the screen cooled down until 6 s, the mouse did not.
@@ -840,7 +851,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 	})
 
 	t.Run("three give-aways of one name in 30 s pause every name", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		seq := state.Seq(3)
 		for i, sec := range []int{0, 6, 12} {
 			ds := handled(m, sec, screenAssignment("LG", "mac", "linux", seq+state.Seq(i)))
@@ -856,7 +867,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 	})
 
 	t.Run("give-aways spread beyond the window never trip it", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		for i, sec := range []int{0, 20, 40, 60, 80} {
 			ds := handled(m, sec, screenAssignment("LG", "mac", "linux", state.Seq(3+i)))
 			want(t, ds, "give:screen/LG")
@@ -865,7 +876,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 	})
 
 	t.Run("the breaker never blocks an activation or a deactivation", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		for i, sec := range []int{0, 6, 12} {
 			handled(m, sec, screenAssignment("LG", "mac", "linux", state.Seq(3+i)))
 			m.decide(at(sec+1), Observation{GaveAway: okAll(lgKey)})
@@ -884,7 +895,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	}
 
 	t.Run("nothing to move starts no cooldown and never trips the breaker", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		for i, sec := range []int{0, 1, 2, 3} {
 			// Each assignment follows the previous at once: no cooldown defers
 			// it.
@@ -901,7 +912,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	})
 
 	t.Run("a failed write starts the cooldown and counts", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(assignment(3)))
 		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
 		for _, sec := range []int{2, 4, 6, 8} {
@@ -917,7 +928,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	})
 
 	t.Run("an assignment missing from the result counts", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(assignment(3)))
 		for _, sec := range []int{2, 4, 6, 8} {
 			m.decide(at(sec), Observation{GaveAway: given(map[state.AssignmentKey]error{})})
@@ -928,7 +939,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	})
 
 	t.Run("superseded before any run reported it as attempted does not count", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(assignment(3)))
 		m.decide(at(1), state_(assignment(4))) // the job is still in flight
 		want(t, m.decide(at(2), Observation{GaveAway: notHere}), "save", "give:screen/LG")
@@ -938,7 +949,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	})
 
 	t.Run("a mixed batch gates only the key that was written", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := func(lg, mouse state.Seq) *state.ServerState {
 			return mk("mac", 2, hidAssignment("mouse", "mac", "linux", mouse, false), screenAssignment("LG", "mac", "linux", lg))
 		}
@@ -958,14 +969,14 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 
 func TestLateResults(t *testing.T) {
 	t.Run("a result with no run in flight is ignored", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		ds := m.decide(at(0), Observation{Ran: ran(nil)})
 		want(t, ds)
 		wantLog(t, ds, "ignoring a late")
 	})
 
 	t.Run("a result after its batch ended is ignored", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
 		ds := m.decide(at(2), Observation{GaveAway: okAll(lgKey)})
@@ -974,7 +985,7 @@ func TestLateResults(t *testing.T) {
 	})
 
 	t.Run("a command result during a batch of assignments is ignored", func(t *testing.T) {
-		m := newDecider("linux", agentAt("mac", 2, nil))
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		ds := m.decide(at(1), Observation{Ran: ran(nil)})
 		wantLog(t, ds, "ignoring a late")
@@ -982,7 +993,7 @@ func TestLateResults(t *testing.T) {
 	})
 
 	t.Run("a give-away result during a command is ignored", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		ds := m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
 		wantLog(t, ds, "ignoring a late")
@@ -992,7 +1003,7 @@ func TestLateResults(t *testing.T) {
 
 func TestAttachSettle(t *testing.T) {
 	t.Run("a stable attach claims after the settle", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		want(t, m.decide(at(0), Observation{Attach: true}), "wake:2")
 		want(t, m.decide(at(1), Observation{}), "wake:2")
 		want(t, m.decide(at(2), Observation{}), "claim:linux")
@@ -1000,7 +1011,7 @@ func TestAttachSettle(t *testing.T) {
 	})
 
 	t.Run("a flapping attach restarts the settle", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), Observation{Attach: true})
 		want(t, m.decide(at(1), Observation{Attach: true}), "wake:3")
 		want(t, m.decide(at(2), Observation{}), "wake:3")
@@ -1008,7 +1019,7 @@ func TestAttachSettle(t *testing.T) {
 	})
 
 	t.Run("an attach during a deactivation settles from the attach and claims once it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(1), Observation{Attach: true}), "wake:3")
 		// Settled at 3, but the job is in flight: the claim waits for it.
@@ -1017,7 +1028,7 @@ func TestAttachSettle(t *testing.T) {
 	})
 
 	t.Run("an attach late in a deactivation still waits out its settle", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		m.decide(at(4), Observation{Attach: true})
 		want(t, m.decide(at(5), Observation{Ran: ran(nil)}), "save", "wake:6")
@@ -1025,7 +1036,7 @@ func TestAttachSettle(t *testing.T) {
 	})
 
 	t.Run("a settle that elapsed during a deactivation fires once it ends", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), Observation{Attach: true})
 		m.decide(at(1), state_(mk("mac", 2)))
 		// The settle is due at 2 s but a deactivation runs.
@@ -1035,14 +1046,14 @@ func TestAttachSettle(t *testing.T) {
 	})
 
 	t.Run("a claim is not blocked by the cooldown or the breaker", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.limiter.pausedUntil = at(100)
 		m.decide(at(0), Observation{Attach: true})
 		want(t, m.decide(at(2), Observation{}), "claim:linux")
 	})
 
 	t.Run("a stale epoch still reconciles", func(t *testing.T) {
-		m := newDecider("linux", agentAt("linux", 1, nil))
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		s := mk("linux", 1)
 		s.Epoch = 1
 		want(t, m.decide(at(0), state_(s)))
@@ -1053,7 +1064,7 @@ func TestAttachSettle(t *testing.T) {
 }
 
 func TestWakeAt(t *testing.T) {
-	m := newDecider("linux", agentAt("mac", 2, nil))
+	m := newDecider(t, "linux", agentAt("mac", 2, nil))
 	m.decide(at(0), Observation{Attach: true})
 	m.decide(at(1), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
 	// The earliest deadline wins: the settle at 2 s, not the arrival window at
@@ -1063,13 +1074,13 @@ func TestWakeAt(t *testing.T) {
 	}
 
 	// With nothing pending, nothing to do and no wake.
-	if ds, wake := newDecider("linux", agentAt("mac", 2, nil)).Decide(at(0), Observation{}); len(ds) != 0 || !wake.IsZero() {
+	if ds, wake := newDecider(t, "linux", agentAt("mac", 2, nil)).Decide(at(0), Observation{}); len(ds) != 0 || !wake.IsZero() {
 		t.Fatalf("idle decider returned %+v, wake %v", ds, wake)
 	}
 }
 
 func ExampleDecider_Decide() {
-	m := NewDecider(testConfig("linux"), &state.AgentState{HandledOwner: "linux"})
+	m, _ := NewDecider(testConfig("linux"), &state.AgentState{HandledOwner: "linux"})
 	ds, _ := m.Decide(time.Unix(0, 0), Observation{
 		State: &state.ServerState{
 			Owner:      "mac",

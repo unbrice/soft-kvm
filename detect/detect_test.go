@@ -853,6 +853,19 @@ func TestRenderNotes(t *testing.T) {
 			t.Errorf("a note about a placeholder that is not there:\n%s", out)
 		}
 	})
+
+	t.Run("an unread port says why", func(t *testing.T) {
+		var buf bytes.Buffer
+		r := screen.Report{Backend: "ddcutil", Displays: []screen.Display{
+			{Mfg: "DEL", Model: "DELL U2720Q", InputErr: errors.New("i2c busy")},
+		}}
+		if err := renderNotes(&buf, r, buildWiring(nil, r, nil)); err != nil {
+			t.Fatalf("renderNotes: %v", err)
+		}
+		if out := buf.String(); !strings.Contains(out, ", input unread: i2c busy.\n") {
+			t.Errorf("the read failure is not reported:\n%s", out)
+		}
+	})
 }
 
 // A linked Easy-Switch trigger whose channel could not be read is declared

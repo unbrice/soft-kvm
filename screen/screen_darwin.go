@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 const backend = "IOAVService"
@@ -19,6 +20,9 @@ const backend = "IOAVService"
 type monitor struct {
 	Display
 	svc avService
+	// edidErr is why Display has no name: the EDID could not be read or does
+	// not parse. Such a monitor is still attached, so the guard counts it.
+	edidErr error
 }
 
 // monitors opens the external displays a write can drive, named from
@@ -32,14 +36,19 @@ func monitors() ([]monitor, error) {
 	var ms []monitor
 	for _, svc := range svcs {
 		var d Display
-		if edid, err := svc.edid(); err == nil {
-			d.Mfg, d.Model, _ = parseEDID(edid)
+		var edidErr error
+		if edid, err := svc.edid(); err != nil {
+			edidErr = fmt.Errorf("read EDID: %w", err)
+		} else if mfg, model, ok := parseEDID(edid); !ok {
+			edidErr = errors.New("EDID does not parse")
+		} else {
+			d.Mfg, d.Model = mfg, model
 		}
 		if d.Mfg == "APP" {
 			svc.close()
 			continue
 		}
-		ms = append(ms, monitor{d, svc})
+		ms = append(ms, monitor{d, svc, edidErr})
 	}
 	return ms, nil
 }
@@ -82,6 +91,14 @@ func (w Write) Do(ctx context.Context, _ Runner, name string) error {
 		names[i] = m.Model
 	}
 	i, err := pickByName(names, name)
+	if errors.Is(err, ErrNoDisplay) {
+		// A monitor with no name might be the one: that is not "not here".
+		for _, m := range ms {
+			if m.edidErr != nil {
+				return fmt.Errorf("screen write: cannot tell whether %q is attached: %w", name, m.edidErr)
+			}
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -107,12 +124,25 @@ func Probe(ctx context.Context, _ Runner) Report {
 		r.Err = errors.New("no external display has an IOAVService")
 		return r
 	}
+	var unnamed []error
 	for _, m := range ms {
+		if m.edidErr != nil {
+			unnamed = append(unnamed, m.edidErr)
+			continue
+		}
 		d := m.Display
-		if v, err := m.svc.getVCP(ctx, inputSourceVCP); err == nil {
+		if v, err := m.svc.getVCP(ctx, inputSourceVCP); err != nil {
+			d.InputErr = err
+		} else {
 			d.Input, d.InputOK = uint8(v), true
 		}
 		r.Displays = append(r.Displays, d)
+	}
+	if len(r.Displays) == 0 && len(unnamed) > 0 {
+		r.Err = errors.Join(unnamed...)
+	}
+	for _, err := range unnamed {
+		slog.Warn("ignoring a monitor with no usable EDID", "error", err)
 	}
 	return r
 }
