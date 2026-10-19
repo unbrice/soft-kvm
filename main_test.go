@@ -94,7 +94,7 @@ func TestSplitCommand(t *testing.T) {
 		want    []string
 		wantErr bool
 	}{
-		{name: "one word", in: "screen-switch", want: []string{"screen-switch"}},
+		{name: "one word", in: "take-screen", want: []string{"take-screen"}},
 		{name: "words", in: "ddcutil setvcp 0xF4  0xD0", want: []string{"ddcutil", "setvcp", "0xF4", "0xD0"}},
 		{name: "surrounding space", in: "  a b\t", want: []string{"a", "b"}},
 		{name: "single quotes", in: `notify-send 'two words' x`, want: []string{"notify-send", "two words", "x"}},
@@ -136,14 +136,14 @@ func TestSplitCommand(t *testing.T) {
 func TestConnectCommandFlags(t *testing.T) {
 	fs, v := newConnectFlagSet()
 	fs.SetOutput(io.Discard)
-	args := []string{"-D", "screen-switch dp1", "--on-deactivation", "hid-switch 046d:c548 host=1", "-A", "notify-send 'hi there'", "--trigger", "046d:c52b"}
+	args := []string{"-D", "notify-send 'left'", "--on-deactivation", "logger bye", "-A", "notify-send 'hi there'", "--trigger", "kbd", "--declare-hid", "kbd 046d:c52b"}
 	if err := parseArgs(fs, args); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateCommands(fs, v); err != nil {
+	if _, err := validateConnect(fs, v); err != nil {
 		t.Fatal(err)
 	}
-	wantD := [][]string{{"screen-switch", "dp1"}, {"hid-switch", "046d:c548", "host=1"}}
+	wantD := [][]string{{"notify-send", "left"}, {"logger", "bye"}}
 	if !slices.EqualFunc(v.onDeactivation.argv, wantD, slices.Equal) {
 		t.Errorf("on-deactivation = %q, want %q", v.onDeactivation.argv, wantD)
 	}
@@ -157,6 +157,106 @@ func TestConnectCommandFlags(t *testing.T) {
 	fs.SetOutput(io.Discard)
 	if err := parseArgs(fs, []string{"-D", "unterminated 'quote"}); !errors.Is(err, errUsage) {
 		t.Errorf("unterminated quote: got %v, want errUsage", err)
+	}
+}
+
+func parseConnect(t *testing.T, args ...string) (wiring, error) {
+	t.Helper()
+	fs, v := newConnectFlagSet()
+	fs.SetOutput(io.Discard)
+	// A trigger every case needs, declared with no channel; a --trigger in
+	// args comes later and wins.
+	args = append([]string{"--trigger", "trig", "--declare-hid", "trig 046d:c52b"}, args...)
+	if err := parseArgs(fs, args); err != nil {
+		t.Fatalf("parse %q: %v", args, err)
+	}
+	return validateConnect(fs, v)
+}
+
+func TestValidateConnect(t *testing.T) {
+	const lg = `"LG HDR WQHD" dp1 lg`
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string // substring; empty means success
+	}{
+		{name: "the full wiring", args: []string{
+			"--declare-screen", lg, "--declare-hid", "keyboard 046d:c548:1 host=1", "--declare-hid", "mouse 046d:c548:2 host=1",
+			"-A", "take-screen", "-A", "take-hid", "-D", "notify-send left"}},
+		{name: "no command at all", args: nil},
+		{name: "only -D", args: []string{"-D", "notify-send left"}},
+		{name: "a device declared without take-hid still gives it away", args: []string{
+			"--declare-hid", "mouse 046d:c548:2 host=1"}},
+		{name: "take-screen alone", args: []string{"--declare-screen", lg, "-A", "take-screen"}},
+
+		{name: "take-screen without a screen", args: []string{"-A", "take-screen"}, wantErr: "take-screen needs at least one --declare-screen"},
+		{name: "a screen without take-screen", args: []string{"--declare-screen", lg}, wantErr: "does nothing without -A take-screen"},
+		{name: "a screen with only take-hid", args: []string{"--declare-screen", lg, "--declare-hid", "m 046d:c548:2 host=1", "-A", "take-hid"}, wantErr: "does nothing without -A take-screen"},
+		{name: "take-hid without a device", args: []string{"-A", "take-hid"}, wantErr: "take-hid needs at least one --declare-hid"},
+		{name: "take-screen in -D", args: []string{"--declare-screen", lg, "-A", "take-screen", "-D", "take-screen"}, wantErr: "belongs in -A"},
+		{name: "take-hid in -D", args: []string{"-D", "take-hid"}, wantErr: "belongs in -A"},
+		{name: "take-screen with an argument", args: []string{"--declare-screen", lg, "-A", "take-screen dp1"}, wantErr: "takes no argument"},
+		{name: "take-hid with an argument", args: []string{"--declare-hid", "m 046d:c548:2 host=1", "-A", "take-hid mouse"}, wantErr: "takes no argument"},
+
+		{name: "screen declaration that does not parse", args: []string{"--declare-screen", "LG vga", "-A", "take-screen"}, wantErr: "--declare-screen: invalid input"},
+		{name: "screen declaration with one word", args: []string{"--declare-screen", "LG", "-A", "take-screen"}, wantErr: "--declare-screen"},
+		{name: "device without its channel", args: []string{"--declare-hid", "m 046d:c548:2", "-A", "take-hid"}, wantErr: "--declare-hid"},
+		{name: "device with a bad name", args: []string{"--declare-hid", "my-mouse! 046d:c548:2 host=1", "-A", "take-hid"}, wantErr: "invalid device name"},
+		{name: "a monitor declared twice", args: []string{"--declare-screen", "LG dp1", "--declare-screen", "lg hdmi1", "-A", "take-screen"}, wantErr: "declared twice"},
+		{name: "a device declared twice", args: []string{"--declare-hid", "m 046d:c548:2 host=1", "--declare-hid", "m 046d:c548:3 host=2", "-A", "take-hid"}, wantErr: "declared twice"},
+		{name: "a monitor and a device may share a name", args: []string{
+			"--declare-screen", "desk dp1", "--declare-hid", "desk 046d:c548:2 host=1", "-A", "take-screen", "-A", "take-hid"}},
+		{name: "a stray positional", args: []string{"--", "take-screen"}, wantErr: "-A take-screen"},
+
+		{name: "no trigger", args: []string{"--trigger", ""}, wantErr: "--trigger is required"},
+		{name: "a trigger by address", args: []string{"--trigger", "046d:c52b"}, wantErr: "no --declare-hid has that name"},
+		{name: "two triggers by their declared names", args: []string{
+			"--trigger", "keyboard,trig", "--declare-hid", "keyboard 046d:c548:1 host=1"}},
+		{name: "a trigger naming no declaration", args: []string{
+			"--trigger", "mouse", "--declare-hid", "keyboard 046d:c548:1 host=1"}, wantErr: `--trigger "mouse"`},
+		{name: "take-hid with only a device without its channel", args: []string{"-A", "take-hid"}, wantErr: "with its host=N"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseConnect(t, c.args...)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("got %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("got %v, want an error containing %q", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateConnectWiring(t *testing.T) {
+	w, err := parseConnect(t,
+		"--declare-screen", `"LG HDR WQHD" usbc1 lg`, "--declare-screen", `DELL\ U2720Q hdmi1`,
+		"--declare-hid", "keyboard 046d:c548:1 host=1", "--declare-hid", "mouse 046d:b035 host=3",
+		"-A", "take-screen", "-A", "take-hid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The helper's own trigger declaration comes first.
+	if !w.takes || len(w.screens) != 2 || len(w.hids) != 3 || w.detector == nil {
+		t.Fatalf("wiring = %+v", w)
+	}
+	if got := w.screens[0]; got.Name != "LG HDR WQHD" || got.Write.String() != "F4:50=D1" {
+		t.Errorf("screen 0 = %+v", got)
+	}
+	if got := w.screens[1]; got.Name != `DELL U2720Q` || got.Write.String() != "60:51=11" {
+		t.Errorf("screen 1 = %+v", got)
+	}
+	if got := w.hids[2]; got.Name != "mouse" || got.Target.Slot != 0 || got.Channel != 3 {
+		t.Errorf("hid 2 = %+v", got)
+	}
+
+	w, err = parseConnect(t, "--declare-hid", "mouse 046d:c548:2 host=1")
+	if err != nil || w.takes {
+		t.Fatalf("a device that is only given away: %+v, %v; want no takes", w, err)
 	}
 }
 

@@ -25,27 +25,27 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// trigger is one --trigger entry: a HID device, optionally narrowed to a
-// single pairing slot of a receiver.
+// trigger is one --trigger entry, resolved: a HID device, optionally narrowed
+// to a single pairing slot of a receiver.
 type trigger struct {
 	vidpid
 	slot uint8 // 0 = the device itself; 1-6 = a receiver pairing slot
 }
 
-// parseTriggers parses a comma-separated list of "VID:PID" and
-// "VID:PID:SLOT" entries. The address grammar is hidpp.ParseTarget, shared
-// with hid-switch so a device is spelled the same way everywhere.
-func parseTriggers(list string) ([]trigger, error) {
+// parseTriggers resolves a comma-separated list of names against the devices
+// --declare-hid declared: an address is spelled once, in its declaration.
+func parseTriggers(list string, named map[string]hidpp.Target) ([]trigger, error) {
 	var out []trigger
 	for _, s := range strings.Split(list, ",") {
-		if strings.TrimSpace(s) == "" {
+		s = strings.TrimSpace(s)
+		if s == "" {
 			return nil, fmt.Errorf("empty --trigger entry")
 		}
-		vid, pid, slot, err := hidpp.ParseTarget(s)
-		if err != nil {
-			return nil, err
+		t, ok := named[s]
+		if !ok {
+			return nil, fmt.Errorf("--trigger %q: no --declare-hid has that name", s)
 		}
-		out = append(out, trigger{vidpid: vidpid{vid, pid}, slot: slot})
+		out = append(out, trigger{vidpid: vidpid{t.VID, t.PID}, slot: t.Slot})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("empty --trigger list")
@@ -67,9 +67,10 @@ type Detector struct {
 	receivers  []receiverTarget
 }
 
-// NewDetector builds the detector for a --trigger list.
-func NewDetector(list string) (*Detector, error) {
-	triggers, err := parseTriggers(list)
+// NewDetector builds the detector for a --trigger list of names. named holds
+// the devices --declare-hid declared.
+func NewDetector(list string, named map[string]hidpp.Target) (*Detector, error) {
+	triggers, err := parseTriggers(list, named)
 	if err != nil {
 		return nil, err
 	}
@@ -164,32 +165,6 @@ func watchReceiver(ctx context.Context, r receiverTarget, attach chan<- struct{}
 	})
 	if err := g.Wait(); err != nil && ctx.Err() == nil {
 		return err
-	}
-	return nil
-}
-
-// OwnChannelFunc returns a reader for the Easy-Switch channel this host
-// occupies on the trigger peripheral, or nil when no trigger can answer
-// HID++. The agent publishes the answer with its claim so the losing host
-// knows where to send the peripherals it still holds (SPEC §5.5).
-//
-// A receiver slot is asked before a plain HID target, whatever the order in
-// --trigger: a receiver always speaks HID++, while a bare VID:PID may be any
-// keyboard. Either way the answer is the same — the channel is a property of
-// this host, not of the device that reports it.
-func (d *Detector) OwnChannelFunc() func(context.Context) (uint8, error) {
-	switch {
-	case len(d.receivers) > 0:
-		r := d.receivers[0]
-		slot := r.slots[0]
-		return func(ctx context.Context) (uint8, error) {
-			return hidpp.CurrentChannel(ctx, r.vid, r.pid, slot)
-		}
-	case len(d.hidTargets) > 0:
-		t := d.hidTargets[0]
-		return func(ctx context.Context) (uint8, error) {
-			return hidpp.CurrentChannel(ctx, t.vid, t.pid, 0)
-		}
 	}
 	return nil
 }

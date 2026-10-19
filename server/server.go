@@ -17,9 +17,13 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/identity"
@@ -38,20 +42,36 @@ const DefaultWaitTimeout = 50 * time.Second
 // winner's gap and refuses to switch (SPEC §4.3).
 const LiveGraceTime = 30 * time.Second
 
-// Server carries the display bit and serves the /claim /state /wait API.
+// MaxTakes bounds the takes of one POST /take (SPEC §7).
+const MaxTakes = 16
+
+// maxBody bounds a request body: sixteen takes are a few KB at most.
+const maxBody = 64 << 10
+
+// maxNameRunes bounds a hold's name (SPEC §7).
+const maxNameRunes = 64
+
+// validInput is a screen take's VCP:SRC=VAL: three hex bytes (SPEC §5.6).
+var validInput = regexp.MustCompile(`^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}=[0-9A-Fa-f]{2}$`)
+
+// Server carries the display bit and the holds, and serves the /claim /take
+// /arrived /state /wait API.
 type Server struct {
-	mu           sync.Mutex
-	token        string
-	statePath    string
-	owner        string
-	epoch        int64
-	since        time.Time
-	ownerChannel uint8
-	serverID     string
-	waiters      map[string]int
-	lastWait     map[string]time.Time // when each host's last /wait closed
-	broadcast    chan struct{}
-	waitTimeout  time.Duration
+	mu         sync.Mutex
+	token      string
+	statePath  string
+	owner      string
+	epoch      int64
+	since      time.Time
+	activation int64
+	// holds is the last take per (kind, name), with the activation it was
+	// taken under.
+	holds       map[state.HoldKey]state.StoredHold
+	serverID    string
+	waiters     map[string]int
+	lastWait    map[string]time.Time // when each host's last /wait closed
+	broadcast   chan struct{}
+	waitTimeout time.Duration
 }
 
 // NewServer loads the persisted ownerState from statePath. A missing file is
@@ -65,17 +85,21 @@ func NewServer(statePath, token string) *Server {
 	}
 
 	s := &Server{
-		token:        token,
-		statePath:    statePath,
-		owner:        persisted.Owner,
-		epoch:        persisted.Epoch,
-		since:        persisted.Since,
-		ownerChannel: persisted.OwnerChannel,
-		serverID:     newUUID(),
-		waiters:      make(map[string]int),
-		lastWait:     make(map[string]time.Time),
-		broadcast:    make(chan struct{}),
-		waitTimeout:  DefaultWaitTimeout,
+		token:       token,
+		statePath:   statePath,
+		owner:       persisted.Owner,
+		epoch:       persisted.Epoch,
+		since:       persisted.Since,
+		activation:  persisted.Activation,
+		holds:       make(map[state.HoldKey]state.StoredHold, len(persisted.Holds)),
+		serverID:    newUUID(),
+		waiters:     make(map[string]int),
+		lastWait:    make(map[string]time.Time),
+		broadcast:   make(chan struct{}),
+		waitTimeout: DefaultWaitTimeout,
+	}
+	for _, h := range persisted.Holds {
+		s.holds[h.Key()] = h
 	}
 	return s
 }
@@ -166,37 +190,29 @@ func newUUID() string {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /claim/{id}", s.handleClaim)
+	mux.HandleFunc("POST /take/{id}", s.handleTake)
+	mux.HandleFunc("POST /arrived/{id}", s.handleArrived)
 	mux.HandleFunc("GET /state", s.handleState)
 	mux.HandleFunc("GET /wait", s.handleWait)
 	return mux
 }
 
-// handleClaim implements POST /claim/{id} (SPEC §7).
+// handleClaim implements POST /claim/{id} (SPEC §7). A change of owner bumps
+// the activation and the epoch; so does ?retake=true on an unchanged owner,
+// which is how `activate` makes the owner take again. Either needs a live
+// agent unless ?force=true.
 func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validID.MatchString(id) {
-		w.WriteHeader(http.StatusBadRequest)
-		maybeWriteJSON(w, map[string]string{"error": "invalid id"})
+		writeError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// A re-claim by the current owner is idempotent on owner/epoch, but it
-	// still refreshes the published channel: the owner may have learned it
-	// only after the claim that made it owner.
-	channel, cerr := claimChannel(r)
-	if cerr != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		maybeWriteJSON(w, map[string]string{"error": cerr.Error()})
-		return
-	}
-	if id == s.owner {
-		if channel != 0 && channel != s.ownerChannel {
-			s.ownerChannel = channel
-			s.persist()
-		}
+	retake := queryBool(r, "retake")
+	if id == s.owner && !retake {
 		maybeWriteJSON(w, map[string]any{
 			"owner":   s.owner,
 			"epoch":   s.epoch,
@@ -205,21 +221,21 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	force := r.URL.Query().Get("force")
-	if !s.isLiveLocked(id) && force != "true" && force != "1" {
-		w.WriteHeader(http.StatusBadRequest)
-		maybeWriteJSON(w, map[string]string{"error": fmt.Sprintf("no live agent for %s", id)})
+	if !s.isLiveLocked(id) && !queryBool(r, "force") {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("no live agent for %s", id))
 		return
 	}
 
 	old := s.owner
-	s.owner = id
+	if old != id {
+		s.owner = id
+		s.since = time.Now().UTC()
+	}
+	s.activation++
 	s.epoch++
-	s.since = time.Now().UTC()
-	s.ownerChannel = channel
 	s.persist()
-	slog.Info("owner changed", "from", old, "to", s.owner,
-		"epoch", s.epoch, "channel", s.ownerChannel)
+	slog.Info("claimed", "from", old, "to", s.owner,
+		"epoch", s.epoch, "activation", s.activation, "retake", retake)
 	s.wake()
 
 	maybeWriteJSON(w, map[string]any{
@@ -227,6 +243,174 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		"epoch":   s.epoch,
 		"changed": true,
 	})
+}
+
+// takeRequest is the body of POST /take/{id}.
+type takeRequest struct {
+	Activation int64        `json:"activation"`
+	Takes      []state.Take `json:"takes"`
+}
+
+// handleTake implements POST /take/{id} (SPEC §7): the owner, under the
+// activation its ownership dates from, asks that named screens and devices
+// come to it.
+func (s *Server) handleTake(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req takeRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateTakes(req.Takes); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if id != s.owner || req.Activation != s.activation {
+		slog.Info("take refused", "id", id, "owner", s.owner,
+			"activation", req.Activation, "current", s.activation)
+		writeError(w, http.StatusConflict, "not the owner under this activation")
+		return
+	}
+
+	next := s.epoch + 1
+	changed := false
+	for _, t := range req.Takes {
+		old, held := s.holds[t.Key()]
+		input := strings.ToUpper(t.Input)
+		if held && old.Holder == id && old.Input == input && old.Channel == t.Channel &&
+			old.Activation == req.Activation {
+			continue
+		}
+		h := state.Hold{
+			Kind: t.Kind, Name: t.Name, Holder: id, Seq: state.Seq(next),
+			Input: input, Channel: t.Channel, Arrived: t.Arrived && t.Kind == state.KindHID,
+		}
+		if held {
+			h.Prev = old.Prev
+			if old.Holder != id {
+				h.Prev = old.Holder
+			}
+		}
+		s.holds[t.Key()] = state.StoredHold{Hold: h, Activation: req.Activation}
+		changed = true
+		slog.Info("take recorded", "kind", h.Kind, "name", h.Name, "holder", id,
+			"prev", h.Prev, "seq", h.Seq, "input", h.Input, "channel", h.Channel, "arrived", h.Arrived)
+	}
+	s.bumpLocked(changed)
+	maybeWriteJSON(w, map[string]any{"epoch": s.epoch, "changed": changed})
+}
+
+// arrivedRequest is the body of POST /arrived/{id}.
+type arrivedRequest struct {
+	Arrivals []state.Arrival `json:"arrivals"`
+}
+
+// handleArrived implements POST /arrived/{id} (SPEC §7): the holder reports
+// that a device it took is linked to it. An arrival that does not match a
+// current hold of this holder is ignored: it answers a take that has since
+// been replaced.
+func (s *Server) handleArrived(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req arrivedRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changed := false
+	for _, a := range req.Arrivals {
+		key := state.HoldKey{Kind: a.Kind, Name: a.Name}
+		h, ok := s.holds[key]
+		if !ok || h.Holder != id || h.Seq != a.Seq || h.Arrived {
+			continue
+		}
+		h.Arrived = true
+		s.holds[key] = h
+		changed = true
+		slog.Info("arrived", "kind", h.Kind, "name", h.Name, "holder", id, "seq", h.Seq)
+	}
+	s.bumpLocked(changed)
+	maybeWriteJSON(w, map[string]any{"epoch": s.epoch, "changed": changed})
+}
+
+// bumpLocked ends a mutation: when changed, one epoch step, persisted, and
+// every waiter woken. Caller must hold s.mu.
+func (s *Server) bumpLocked(changed bool) {
+	if !changed {
+		return
+	}
+	s.epoch++
+	s.persist()
+	s.wake()
+}
+
+// validateTakes checks the shape of a take request, not its meaning: which
+// VCP:SRC pairs are safe to write is the writer's check (SPEC §5.6, §7).
+func validateTakes(takes []state.Take) error {
+	if len(takes) > MaxTakes {
+		return fmt.Errorf("%d takes, at most %d", len(takes), MaxTakes)
+	}
+	seen := make(map[state.HoldKey]bool, len(takes))
+	for _, t := range takes {
+		if t.Kind != state.KindScreen && t.Kind != state.KindHID {
+			return fmt.Errorf("invalid kind %q", t.Kind)
+		}
+		if n := utf8.RuneCountInString(t.Name); n < 1 || n > maxNameRunes ||
+			strings.IndexFunc(t.Name, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+			return fmt.Errorf("invalid name %q: want 1-%d printable characters", t.Name, maxNameRunes)
+		}
+		if seen[t.Key()] {
+			return fmt.Errorf("%s/%s taken twice", t.Kind, t.Name)
+		}
+		seen[t.Key()] = true
+		switch t.Kind {
+		case state.KindScreen:
+			if !validInput.MatchString(t.Input) || t.Channel != 0 {
+				return fmt.Errorf("invalid screen take %q: want input VCP:SRC=VAL as three hex bytes", t.Name)
+			}
+		case state.KindHID:
+			if t.Input != "" || t.Channel < 1 || t.Channel > hidpp.MaxChannel {
+				return fmt.Errorf("invalid hid take %q: want channel 1-%d and no input", t.Name, hidpp.MaxChannel)
+			}
+		}
+	}
+	return nil
+}
+
+// decodeBody reads a bounded JSON request body into v.
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("invalid body: %w", err)
+	}
+	return nil
+}
+
+// queryBool reads a flag such as ?force=true; "1" is accepted too.
+func queryBool(r *http.Request, name string) bool {
+	v := r.URL.Query().Get(name)
+	return v == "true" || v == "1"
+}
+
+// writeError answers with a JSON error body.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.WriteHeader(status)
+	maybeWriteJSON(w, map[string]string{"error": msg})
 }
 
 // handleState implements GET /state (SPEC §7).
@@ -239,15 +423,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 func (s *Server) CurrentState() state.ServerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	return state.ServerState{
-		Owner:        s.owner,
-		Epoch:        s.epoch,
-		Since:        s.since,
-		OwnerChannel: s.ownerChannel,
-		Live:         s.liveLocked(),
-		ServerID:     s.serverID,
-	}
+	return s.serverStateLocked()
 }
 
 // handleWait implements GET /wait?epoch=N&id=<me> (SPEC §7, §11.1).
@@ -310,15 +486,37 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serverStateLocked returns the ServerState snapshot while s.mu is held.
+// serverStateLocked returns the ServerState snapshot while s.mu is held. The
+// holds are sorted by kind, then name, and never nil.
 func (s *Server) serverStateLocked() state.ServerState {
 	return state.ServerState{
-		Owner:    s.owner,
-		Epoch:    s.epoch,
-		Since:    s.since,
-		Live:     s.liveLocked(),
-		ServerID: s.serverID,
+		Owner:      s.owner,
+		Epoch:      s.epoch,
+		Since:      s.since,
+		Activation: s.activation,
+		Live:       s.liveLocked(),
+		ServerID:   s.serverID,
+		Holds:      s.holdsLocked(),
 	}
+}
+
+// holdsLocked lists the holds sorted by kind, then name. Caller must hold s.mu.
+func (s *Server) holdsLocked() []state.Hold {
+	holds := make([]state.Hold, 0, len(s.holds))
+	for _, h := range s.holds {
+		holds = append(holds, h.Hold)
+	}
+	slices.SortFunc(holds, func(a, b state.Hold) int {
+		return cmpKeys(a.Key(), b.Key())
+	})
+	return holds
+}
+
+func cmpKeys(a, b state.HoldKey) int {
+	if c := strings.Compare(a.Kind, b.Kind); c != 0 {
+		return c
+	}
+	return strings.Compare(a.Name, b.Name)
 }
 
 // wake closes the current broadcast channel and replaces it.
@@ -381,31 +579,22 @@ func maybeWriteJSON(w http.ResponseWriter, v any) {
 	_, _ = w.Write(data)
 }
 
-// persist writes the owner bit. A failure is logged but does not block the
-// in-memory state (SPEC §6.4).
+// persist writes the owner bit and the holds. A failure is logged but does
+// not block the in-memory state (SPEC §6.4).
 func (s *Server) persist() {
+	stored := make([]state.StoredHold, 0, len(s.holds))
+	for _, h := range s.holds {
+		stored = append(stored, h)
+	}
+	slices.SortFunc(stored, func(a, b state.StoredHold) int { return cmpKeys(a.Key(), b.Key()) })
 	err := state.Save(s.statePath, state.OwnerState{
-		Owner:        s.owner,
-		Epoch:        s.epoch,
-		Since:        s.since,
-		OwnerChannel: s.ownerChannel,
+		Owner:      s.owner,
+		Epoch:      s.epoch,
+		Since:      s.since,
+		Activation: s.activation,
+		Holds:      stored,
 	})
 	if err != nil {
 		slog.Error("failed to persist state", "path", s.statePath, "error", err)
 	}
-}
-
-// claimChannel reads the optional ?channel=N on a claim: the Easy-Switch
-// channel the claimant occupies on its peripherals. Absent means "unknown",
-// which is not an error — a host with no HID++ peripheral has none to report.
-func claimChannel(r *http.Request) (uint8, error) {
-	raw := r.URL.Query().Get("channel")
-	if raw == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseUint(raw, 10, 8)
-	if err != nil || n < 1 || n > hidpp.MaxChannel {
-		return 0, fmt.Errorf("invalid channel %q (1-%d)", raw, hidpp.MaxChannel)
-	}
-	return uint8(n), nil
 }

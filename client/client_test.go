@@ -19,6 +19,7 @@ import (
 	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/server"
+	"github.com/unbrice/soft-kvm/state"
 )
 
 const clientTestToken = "client-test-token"
@@ -66,7 +67,7 @@ func TestClientClaimForce(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, clientTestToken)
-	changed, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", true, 0)
+	changed, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", true, false)
 	if err != nil {
 		t.Fatalf("claim force: %v", err)
 	}
@@ -88,7 +89,7 @@ func TestClientClaimNoLiveAgent(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, clientTestToken)
-	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false, 0)
+	_, err := c.Claim(context.Background(), baseFromURL(t, srv.URL), "mac", false, false)
 	if !errors.Is(err, client.ErrNoLiveAgent) {
 		t.Fatalf("expected ErrNoLiveAgent, got %v", err)
 	}
@@ -125,7 +126,7 @@ func TestClientWaitWakesOnClaim(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	changed, err := c.Claim(context.Background(), base, "mac", false, 0)
+	changed, err := c.Claim(context.Background(), base, "mac", false, false)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -186,7 +187,7 @@ func TestClientWrongSecret(t *testing.T) {
 	// (SPEC §9).
 	c := newTestClient(t, "wrong-token")
 
-	if _, err := c.Claim(context.Background(), base, "mac", true, 0); err == nil {
+	if _, err := c.Claim(context.Background(), base, "mac", true, false); err == nil {
 		t.Fatal("claim: expected TLS failure")
 	} else if !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("claim: expected certificate error, got %v", err)
@@ -248,11 +249,48 @@ func TestClientNonJSONErrorBody(t *testing.T) {
 	defer server.Close()
 
 	c := newTestClient(t, clientTestToken)
-	_, err = c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false, 0)
+	_, err = c.Claim(context.Background(), baseFromURL(t, server.URL), "mac", false, false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "plain text error") {
 		t.Fatalf("error should contain body: %v", err)
+	}
+}
+
+func TestClientTakeAndArrived(t *testing.T) {
+	_, srv := newClientTestServer(t)
+	defer srv.Close()
+	base := baseFromURL(t, srv.URL)
+	c := newTestClient(t, clientTestToken)
+	ctx := context.Background()
+	takes := []state.Take{{Kind: state.KindHID, Name: "mouse", Channel: 2}}
+
+	// Nobody owns: a 409 becomes the sentinel.
+	if err := c.Take(ctx, base, "mac", 0, takes); !errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("take by a non-owner: %v, want ErrNotOwner", err)
+	}
+	if _, err := c.Claim(ctx, base, "mac", true, false); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := c.Take(ctx, base, "mac", 1, takes); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	// A malformed take is a plain error, not the sentinel.
+	err := c.Take(ctx, base, "mac", 1, []state.Take{{Kind: "led", Name: "x"}})
+	if err == nil || errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("malformed take: %v, want a plain error", err)
+	}
+
+	st, err := c.State(ctx, base)
+	if err != nil || len(st.Holds) != 1 {
+		t.Fatalf("state: %+v, %v", st, err)
+	}
+	h := st.Holds[0]
+	if err := c.Arrived(ctx, base, "mac", state.Arrival{Kind: h.Kind, Name: h.Name, Seq: h.Seq}); err != nil {
+		t.Fatalf("arrived: %v", err)
+	}
+	if st, _ = c.State(ctx, base); !st.Holds[0].Arrived {
+		t.Fatalf("hold not arrived: %+v", st.Holds[0])
 	}
 }

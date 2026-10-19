@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // agent_test.go: wiring tests for the agent loop (SPEC §11.3, §11.4). The
-// machine is real; the detector, guard, and runner are fakes; the server is
-// real under httptest.
+// machine is real; the detector, guard, runner and the screen and device
+// seams are fakes; the server is real under httptest.
 
 package agent
 
@@ -14,8 +14,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,8 +23,10 @@ import (
 
 	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/model"
+	"github.com/unbrice/soft-kvm/screen"
 	"github.com/unbrice/soft-kvm/server"
 	"github.com/unbrice/soft-kvm/state"
 )
@@ -147,6 +149,7 @@ func agentMachineConfig(id string) *model.MachineConfig {
 		Settle:         50 * time.Millisecond,
 		SwitchRetries:  1,
 		RetrySpacing:   50 * time.Millisecond,
+		ArrivalWindow:  500 * time.Millisecond,
 		Cooldown:       50 * time.Millisecond,
 		BreakerWindow:  1 * time.Minute,
 		BreakerMax:     10,
@@ -227,53 +230,49 @@ func TestAgentAttachClaims(t *testing.T) {
 	}
 }
 
-func TestAgentSwitchPath(t *testing.T) {
+// seedOwner makes id the owner on the server and records, in agent.json, that
+// the agent has followed that ownership: it starts as the owner or as a host
+// that was left, not as a fresh install.
+func seedOwner(t *testing.T, base, ownerID, statePath, agentLastOwner string) {
+	t.Helper()
+	c := newTestClient(t, testToken)
+	if _, err := c.Claim(context.Background(), base, ownerID, true, false); err != nil {
+		t.Fatalf("seed claim %s: %v", ownerID, err)
+	}
+	rec := state.AgentState{LastOwner: agentLastOwner, LastActivation: 1}
+	if err := state.Save(statePath, rec); err != nil {
+		t.Fatalf("save agent state: %v", err)
+	}
+}
+
+func TestAgentDeactivationPath(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	// Seed the server so the agent starts with last_owner == me.
-	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
-
-	// Make "other" appear live to the server so the agent will switch to it.
-	s.SetWaiterCount("other", 1)
+	seedOwner(t, base, "linux", statePath, "linux")
 
 	det := newFakeDetector()
 	runner := &recordingRunner{}
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	// A second switch command (e.g. a USB device) runs after the display one.
+	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
+	// A second command (e.g. a notification) runs after the first.
 	cfg.OnDeactivation = append(cfg.OnDeactivation, []string{"switch", "usb"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runAgent(ctx, t, cfg)
-
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
+	// Nothing about the new owner is checked: not live, no cooldown.
+	if _, err := client.Claim(context.Background(), base, "other", true, false); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
-	// Exit 0 from every command is the receipt: nothing probes before or after.
 	waitForLastOwner(t, statePath, "other")
-	calls := runner.Calls()
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 runner calls, got %d: %v", len(calls), calls)
-	}
-	if !slices.Equal(calls[0], cfg.OnDeactivation[0]) {
-		t.Errorf("call 0 = %v, want switch %v", calls[0], cfg.OnDeactivation[0])
-	}
-	if !slices.Equal(calls[1], cfg.OnDeactivation[1]) {
-		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.OnDeactivation[1])
+	if calls := runner.Calls(); !slices.EqualFunc(calls, cfg.OnDeactivation, slices.Equal[[]string]) {
+		t.Fatalf("calls = %v, want the deactivation commands %v in order", calls, cfg.OnDeactivation)
 	}
 }
 
@@ -285,36 +284,62 @@ func TestAgentActivationPath(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "other"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
+	seedOwner(t, base, "other", statePath, "other")
 
 	det := newFakeDetector()
 	runner := &recordingRunner{}
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
 	cfg.OnActivation = [][]string{{"activate", "cmd"}, {"activate", "usb"}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runAgent(ctx, t, cfg)
-
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
+	if _, err := client.Claim(context.Background(), base, "linux", true, false); err != nil {
 		t.Fatalf("force claim linux: %v", err)
 	}
 
 	waitForLastOwner(t, statePath, "linux")
-	calls := runner.Calls()
-	if !slices.EqualFunc(calls, cfg.OnActivation, slices.Equal[[]string]) {
+	if calls := runner.Calls(); !slices.EqualFunc(calls, cfg.OnActivation, slices.Equal[[]string]) {
 		t.Errorf("calls = %v, want exactly the activation commands %v", calls, cfg.OnActivation)
 	}
+}
+
+// `activate` against the current owner re-runs its -A commands, and an
+// attach-driven claim does not (SPEC §4.3).
+func TestAgentReactivation(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	seedOwner(t, base, "linux", statePath, "linux")
+
+	det := newFakeDetector()
+	runner := &recordingRunner{}
+	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
+	cfg.OnActivation = [][]string{{"activate", "cmd"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+	waitForLive(t, s, "linux")
+
+	// A receiver flap claims the bit it already holds: nothing runs.
+	det.attach()
+	time.Sleep(300 * time.Millisecond)
+	if calls := runner.Calls(); len(calls) != 0 {
+		t.Fatalf("an attach-driven claim ran %v", calls)
+	}
+
+	if _, err := client.Claim(context.Background(), base, "linux", false, true); err != nil {
+		t.Fatalf("retake: %v", err)
+	}
+	waitFor(t, "the activation commands run again", func() bool { return len(runner.Calls()) == 1 })
+	waitForRecord(t, statePath, func(as state.AgentState) bool { return as.LastActivation == 2 })
 }
 
 // A retry re-runs only the commands that failed: the peripheral the second
@@ -325,130 +350,477 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
-
-	s.SetWaiterCount("other", 1)
+	seedOwner(t, base, "linux", statePath, "linux")
 
 	det := newFakeDetector()
-	// Attempt 1: the display command fails, the USB one succeeds. Attempt 2:
-	// the display command succeeds.
+	// Attempt 1: the first command fails, the second succeeds. Attempt 2: the
+	// first command succeeds.
 	runner := &recordingRunner{errs: []error{errors.New("monitor still here"), nil, nil}}
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.OnDeactivation = append(cfg.OnDeactivation, []string{"switch", "usb"})
+	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
+	cfg.OnDeactivation = [][]string{{"switch", "display"}, {"switch", "usb"}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runAgent(ctx, t, cfg)
-
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, false); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
 	waitForLastOwner(t, statePath, "other")
-	calls := runner.Calls()
 	want := [][]string{cfg.OnDeactivation[0], cfg.OnDeactivation[1], cfg.OnDeactivation[0]}
-	if len(calls) != len(want) {
-		t.Fatalf("expected %d runner calls, got %d: %v", len(want), len(calls), calls)
-	}
-	for i := range want {
-		if !slices.Equal(calls[i], want[i]) {
-			t.Errorf("call %d = %v, want %v", i, calls[i], want[i])
-		}
+	if calls := runner.Calls(); !slices.EqualFunc(calls, want, slices.Equal[[]string]) {
+		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 }
 
-// screen-switch is built in: it goes to the screen runner, never to the argv
-// runner as a program called "screen-switch" (SPEC §5.6).
-func TestAgentScreenSwitchIsBuiltIn(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("ScreenRunner (ddcutil) is Linux-only; macOS uses IOAVService")
-	}
+// take-screen and take-hid are built in: they post this host's declarations
+// and are never exec'd as programs (SPEC §5.4).
+func TestAgentTakeCommandsAreBuiltIn(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
+	seedOwner(t, base, "other", statePath, "other")
 
-	s.SetWaiterCount("other", 1)
-
-	det := newFakeDetector()
 	runner := &recordingRunner{}
-	// The write succeeds; any read after it fails, which is the monitor
-	// having left this input.
-	screenRunner := &recordingRunner{errs: []error{nil, errors.New("no DDC reply")}}
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.OnDeactivation = [][]string{{"screen-switch", "dp1"}}
-	cfg.ScreenRunner = func(ctx context.Context, argv []string) ([]byte, error) {
-		return nil, screenRunner.run(ctx, argv)
+	cfg := agentTestConfig(t, base, statePath, s, newFakeDetector(), &fakeGuard{ok: true}, runner.run)
+	cfg.OnActivation = [][]string{{"take-screen"}, {"take-hid"}, {"after", "takes"}}
+	cfg.Screens = []screen.Declaration{{Name: "LG HDR WQHD", Write: screen.Write{VCP: 0xF4, Source: 0x50, Value: 0xD0}}}
+	cfg.HIDs = []hidpp.Declaration{
+		{Name: "keyboard", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 1}, Channel: 1},
+		{Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}, Channel: 1},
 	}
+	// The keyboard carried the gesture and is already here; the mouse is not.
+	cfg.HIDPresent = func(_ context.Context, tg hidpp.Target) (bool, error) { return tg.Slot == 1, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runAgent(ctx, t, cfg)
-
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
-		t.Fatalf("force claim other: %v", err)
+	if _, err := client.Claim(context.Background(), base, "linux", true, false); err != nil {
+		t.Fatalf("force claim linux: %v", err)
+	}
+	waitForLastOwner(t, statePath, "linux")
+
+	st, err := client.State(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []state.Hold{
+		{Kind: "hid", Name: "keyboard", Holder: "linux", Seq: st.Holds[0].Seq, Channel: 1, Arrived: true},
+		{Kind: "hid", Name: "mouse", Holder: "linux", Seq: st.Holds[1].Seq, Channel: 1},
+		{Kind: "screen", Name: "LG HDR WQHD", Holder: "linux", Seq: st.Holds[2].Seq, Input: "F4:50=D0"},
+	}
+	if !slices.Equal(st.Holds, want) {
+		t.Fatalf("holds = %+v\nwant    %+v", st.Holds, want)
+	}
+	if calls := runner.Calls(); !slices.EqualFunc(calls, [][]string{{"after", "takes"}}, slices.Equal[[]string]) {
+		t.Fatalf("exec'd %v, want only the ordinary command", calls)
+	}
+}
+
+// A take under an activation that is no longer current is refused, and the
+// command fails (SPEC §4.3).
+func TestAgentTakeUnderStaleActivationFails(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	seedOwner(t, base, "linux", filepath.Join(t.TempDir(), "agent.json"), "linux")
+
+	cfg := agentTestConfig(t, base, filepath.Join(t.TempDir(), "agent.json"), s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
+	cfg.Screens = []screen.Declaration{{Name: "LG", Write: screen.Write{VCP: 0x60, Source: 0x51, Value: 0x0F}}}
+	a := &agent{cfg: cfg}
+
+	if err := a.runCommand(context.Background(), []string{TakeScreen}, 99); !errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("take under a stale activation: %v, want ErrNotOwner", err)
+	}
+	if err := a.runCommand(context.Background(), []string{TakeScreen}, 1); err != nil {
+		t.Fatalf("take under the current activation: %v", err)
+	}
+	if st := s.CurrentState(); len(st.Holds) != 1 || st.Holds[0].Input != "60:51=0F" {
+		t.Fatalf("holds = %+v", st.Holds)
+	}
+}
+
+// fakeSeams records the writes and sends, and answers from canned results.
+type fakeSeams struct {
+	mu       sync.Mutex
+	writes   []string // "NAME VCP:SRC=VAL"
+	sends    []string // "VID:PID:SLOT channel"
+	writeErr error
+	hang     bool // writes block until their context is done
+	sendErr  error
+	sendHere bool            // the device is linked to this host before the send
+	present  map[string]bool // by target string
+}
+
+func (f *fakeSeams) writeScreen(ctx context.Context, w screen.Write, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = append(f.writes, name+" "+w.String())
+	if f.hang {
+		f.mu.Unlock()
+		<-ctx.Done()
+		f.mu.Lock()
+		return ctx.Err()
+	}
+	return f.writeErr
+}
+
+func (f *fakeSeams) sendHID(_ context.Context, tg hidpp.Target, channel uint8) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sends = append(f.sends, tg.String()+" "+string(rune('0'+channel)))
+	return f.sendHere, f.sendErr
+}
+
+func (f *fakeSeams) here(_ context.Context, tg hidpp.Target) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.present[tg.String()], nil
+}
+
+func (f *fakeSeams) setPresent(tg hidpp.Target, v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.present == nil {
+		f.present = map[string]bool{}
+	}
+	f.present[tg.String()] = v
+}
+
+func (f *fakeSeams) Writes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.writes)
+}
+
+func (f *fakeSeams) Sends() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.sends)
+}
+
+func TestRunTake(t *testing.T) {
+	mouse := hidpp.Declaration{Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}, Channel: 1}
+	lg := state.Hold{Kind: state.KindScreen, Name: "LG HDR WQHD", Holder: "mac", Seq: 3, Input: "F4:50=D1"}
+	mouseHold := state.Hold{Kind: state.KindHID, Name: "mouse", Holder: "mac", Seq: 3, Channel: 3}
+
+	cases := []struct {
+		name  string
+		hold  state.Hold
+		seams *fakeSeams
+		want  model.Outcome
+		check func(t *testing.T, f *fakeSeams)
+	}{
+		{name: "a screen is written, as the wire says", hold: lg,
+			check: func(t *testing.T, f *fakeSeams) {
+				if w := f.Writes(); !slices.Equal(w, []string{"LG HDR WQHD F4:50=D1"}) {
+					t.Errorf("writes = %q", w)
+				}
+			}},
+		{name: "no monitor of that name is nothing to move", hold: lg,
+			seams: &fakeSeams{writeErr: screen.ErrNoDisplay}, want: model.Outcome{NotHere: true}},
+		{name: "a write that fails is an error", hold: lg,
+			seams: &fakeSeams{writeErr: errors.New("ddcutil missing")}, want: model.Outcome{Err: errors.New("ddcutil missing")}},
+		{name: "a malformed input is an error and writes nothing", hold: state.Hold{Kind: state.KindScreen, Name: "LG", Input: "nonsense"},
+			want: model.Outcome{Err: errors.New("invalid write")}},
+		{name: "a pair no table lists is an error and writes nothing", hold: state.Hold{Kind: state.KindScreen, Name: "LG", Input: "04:51=01"},
+			want: model.Outcome{Err: errors.New("refusing write")},
+			check: func(t *testing.T, f *fakeSeams) {
+				if w := f.Writes(); len(w) != 0 {
+					t.Errorf("wrote %q", w)
+				}
+			}},
+		{name: "a device is sent to the holder's channel", hold: mouseHold, seams: &fakeSeams{sendHere: true},
+			check: func(t *testing.T, f *fakeSeams) {
+				if s := f.Sends(); !slices.Equal(s, []string{"046d:c548:2 3"}) {
+					t.Errorf("sends = %q", s)
+				}
+			}},
+		{name: "a device not linked here is nothing to move", hold: mouseHold, want: model.Outcome{NotHere: true}},
+		{name: "a device with no local declaration is nothing to move",
+			hold: state.Hold{Kind: state.KindHID, Name: "pen", Seq: 3, Channel: 1}, want: model.Outcome{NotHere: true},
+			check: func(t *testing.T, f *fakeSeams) {
+				if s := f.Sends(); len(s) != 0 {
+					t.Errorf("sent %q", s)
+				}
+			}},
+		{name: "a send that fails is an error", hold: mouseHold,
+			seams: &fakeSeams{sendHere: true, sendErr: errors.New("EACCES")}, want: model.Outcome{Err: errors.New("EACCES")}},
+		{name: "an unknown kind is an error", hold: state.Hold{Kind: "led", Name: "x"}, want: model.Outcome{Err: errors.New("unknown kind")}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := c.seams
+			if f == nil {
+				f = &fakeSeams{}
+			}
+			cfg := Config{WriteScreen: f.writeScreen, SendHID: f.sendHID, SwitchTimeout: time.Second}
+			a := &agent{cfg: cfg, hids: map[string]hidpp.Declaration{"mouse": mouse}}
+			got := a.runTake(context.Background(), c.hold)
+			if got.NotHere != c.want.NotHere || (got.Err == nil) != (c.want.Err == nil) {
+				t.Fatalf("outcome = %+v, want %+v", got, c.want)
+			}
+			if c.want.Err != nil && !strings.Contains(got.Err.Error(), c.want.Err.Error()) {
+				t.Fatalf("error = %v, want it to contain %q", got.Err, c.want.Err)
+			}
+			if c.check != nil {
+				c.check(t, f)
+			}
+		})
+	}
+}
+
+// A hung write is killed by --switch-timeout and reported as a failure, so one
+// stuck monitor cannot freeze the agent (SPEC §4.3).
+func TestRunTakeTimesOut(t *testing.T) {
+	f := &fakeSeams{hang: true}
+	a := &agent{cfg: Config{WriteScreen: f.writeScreen, SwitchTimeout: 30 * time.Millisecond}}
+	got := a.runTake(context.Background(), state.Hold{Kind: state.KindScreen, Name: "LG", Input: "60:51=0F"})
+	if !errors.Is(got.Err, errSwitchTimeout) {
+		t.Fatalf("outcome = %+v, want errSwitchTimeout", got)
+	}
+}
+
+// The whole handover, with two real agents on a real server: the Mac claims,
+// Linux deactivates and then runs the Mac's takes against its fakes, and the
+// Mac's arrival watcher reports the mouse once it links (SPEC §4.1).
+func TestAgentHandover(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+	dir := t.TempDir()
+	linuxState, macState := filepath.Join(dir, "linux.json"), filepath.Join(dir, "mac.json")
+	seedOwner(t, base, "linux", linuxState, "linux")
+	if err := state.Save(macState, state.AgentState{LastOwner: "linux", LastActivation: 1}); err != nil {
+		t.Fatal(err)
 	}
 
-	waitForLastOwner(t, statePath, "other")
-	if len(screenRunner.Calls()) == 0 {
-		t.Error("screen-switch never reached the screen runner")
+	lgOnMac := screen.Write{VCP: 0xF4, Source: 0x50, Value: 0xD1}
+	mouseOnMac := hidpp.Target{VID: 0x046d, PID: 0xb035}
+	mouseOnLinux := hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}
+
+	linuxSeams, macSeams := &fakeSeams{sendHere: true}, &fakeSeams{}
+	linuxRunner, macRunner := &recordingRunner{}, &recordingRunner{}
+
+	linux := agentTestConfig(t, base, linuxState, s, newFakeDetector(), &fakeGuard{ok: true}, linuxRunner.run)
+	linux.OnDeactivation = [][]string{{"notify", "left"}}
+	linux.WriteScreen, linux.SendHID, linux.HIDPresent = linuxSeams.writeScreen, linuxSeams.sendHID, linuxSeams.here
+	linux.HIDs = []hidpp.Declaration{{Name: "mouse", Target: mouseOnLinux, Channel: 1}}
+
+	mac := agentTestConfig(t, base, macState, s, newFakeDetector(), &fakeGuard{ok: true}, macRunner.run)
+	mac.ID = "mac"
+	mac.Machine = agentMachineConfig("mac")
+	mac.OnDeactivation = nil
+	mac.OnActivation = [][]string{{"take-screen"}, {"take-hid"}}
+	mac.Screens = []screen.Declaration{{Name: "LG HDR WQHD", Write: lgOnMac}}
+	mac.HIDs = []hidpp.Declaration{{Name: "mouse", Target: mouseOnMac, Channel: 3}}
+	mac.WriteScreen, mac.SendHID, mac.HIDPresent = macSeams.writeScreen, macSeams.sendHID, macSeams.here
+	mac.ArrivalPoll, mac.ArrivalFor = 10*time.Millisecond, 5*time.Second
+	mac.Resolver = discover.NewResolver(filepath.Join(t.TempDir(), "server"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, linux)
+	runAgent(ctx, t, mac)
+	waitForLive(t, s, "linux")
+	waitForLive(t, s, "mac")
+
+	if _, err := client.Claim(ctx, base, "mac", false, false); err != nil {
+		t.Fatalf("mac claim: %v", err)
 	}
-	if calls := runner.Calls(); len(calls) != 0 {
-		t.Errorf("screen-switch was exec'd as a program: %v", calls)
+
+	// Linux gives the monitor and the mouse to the Mac's input and channel.
+	waitFor(t, "linux writes the monitor", func() bool { return len(linuxSeams.Writes()) == 1 })
+	waitFor(t, "linux sends the mouse", func() bool { return len(linuxSeams.Sends()) == 1 })
+	if w := linuxSeams.Writes(); w[0] != "LG HDR WQHD F4:50=D1" {
+		t.Errorf("linux wrote %q", w)
+	}
+	if sd := linuxSeams.Sends(); sd[0] != "046d:c548:2 3" {
+		t.Errorf("linux sent %q", sd)
+	}
+	if calls := linuxRunner.Calls(); !slices.EqualFunc(calls, [][]string{{"notify", "left"}}, slices.Equal[[]string]) {
+		t.Errorf("linux deactivation ran %v", calls)
+	}
+	if w := macSeams.Writes(); len(w) != 0 {
+		t.Errorf("the taker wrote the monitor: %q", w)
+	}
+
+	// The mouse links on the Mac; its watcher reports it.
+	macSeams.setPresent(mouseOnMac, true)
+	waitFor(t, "the mouse hold arrives", func() bool {
+		for _, h := range s.CurrentState().Holds {
+			if h.Kind == state.KindHID && h.Name == "mouse" && h.Arrived && h.Holder == "mac" && h.Prev == "" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// Linux marks both takes handled, and sends nothing more.
+	waitForRecord(t, linuxState, func(as state.AgentState) bool {
+		return as.LastOwner == "mac" && len(as.Seen) == 2
+	})
+	time.Sleep(200 * time.Millisecond)
+	if n := len(linuxSeams.Sends()); n != 1 {
+		t.Errorf("linux sent the mouse %d times, want 1", n)
+	}
+	if n := len(linuxSeams.Writes()); n != 1 {
+		t.Errorf("linux wrote the monitor %d times, want 1", n)
+	}
+}
+
+func TestArrivalWatcher(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+	if _, err := client.Claim(context.Background(), base, "linux", true, false); err != nil {
+		t.Fatal(err)
+	}
+	mouseT := hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}
+	if err := client.Take(context.Background(), base, "linux", 1, []state.Take{
+		{Kind: state.KindHID, Name: "mouse", Channel: 1},
+		{Kind: state.KindHID, Name: "pen", Channel: 2}, // no local declaration
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var polls atomic.Int32
+	var present atomic.Bool
+	cfg := agentTestConfig(t, base, filepath.Join(t.TempDir(), "agent.json"), s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
+	cfg.HIDs = []hidpp.Declaration{{Name: "mouse", Target: mouseT, Channel: 1}}
+	cfg.HIDPresent = func(_ context.Context, tg hidpp.Target) (bool, error) {
+		if tg != mouseT {
+			t.Errorf("polled %v, want only the declared mouse", tg)
+		}
+		polls.Add(1)
+		return present.Load(), nil
+	}
+	cfg.ArrivalPoll, cfg.ArrivalFor = 10*time.Millisecond, 400*time.Millisecond
+	a := &agent{cfg: cfg, hids: map[string]hidpp.Declaration{"mouse": cfg.HIDs[0]}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	states := make(chan *state.ServerState, 1)
+	go func() { _ = a.arrivalWatch(ctx, states) }()
+	st := s.CurrentState()
+	states <- &st
+
+	waitFor(t, "the watcher polls", func() bool { return polls.Load() >= 3 })
+	for _, h := range s.CurrentState().Holds {
+		if h.Arrived {
+			t.Fatalf("%s arrived before the device did", h.Name)
+		}
+	}
+
+	present.Store(true)
+	waitFor(t, "the mouse is reported", func() bool {
+		for _, h := range s.CurrentState().Holds {
+			if h.Name == "mouse" {
+				return h.Arrived
+			}
+		}
+		return false
+	})
+	// Reported once, then not polled again for that seq.
+	n := polls.Load()
+	time.Sleep(100 * time.Millisecond)
+	if got := polls.Load(); got > n+1 {
+		t.Errorf("polling went on after the arrival: %d -> %d", n, got)
+	}
+}
+
+func TestArrivalWatcherGivesUp(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+	if _, err := client.Claim(context.Background(), base, "linux", true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Take(context.Background(), base, "linux", 1, []state.Take{{Kind: state.KindHID, Name: "mouse", Channel: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var polls atomic.Int32
+	cfg := agentTestConfig(t, base, filepath.Join(t.TempDir(), "agent.json"), s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
+	cfg.HIDPresent = func(context.Context, hidpp.Target) (bool, error) { polls.Add(1); return false, nil }
+	cfg.ArrivalPoll, cfg.ArrivalFor = 10*time.Millisecond, 100*time.Millisecond
+	a := &agent{cfg: cfg, hids: map[string]hidpp.Declaration{"mouse": {Name: "mouse"}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	states := make(chan *state.ServerState, 1)
+	go func() { _ = a.arrivalWatch(ctx, states) }()
+	st := s.CurrentState()
+	states <- &st
+
+	time.Sleep(400 * time.Millisecond)
+	n := polls.Load()
+	if n == 0 {
+		t.Fatal("never polled")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := polls.Load(); got != n {
+		t.Errorf("still polling %v after the window: %d -> %d", cfg.ArrivalFor, n, got)
+	}
+	// A new take of the name starts a new window.
+	if err := client.Take(context.Background(), base, "linux", 1, []state.Take{{Kind: state.KindHID, Name: "mouse", Channel: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	st = s.CurrentState()
+	states <- &st
+	waitFor(t, "polling resumes for the new take", func() bool { return polls.Load() > n })
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for: %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForRecord(t *testing.T, statePath string, ok func(state.AgentState) bool) {
+	t.Helper()
+	var as state.AgentState
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		as = state.AgentState{}
+		if err := state.Load(statePath, &as); err == nil && ok(as) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent state never reached the expected record (got %+v)", as)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func waitForLastOwner(t *testing.T, statePath, want string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		var as state.AgentState
-		if err := state.Load(statePath, &as); err == nil && as.LastOwner == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("agent state never reached last_owner=%q (got %q)", want, as.LastOwner)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForRecord(t, statePath, func(as state.AgentState) bool { return as.LastOwner == want })
 }
 
 func TestAgentGuardsDown(t *testing.T) {
 	s, srv := newAgentTestServer(t)
 	defer srv.Close()
 	base := agentTestBase(t, srv.URL)
-	client := newTestClient(t, testToken)
-
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
-		t.Fatalf("seed claim other: %v", err)
-	}
 
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
+	seedOwner(t, base, "other", statePath, "linux")
 
 	det := newFakeDetector()
 	runner := &recordingRunner{}
@@ -483,32 +855,20 @@ func TestAgentSwitchTimeout(t *testing.T) {
 	base := agentTestBase(t, srv.URL)
 	client := newTestClient(t, testToken)
 
-	// Seed the server so the agent starts with last_owner == me.
-	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
-
 	statePath := filepath.Join(t.TempDir(), "agent.json")
-	if err := state.Save(statePath, state.AgentState{LastOwner: "linux"}); err != nil {
-		t.Fatalf("save agent state: %v", err)
-	}
-
-	// Make "other" appear live so the agent will try to switch to it.
-	s.SetWaiterCount("other", 1)
+	seedOwner(t, base, "linux", statePath, "linux")
 
 	det := newFakeDetector()
 	runner := newHungSwitchRunner()
-	guard := &fakeGuard{ok: true}
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
 	cfg.SwitchTimeout = 50 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runAgent(ctx, t, cfg)
-
 	waitForLive(t, s, "linux")
 
-	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
+	if _, err := client.Claim(context.Background(), base, "other", true, false); err != nil {
 		t.Fatalf("force claim other: %v", err)
 	}
 
@@ -519,20 +879,9 @@ func TestAgentSwitchTimeout(t *testing.T) {
 		t.Fatal("switch runner not called")
 	}
 
-	// The agent must stay responsive: the timeout produces a SwitchExit and the
+	// The agent must stay responsive: the timeout produces an Exit and the
 	// machine retries (SwitchRetries=1), so a second switch call arrives.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		n := runner.SwitchCalls()
-		if n >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected 2 switch calls, got %d", n)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
+	waitFor(t, "a second switch call", func() bool { return runner.SwitchCalls() >= 2 })
 	if !runner.firstCtxCanceled() {
 		t.Error("first switch context was not canceled by timeout")
 	}
@@ -637,94 +986,16 @@ func waitForLive(t *testing.T, s *server.Server, id string) {
 	}
 }
 
-// The winner publishes the Easy-Switch channel it occupies, so the losing
-// host knows where to send the peripherals it still holds (SPEC §5.5).
-func TestAgentClaimPublishesOwnChannel(t *testing.T) {
-	s, srv := newAgentTestServer(t)
-	defer srv.Close()
-	base := agentTestBase(t, srv.URL)
-
-	det := newFakeDetector()
-	runner := &recordingRunner{}
-	guard := &fakeGuard{ok: true}
-	statePath := filepath.Join(t.TempDir(), "agent.json")
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-
-	// Count the reads: the channel is a property of the pairing, so it must
-	// be read once and cached, not on every claim.
-	var reads atomic.Int32
-	cfg.OwnChannel = func(context.Context) (uint8, error) {
-		reads.Add(1)
-		return 2, nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runAgent(ctx, t, cfg)
-
-	waitForLive(t, s, "linux")
-	det.attach()
-
-	client := newTestClient(t, testToken)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		st, err := client.State(ctx, base)
-		if err != nil {
-			t.Fatalf("state: %v", err)
-		}
-		if st.Owner == "linux" && st.OwnerChannel == 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("owner channel not published: %+v", st)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	det.attach()
-	time.Sleep(100 * time.Millisecond)
-	if n := reads.Load(); n != 1 {
-		t.Errorf("OwnChannel read %d times, want 1 (cached)", n)
-	}
-}
-
-// A nil OwnChannel — a trigger that cannot answer HID++ — must not break the
-// claim; it just publishes nothing.
-func TestAgentClaimWithoutOwnChannel(t *testing.T) {
-	s, srv := newAgentTestServer(t)
-	defer srv.Close()
-	base := agentTestBase(t, srv.URL)
-
-	det := newFakeDetector()
-	runner := &recordingRunner{}
-	guard := &fakeGuard{ok: true}
-	statePath := filepath.Join(t.TempDir(), "agent.json")
-	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.OwnChannel = nil
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runAgent(ctx, t, cfg)
-
-	waitForLive(t, s, "linux")
-	det.attach()
-
-	client := newTestClient(t, testToken)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		st, err := client.State(ctx, base)
-		if err != nil {
-			t.Fatalf("state: %v", err)
-		}
-		if st.Owner == "linux" {
-			if st.OwnerChannel != 0 {
-				t.Fatalf("OwnerChannel = %d, want 0", st.OwnerChannel)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("claim did not land: %+v", st)
-		}
-		time.Sleep(10 * time.Millisecond)
+// A declaration without host=N is watched and given away, never taken:
+// take-hid does not post it.
+func TestHIDTakesSkipDevicesWithoutChannel(t *testing.T) {
+	a := &agent{cfg: Config{HIDs: []hidpp.Declaration{
+		{Name: "keyboard", Target: hidpp.Target{VID: 0x1532, PID: 0x0285}},
+		{Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}, Channel: 2},
+	}}}
+	got := a.hidTakes(context.Background())
+	want := []state.Take{{Kind: state.KindHID, Name: "mouse", Channel: 2}}
+	if !slices.Equal(got, want) {
+		t.Errorf("hidTakes = %+v, want %+v", got, want)
 	}
 }

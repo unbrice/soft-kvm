@@ -12,5 +12,5 @@ import (
 )
 
 func serviceCmd(_ context.Context) error {
-	return errors.New("service management is only supported on Linux (systemd); for macOS launchd, see SPEC §6.2")
+	return errors.New("service management is only supported on Linux (systemd); on macOS, run connect from a LaunchAgent in ~/Library/LaunchAgents")
 }

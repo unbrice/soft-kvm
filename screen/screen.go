@@ -2,10 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen.go: the `screen-switch` virtual switch command — input aliases, the
-// mapping tables, the argv parser and the confirm loop both backends share
-// (SPEC §5.6). The per-OS files drive the monitor: ddcutil on Linux,
-// IOAVService on macOS.
+// screen.go: screen declarations and the VCP:SRC=VAL wire form — input
+// aliases, the mapping tables and the checks both backends share (SPEC §5.6).
+// The per-OS files write the monitor: ddcutil on Linux, IOAVService on macOS.
 
 package screen
 
@@ -17,7 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Runner executes one argv slice and returns its combined output: nil error
@@ -56,14 +56,14 @@ func (t *Table) reads(alias string) (value uint8, ok bool) {
 }
 
 // inputSourceVCP is the MCCS Input Source feature: what the standard table
-// writes, and what both backends read back to confirm a switch.
+// writes, and what `detect` reads to name this host's own port.
 const inputSourceVCP = 0x60
 
-// StandardName names the table a command gets when it names none, and the
+// StandardName names the table a declaration gets when it names none, and the
 // one TableFor falls back to.
 const StandardName = "standard"
 
-// standard is the MCCS table, and the one a command names no table for. MCCS
+// standard is the MCCS table, and the one a declaration names no table for. MCCS
 // stops at HDMI 2: usbc1 is 0x1B by convention only and vendors deviate, which
 // is what a raw INPUT value is for.
 var standard = &Table{
@@ -122,8 +122,8 @@ func (t *Table) AliasFor(value uint8) (alias string, ok bool) {
 }
 
 // TableFor maps an EDID manufacturer ID to its table: standard unless a
-// vendor table claims the ID. Only `detect` calls it — screen-switch itself
-// never guesses a table.
+// vendor table claims the ID. Only `detect` calls it — a declaration names its
+// table, or gets the standard one.
 func TableFor(mfg string) *Table {
 	for _, t := range tables {
 		if slices.Contains(t.Mfg, strings.ToUpper(mfg)) {
@@ -142,66 +142,144 @@ func tableByName(name string) *Table {
 	return nil
 }
 
-const usage = "usage: screen-switch INPUT [TABLE] [display=MATCH]"
+// ErrNoDisplay means no attached monitor carries the name: there is nothing to
+// move on this host, which is not a failure (SPEC §4.3).
+var ErrNoDisplay = errors.New("no attached monitor of that name")
 
-// Switch is a parsed `screen-switch INPUT [TABLE] [display=MATCH]` command.
-type Switch struct {
-	Table *Table
-	// Value is what gets written to Table.VCP.
-	Value uint8
-	// Expect is the Input Source value a monitor that still answers DDC
-	// reports while it shows the target. ExpectOK is false when the table
-	// does not know it; the monitor going silent is then the only receipt.
-	Expect   uint8
-	ExpectOK bool
-	// Display narrows the command to one monitor; "" leaves the choice to the
-	// backend, which is right when one external display is attached.
-	Display string
+// Write is one DDC/CI Set VCP Feature: the feature, the I²C source address it
+// is sent from and the value. Its text form VCP:SRC=VAL, three hex bytes, is
+// what travels in a take (SPEC §5.6).
+type Write struct{ VCP, Source, Value uint8 }
+
+// ParseWrite reads the VCP:SRC=VAL wire form: exactly three two-digit hex
+// bytes, in either case, that are IsValid. It is the only way in from the
+// wire, and where a take is refused: a backend only panics on what should
+// never reach it.
+func ParseWrite(s string) (Write, error) {
+	bad := fmt.Errorf("invalid write %q: want VCP:SRC=VAL as three hex bytes, e.g. F4:50=D1", s)
+	vcp, rest, ok := strings.Cut(s, ":")
+	if !ok {
+		return Write{}, bad
+	}
+	src, val, ok := strings.Cut(rest, "=")
+	if !ok {
+		return Write{}, bad
+	}
+	var b [3]uint8
+	for i, f := range []string{vcp, src, val} {
+		if len(f) != 2 {
+			return Write{}, bad
+		}
+		v, err := strconv.ParseUint(f, 16, 8)
+		if err != nil {
+			return Write{}, bad
+		}
+		b[i] = uint8(v)
+	}
+	w := Write{b[0], b[1], b[2]}
+	if !w.IsValid() {
+		return Write{}, fmt.Errorf("refusing write %s: no table lists feature %02X from source %02X", w, w.VCP, w.Source)
+	}
+	return w, nil
 }
 
-// Parse validates a screen-switch argv (without the "screen-switch" word).
-// INPUT is one of the table's aliases or a raw value (0x1B, 27) written as
-// is; TABLE defaults to standard and is never guessed here — `detect` prints it when the monitor
-// needs one (SPEC §5.6).
-func Parse(args []string) (*Switch, error) {
-	if len(args) == 0 {
-		return nil, errors.New(usage)
-	}
-	s := &Switch{Table: standard}
-	input, rest := strings.ToLower(args[0]), args[1:]
-	tableSet := false
-	for _, arg := range rest {
-		if match, ok := strings.CutPrefix(arg, "display="); ok {
-			if match == "" || s.Display != "" {
-				return nil, fmt.Errorf("invalid argument %q: %s", arg, usage)
-			}
-			s.Display = match
-			continue
+// String renders the wire form, upper case.
+func (w Write) String() string {
+	return fmt.Sprintf("%02X:%02X=%02X", w.VCP, w.Source, w.Value)
+}
+
+// IsValid reports whether some table writes this feature from this source,
+// whatever the value: a take cannot reach factory reset (0x04) or power (0xD6)
+// (SPEC §5.6, §9).
+func (w Write) IsValid() bool {
+	for _, t := range tables {
+		if t.VCP == w.VCP && t.source() == w.Source {
+			return true
 		}
-		t := tableByName(arg)
-		if t == nil || tableSet {
-			return nil, fmt.Errorf("invalid argument %q: want a mapping table (%s) or display=MATCH",
-				arg, strings.Join(TableNames(), ", "))
-		}
-		s.Table, tableSet = t, true
 	}
-	if v, ok := s.Table.Inputs[input]; ok {
-		s.Value = v
-		s.Expect, s.ExpectOK = s.Table.reads(input)
-	} else {
+	return false
+}
+
+// mustBeValid panics on a write that is not IsValid. ParseWrite already
+// refused it, so reaching a backend with one is a bug: the backends call this
+// last, right before the bytes leave.
+func (w Write) mustBeValid() {
+	if !w.IsValid() {
+		panic(fmt.Sprintf("screen: write %s reached the backend unvalidated", w))
+	}
+}
+
+// source is the I²C source address the table writes from.
+func (t *Table) source() uint8 {
+	if t.Source != 0 {
+		return t.Source
+	}
+	return ddcHost
+}
+
+// Declaration is a parsed `--declare-screen 'NAME INPUT [TABLE]'`: the monitor
+// named Name shows this host on the port Write selects (SPEC §5.6).
+type Declaration struct {
+	Name  string
+	Write Write
+}
+
+const declarationUsage = "want NAME INPUT [TABLE]"
+
+// maxNameRunes bounds a declared name, as the server does (SPEC §7).
+const maxNameRunes = 64
+
+// ParseDeclaration validates the words of a screen declaration. NAME is the
+// monitor's EDID name, compared ignoring case. INPUT is one of TABLE's aliases
+// or a raw value (0x1B, 27) written as is; TABLE defaults to standard and is
+// never guessed here — `detect` prints it when the monitor needs one.
+func ParseDeclaration(args []string) (Declaration, error) {
+	if len(args) != 2 && len(args) != 3 {
+		return Declaration{}, fmt.Errorf("invalid screen declaration %q: %s", strings.Join(args, " "), declarationUsage)
+	}
+	name := args[0]
+	if n := utf8.RuneCountInString(name); n < 1 || n > maxNameRunes ||
+		strings.IndexFunc(name, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+		return Declaration{}, fmt.Errorf("invalid screen name %q: want 1-%d printable characters", name, maxNameRunes)
+	}
+	t := standard
+	if len(args) == 3 {
+		if t = tableByName(args[2]); t == nil {
+			return Declaration{}, fmt.Errorf("invalid table %q for screen %q: want one of %s",
+				args[2], name, strings.Join(TableNames(), ", "))
+		}
+	}
+	input := strings.ToLower(args[1])
+	value, ok := t.Inputs[input]
+	if !ok {
 		v, err := strconv.ParseUint(input, 0, 8)
 		if err != nil {
-			return nil, fmt.Errorf("invalid input %q for table %q: want %s or a raw value such as 0x1B",
-				args[0], s.Table.Name, strings.Join(s.Table.Aliases(), ", "))
+			return Declaration{}, fmt.Errorf("invalid input %q for table %q: want %s or a raw value such as 0x1B",
+				args[1], t.Name, strings.Join(t.Aliases(), ", "))
 		}
-		s.Value = uint8(v)
-		// A raw value reads back as itself only where the write went to the
-		// feature that is read.
-		if s.Table.VCP == inputSourceVCP {
-			s.Expect, s.ExpectOK = s.Value, true
-		}
+		value = uint8(v)
 	}
-	return s, nil
+	return Declaration{Name: name, Write: Write{VCP: t.VCP, Source: t.source(), Value: value}}, nil
+}
+
+// pickByName finds the one monitor named name, ignoring case, among the EDID
+// names of the attached monitors: ErrNoDisplay when none, an error when
+// several, since a write must not guess which one.
+func pickByName(names []string, name string) (int, error) {
+	found := -1
+	for i, n := range names {
+		if !strings.EqualFold(n, name) {
+			continue
+		}
+		if found >= 0 {
+			return 0, fmt.Errorf("two attached monitors are named %q: not writing to either", name)
+		}
+		found = i
+	}
+	if found < 0 {
+		return 0, ErrNoDisplay
+	}
+	return found, nil
 }
 
 // Display is one DDC-capable monitor `detect` found.
@@ -217,7 +295,7 @@ type Display struct {
 // Report is what Probe learned for `detect`: whether the backend works at all
 // and, where it can tell, which monitors it reaches.
 type Report struct {
-	Backend  string // the program screen-switch delegates to on this OS
+	Backend  string // what writes the monitor on this OS
 	Err      error  // why the backend is unusable; nil when it answered
 	Displays []Display
 	// Unreachable are monitors known by their EDID alone: they do not answer
@@ -271,44 +349,6 @@ func parseDetect(out []byte) (displays, unreachable []Display) {
 		*into = append(*into, Display{Mfg: f[0], Model: f[1]})
 	}
 	return displays, unreachable
-}
-
-// The confirm window: how long the monitor may keep answering on this input
-// after the write before the switch counts as failed, and the poll spacing.
-// Variables so the tests can shrink them.
-var (
-	confirmWindow = 4 * time.Second
-	confirmPoll   = 500 * time.Millisecond
-)
-
-// confirm polls this host's own read of Input Source after a write, the
-// receipt both backends share (SPEC §5.6): it fails, or reports the target,
-// once the switch landed. read returns err when the monitor no longer
-// answers, and ok false when it answered with nothing readable.
-func (s *Switch) confirm(ctx context.Context, read func(context.Context) (v uint8, ok bool, err error)) error {
-	deadline := time.Now().Add(confirmWindow)
-	for {
-		v, ok, err := read(ctx)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			return nil // DDC went silent: this input is no longer the active one
-		}
-		if ok && s.ExpectOK && v == s.Expect {
-			// The monitor shows the target and still answers: it answers on
-			// every input, or the target is this host's own port.
-			return nil
-		}
-		if !time.Now().Before(deadline) {
-			return fmt.Errorf("screen-switch: monitor still on this input %v after the write", confirmWindow)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(confirmPoll):
-		}
-	}
 }
 
 // DDC/CI for a backend that speaks it in-process (SPEC §5.6). The I²C call

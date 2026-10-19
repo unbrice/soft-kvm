@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // hint_linux.go: the permission remediation for Linux. hidraw nodes are
-// root-only by default; the HID++ scan and hid-switch open them O_RDWR
+// root-only by default; the HID++ scan and a device take open them O_RDWR
 // (SPEC §6.1).
 
 package detect

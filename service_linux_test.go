@@ -76,7 +76,7 @@ func TestUnitContent(t *testing.T) {
 // substitutions and pins that no placeholder survives.
 func TestNoUnresolvedTokens(t *testing.T) {
 	serveUnit := renderForTest(t, "units/soft-kvm-serve.service", serveBinPath, []string{"8700"})
-	agentUnit := renderForTest(t, "units/soft-kvm.service", "/home/u/soft-kvm", []string{"--trigger", "046d:c52b"})
+	agentUnit := renderForTest(t, "units/soft-kvm.service", "/home/u/soft-kvm", []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b"})
 	serveEnv := renderEnv(mustReadServiceFile(t, "deploy/env.serve.example"), testToken)
 	connectEnv := renderEnv(mustReadServiceFile(t, "deploy/env.connect.example"), testToken)
 
@@ -185,51 +185,50 @@ func TestServeInstallRequiresToken(t *testing.T) {
 }
 
 func TestConnectInstallRefusesRoot(t *testing.T) {
-	err := validateConnectInstall(0, testToken, []string{"--trigger", "046d:c52b", "-D", "screen-switch dp1"})
+	err := validateConnectInstall(0, testToken, []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b", "-D", "notify-send left"})
 	if err == nil || !strings.Contains(err.Error(), "regular user") {
 		t.Fatalf("euid 0: got %v, want a refusal naming the regular user", err)
 	}
-	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "-D", "screen-switch dp1"}); err != nil {
+	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b", "-D", "notify-send left"}); err != nil {
 		t.Fatalf("non-root with valid trigger: got %v, want nil", err)
 	}
 }
 
-// There is no default command: install refuses the same argv connect would,
-// and points at detect (SPEC §5.4).
-func TestConnectInstallRequiresCommand(t *testing.T) {
-	err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b"})
-	if err == nil || !strings.Contains(err.Error(), "soft-kvm detect") {
-		t.Fatalf("no command: got %v, want a refusal naming soft-kvm detect", err)
+// Install refuses the argv connect would: the same declarations and the same
+// use of the built-in takes (SPEC §5.4, §5.7).
+func TestConnectInstallValidatesWiring(t *testing.T) {
+	const screenDecl = `"LG HDR WQHD" dp1 lg`
+	ok := [][]string{
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "-D", "notify-send left"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-screen", screenDecl, "-A", "take-screen"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-screen", screenDecl, "--declare-hid", "mouse 046d:c548:2 host=1",
+			"-A", "take-screen", "-A", "take-hid"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "-D", "ddcutil setvcp 60 0x11"}, // anything else is an external program
 	}
-	// Either side alone is enough.
-	for _, flag := range []string{"-A", "--on-activation", "-D", "--on-deactivation"} {
-		args := []string{"--trigger", "046d:c52b", flag, "screen-switch dp1"}
+	for _, args := range ok {
 		if err := validateConnectInstall(1000, testToken, args); err != nil {
-			t.Errorf("%s alone: got %v, want nil", flag, err)
+			t.Errorf("%q: got %v, want nil", args, err)
+		}
+	}
+	bad := [][]string{
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "-A", "take-screen"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-screen", screenDecl},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "-A", "take-hid"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "-D", "take-hid"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-screen", "LG vga", "-A", "take-screen"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-hid", "mouse 046d:c548:2", "-A", "take-hid"},
+		{"--trigger", "kbd", "--declare-hid", "kbd 046d:c548:1", "--declare-hid", "m 046d:c548:2 host=1", "--declare-hid", "m 046d:c548:3 host=1", "-A", "take-hid"},
+	}
+	for _, args := range bad {
+		if err := validateConnectInstall(1000, testToken, args); err == nil {
+			t.Errorf("%q: got nil, want the refusal connect itself gives", args)
 		}
 	}
 	// The old trailing form is refused with a pointer to the flags.
-	err = validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"})
-	if err == nil || !strings.Contains(err.Error(), "--on-deactivation") {
-		t.Fatalf("trailing command: got %v, want a refusal naming --on-deactivation", err)
-	}
-	// A built-in command is parsed at install time, not on the first switch.
-	for _, argv := range [][]string{
-		{"screen-switch", "vga"},
-		{"screen-switch", "dp1", "dell"},
-		{"hid-switch", "nonsense"},
-	} {
-		for _, flag := range []string{"-A", "-D"} {
-			args := []string{"--trigger", "046d:c52b", flag, strings.Join(argv, " ")}
-			if err := validateConnectInstall(1000, testToken, args); err == nil {
-				t.Errorf("%s %v: got nil, want a refusal", flag, argv)
-			}
-		}
-	}
-	// Anything else is an external program, taken as is.
-	args := []string{"--trigger", "046d:c52b", "-D", "ddcutil setvcp 60 0x11"}
-	if err := validateConnectInstall(1000, testToken, args); err != nil {
-		t.Errorf("external command: got %v, want nil", err)
+	err := validateConnectInstall(1000, testToken, []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b", "--", "take-screen"})
+	if err == nil || !strings.Contains(err.Error(), "-A/--on-activation") {
+		t.Fatalf("trailing command: got %v, want a refusal naming -A/--on-activation", err)
 	}
 }
 

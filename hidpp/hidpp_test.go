@@ -22,64 +22,61 @@ import (
 	"testing/synctest"
 )
 
-func TestParse(t *testing.T) {
+func TestParseDeclaration(t *testing.T) {
 	cases := []struct {
 		name    string
 		args    []string
-		want    *Switch
-		wantErr bool
+		want    Declaration
+		wantErr string // substring; empty means success
 	}{
-		{
-			name: "device, channel from the owner",
-			args: []string{"046d:c52b"},
-			want: &Switch{VID: 0x046d, PID: 0xc52b},
-		},
-		{
-			name: "device with explicit channel",
-			args: []string{"046d:b35b", "host=2"},
-			want: &Switch{VID: 0x046d, PID: 0xb35b, Channel: 2},
-		},
-		{
-			name: "receiver pairing slot",
-			args: []string{"046d:c548:3"},
-			want: &Switch{VID: 0x046d, PID: 0xc548, Slot: 3},
-		},
-		{
-			name: "receiver pairing slot with channel",
-			args: []string{"046d:c548:3", "host=1"},
-			want: &Switch{VID: 0x046d, PID: 0xc548, Slot: 3, Channel: 1},
-		},
-		{name: "no args", args: nil, wantErr: true},
-		{name: "too many args", args: []string{"046d:b35b", "host=1", "1"}, wantErr: true},
-		{name: "bad separator", args: []string{"046db35b"}, wantErr: true},
-		{name: "bad vid", args: []string{"zzzz:b35b"}, wantErr: true},
-		{name: "bad pid", args: []string{"046d:b35bb"}, wantErr: true},
-		{name: "slot zero", args: []string{"046d:c548:0"}, wantErr: true},
-		{name: "slot too high", args: []string{"046d:c548:7"}, wantErr: true},
-		{name: "channel zero", args: []string{"046d:b35b", "host=0"}, wantErr: true},
-		{name: "channel too high", args: []string{"046d:b35b", "host=4"}, wantErr: true},
-		{name: "channel not a number", args: []string{"046d:b35b", "host=mac"}, wantErr: true},
-		// The old grammar must fail loudly, never be reinterpreted: a bare
-		// trailing number used to be a 0-based host index.
-		{name: "old bare host index", args: []string{"046d:b35b", "1"}, wantErr: true},
-		{name: "old kind form", args: []string{"046d:c548", "mouse", "0"}, wantErr: true},
+		{name: "receiver slot", args: []string{"mouse", "046d:c548:2", "host=1"},
+			want: Declaration{"mouse", Target{0x046d, 0xc548, 2}, 1}},
+		{name: "bluetooth device", args: []string{"keyboard", "046d:b35b", "host=3"},
+			want: Declaration{"keyboard", Target{0x046d, 0xb35b, 0}, 3}},
+		{name: "name charset", args: []string{"Ergo_K860.v2-b", "046d:b35b", "host=2"},
+			want: Declaration{"Ergo_K860.v2-b", Target{0x046d, 0xb35b, 0}, 2}},
+		{name: "no arguments", args: nil, wantErr: "NAME VID:PID"},
+		{name: "no channel: watched and given away, never taken", args: []string{"mouse", "046d:c548:2"},
+			want: Declaration{"mouse", Target{0x046d, 0xc548, 2}, 0}},
+		{name: "name alone", args: []string{"mouse"}, wantErr: "NAME VID:PID"},
+		{name: "too many words", args: []string{"mouse", "046d:c548:2", "host=1", "x"}, wantErr: "NAME VID:PID"},
+		{name: "name with a space", args: []string{"my mouse", "046d:c548:2", "host=1"}, wantErr: "invalid device name"},
+		{name: "empty name", args: []string{"", "046d:c548:2", "host=1"}, wantErr: "invalid device name"},
+		{name: "long name", args: []string{strings.Repeat("n", 65), "046d:c548:2", "host=1"}, wantErr: "invalid device name"},
+		{name: "bad separator", args: []string{"m", "046db35b", "host=1"}, wantErr: "VID:PID"},
+		{name: "bad vid", args: []string{"m", "zzzz:b35b", "host=1"}, wantErr: "invalid VID"},
+		{name: "slot zero", args: []string{"m", "046d:c548:0", "host=1"}, wantErr: "pairing slot"},
+		{name: "slot too high", args: []string{"m", "046d:c548:7", "host=1"}, wantErr: "pairing slot"},
+		{name: "channel zero", args: []string{"m", "046d:b35b", "host=0"}, wantErr: "host channel"},
+		{name: "channel too high", args: []string{"m", "046d:b35b", "host=4"}, wantErr: "host channel"},
+		{name: "channel not a number", args: []string{"m", "046d:b35b", "host=mac"}, wantErr: "host channel"},
+		{name: "bare channel number", args: []string{"m", "046d:b35b", "1"}, wantErr: "host=N"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := Parse(c.args)
-			if c.wantErr {
-				if err == nil {
-					t.Fatalf("Parse(%v) succeeded, want error", c.args)
+			got, err := ParseDeclaration(c.args)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("ParseDeclaration(%q) error = %v, want substring %q", c.args, err, c.wantErr)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("Parse(%v): %v", c.args, err)
-			}
-			if *got != *c.want {
-				t.Errorf("Parse(%v) = %+v, want %+v", c.args, *got, *c.want)
+			if err != nil || got != c.want {
+				t.Fatalf("ParseDeclaration(%q) = %+v, %v; want %+v", c.args, got, err, c.want)
 			}
 		})
+	}
+}
+
+func TestTargetString(t *testing.T) {
+	for in, want := range map[string]string{"046d:c548:2": "046d:c548:2", "046D:B35B": "046d:b35b"} {
+		vid, pid, slot, err := ParseTarget(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := (Target{vid, pid, slot}).String(); got != want {
+			t.Errorf("Target(%q).String() = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -195,6 +192,31 @@ func TestPairingKind(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := pairingKind(c.bolt, c.data); got != c.want {
 				t.Errorf("pairingKind(%t, %x) = %v, want %v", c.bolt, c.data, got, c.want)
+			}
+		})
+	}
+}
+
+// TestPairingName reads the replies a Unifying and a Bolt receiver gave, from
+// the echoed sub-register on.
+func TestPairingName(t *testing.T) {
+	cases := []struct {
+		name string
+		bolt bool
+		data []byte
+		want string
+	}{
+		{"unifying", false, append([]byte{0x40, 0x0b}, "MX Master 3\x00\x00\x00"...), "MX Master 3"},
+		{"bolt", true, append([]byte{0x61, 0x01, 0x0c}, "MX Master 3S\x00"...), "MX Master 3S"},
+		{"bolt, longer than the report", true, append([]byte{0x61, 0x01, 0x10}, "MX Anywhere 3"...), "MX Anywhere 3"},
+		{"empty", true, []byte{0x62, 0x01, 0x00, 0x00}, ""},
+		{"truncated", false, []byte{0x40}, ""},
+		{"not ASCII", false, []byte{0x40, 0x02, 0xc3, 0xa9}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pairingName(c.bolt, c.data); got != c.want {
+				t.Errorf("pairingName(%t, %x) = %q, want %q", c.bolt, c.data, got, c.want)
 			}
 		})
 	}
@@ -488,42 +510,6 @@ func TestSetHost(t *testing.T) {
 	})
 }
 
-func TestResolveKind(t *testing.T) {
-	runSync(t, "directly attached device matches", func(t *testing.T) {
-		c := &conn{dev: &emuConn{direct: &emuDevice{kind: KindMouse, changeHost: true}}}
-		got, err := c.resolveKind(t.Context(), KindMouse)
-		if err != nil || len(got) != 1 || got[0] != DeviceIndexDirect {
-			t.Errorf("resolveKind = %v, %v; want [0xFF]", got, err)
-		}
-	})
-
-	// Empty slots draw an immediate 1.0 error reply from the pairing table;
-	// only matching slots cost a changeHost query over the "air".
-	runSync(t, "receiver slot scan", func(t *testing.T) {
-		c := &conn{dev: &emuConn{
-			direct: &emuDevice{kind: KindReceiver},
-			slots: map[uint8]emuDevice{
-				2: {kind: KindMouse, changeHost: true},
-				4: {kind: KindKeyboard, changeHost: true},
-			},
-		}}
-		got, err := c.resolveKind(t.Context(), KindMouse)
-		if err != nil || len(got) != 1 || got[0] != 2 {
-			t.Errorf("resolveKind = %v, %v; want [2]", got, err)
-		}
-	})
-
-	runSync(t, "kind not present", func(t *testing.T) {
-		c := &conn{dev: &emuConn{
-			direct: &emuDevice{kind: KindReceiver},
-			slots:  map[uint8]emuDevice{4: {kind: KindKeyboard, changeHost: true}},
-		}}
-		if _, err := c.resolveKind(t.Context(), KindMouse); err == nil {
-			t.Error("resolveKind succeeded, want error")
-		}
-	})
-}
-
 // nudgeConn queues its reply only once answerFrom reports have been written,
 // emulating a device that sleeps through the first handshake nudges.
 type nudgeConn struct {
@@ -775,18 +761,93 @@ func TestSpeaksHIDPP(t *testing.T) {
 	})
 }
 
-// Without an explicit host=N and without a channel published by the owner
-// there is nowhere safe to send a peripheral, so Do must refuse rather than
-// guess — and it must refuse before touching any hardware.
-func TestSwitchNeedsAChannel(t *testing.T) {
-	sw := &Switch{VID: 0x046d, PID: 0xc52b}
-	err := sw.Do(context.Background(), 0)
-	if err == nil {
-		t.Fatal("Do with no channel succeeded, want an error")
+// A bad channel is refused before any hardware is touched: sending a device to
+// a guessed channel moves it somewhere the user cannot reach it.
+func TestSendRefusesABadChannel(t *testing.T) {
+	for _, ch := range []uint8{0, MaxChannel + 1} {
+		sent, err := Target{VID: 0x046d, PID: 0xc52b}.Send(t.Context(), ch)
+		if sent || err == nil || !strings.Contains(err.Error(), "outside") {
+			t.Errorf("Send(channel %d) = %v, %v; want a refusal", ch, sent, err)
+		}
 	}
-	if !strings.Contains(err.Error(), "no target host channel") {
-		t.Errorf("Do error = %v, want it to name the missing channel", err)
+}
+
+func TestMoveTo(t *testing.T) {
+	changeHostWrites := func(c *emuConn) (n int) {
+		for _, w := range c.writes {
+			if w[3]>>4 == fnSetHost {
+				n++
+			}
+		}
+		return n
 	}
+
+	runSync(t, "a linked slot is sent", func(t *testing.T) {
+		emu := &emuConn{
+			direct: &emuDevice{kind: KindReceiver},
+			slots:  map[uint8]emuDevice{2: {kind: KindMouse, changeHost: true}},
+		}
+		sent, err := (&conn{dev: emu}).moveTo(t.Context(), Target{0x046d, 0xc548, 2}, 3)
+		if !sent || err != nil {
+			t.Fatalf("moveTo = %v, %v; want sent", sent, err)
+		}
+		last := emu.writes[len(emu.writes)-1]
+		// setHost addressed to slot 2 on the changeHost feature index, with
+		// the 0-based host: channel 3 is 2 on the wire.
+		if last[1] != 2 || last[2] != 0x04 || last[3]>>4 != fnSetHost || last[4] != 2 {
+			t.Errorf("last write % x, want setHost(2) to slot 2", last)
+		}
+	})
+
+	runSync(t, "a slot off the link is nothing to move", func(t *testing.T) {
+		emu := &emuConn{
+			direct: &emuDevice{kind: KindReceiver},
+			slots:  map[uint8]emuDevice{4: {kind: KindKeyboard, changeHost: true}},
+		}
+		sent, err := (&conn{dev: emu}).moveTo(t.Context(), Target{0x046d, 0xc548, 2}, 1)
+		if sent || err != nil || changeHostWrites(emu) != 0 {
+			t.Fatalf("moveTo = %v, %v after %d setHost writes; want nothing sent", sent, err, changeHostWrites(emu))
+		}
+	})
+
+	runSync(t, "a direct device is addressed at 0xFF", func(t *testing.T) {
+		emu := &emuConn{direct: &emuDevice{kind: KindMouse, changeHost: true}}
+		sent, err := (&conn{dev: emu}).moveTo(t.Context(), Target{VID: 0x046d, PID: 0xb035}, 1)
+		if !sent || err != nil {
+			t.Fatalf("moveTo = %v, %v; want sent", sent, err)
+		}
+		if last := emu.writes[len(emu.writes)-1]; last[1] != DeviceIndexDirect || last[4] != 0 {
+			t.Errorf("last write % x, want setHost(0) to 0xFF", last)
+		}
+	})
+
+	runSync(t, "a device without changeHost is a failure", func(t *testing.T) {
+		emu := &emuConn{direct: &emuDevice{kind: KindMouse}}
+		sent, err := (&conn{dev: emu}).moveTo(t.Context(), Target{VID: 0x046d, PID: 0xb035}, 1)
+		if sent || err == nil || !strings.Contains(err.Error(), "changeHost") {
+			t.Fatalf("moveTo = %v, %v; want a changeHost failure", sent, err)
+		}
+	})
+
+	runSync(t, "a HID++ error reply to setHost is a failure", func(t *testing.T) {
+		fake := &errorOnSetHost{emuConn: emuConn{direct: &emuDevice{kind: KindMouse, changeHost: true}}}
+		sent, err := (&conn{dev: fake}).moveTo(t.Context(), Target{VID: 0x046d, PID: 0xb035}, 1)
+		var herr *Error
+		if !sent || !errors.As(err, &herr) {
+			t.Fatalf("moveTo = %v, %v; want sent with a *Error", sent, err)
+		}
+	})
+}
+
+// errorOnSetHost answers setHost with a HID++ error reply.
+type errorOnSetHost struct{ emuConn }
+
+func (e *errorOnSetHost) Write(ctx context.Context, p []byte) (int, error) {
+	if p[3]>>4 == fnSetHost {
+		e.push([]byte{reportShort, p[1], errSubShort, p[2], p[3], 0x06})
+		return len(p), nil
+	}
+	return e.emuConn.Write(ctx, p)
 }
 
 func TestParseTarget(t *testing.T) {

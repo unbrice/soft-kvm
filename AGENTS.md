@@ -19,47 +19,45 @@ tree disagree on detail, the tree wins; fix the SPEC in the same change.
 ## How it works
 
 One binary, `soft-kvm` (module `github.com/unbrice/soft-kvm`), same artifact on
-every host, seven subcommands:
+every host, five subcommands:
 
-- `serve [IP:]PORT` — the coordinator. Owns `owner/epoch`, serves `GET /state`,
-  `POST /claim/{id}` and `GET /wait?epoch=N&id=ME` (long-poll) over mutual TLS:
-  the server identity and the required client certificate are both derived from
-  the shared secret. Port defaults to 8700; `--state` defaults to
-  `$STATE_DIRECTORY/state.json` under systemd, else `StateDir/state.json`. It
-  advertises itself over mDNS unless `--no-advertise` (SPEC §6.4, §7).
-- `connect --trigger LIST [-A COMMAND]... [-D COMMAND]... [flags]` — the
-  per-host agent. An HID attach detector feeds the pure state machine that
-  decides when to claim ownership; a run-level action worker runs
-  `-D/--on-deactivation` on the losing host when it stops being the owner, in
-  order, and exit 0 from all of them is the only receipt: a failure is retried,
-  then notified (SPEC §4.3). `-A/--on-activation` runs the same way when the
-  host becomes the owner, without the cooldown, breaker or notification. Each
-  `COMMAND` is one quoted string that `connect` splits into an argv itself. Two
-  command names are not exec'd but run in-process: `screen-switch` drives the
-  monitor (SPEC §5.6) and `hid-switch` speaks Logitech HID++ `changeHost` (SPEC
-  §5.5). At least one of `-A` and `-D` is required — there is no default,
-  `detect` prints it — and so is `--trigger VID:PID[:SLOT][,…]` — a bare
-  `VID:PID` watches a HID node that comes and goes, `VID:PID:SLOT` watches one
-  pairing slot of a receiver that stays plugged in; macOS also gets
-  `--no-guards` and `--display-match` (SPEC §5.4, §6).
-- `activate ID` — claims an identity by hand, for scripts and recovery. Fails
-  with a pointer to `--force` when the target has no live agent.
-- `detect` — prints attached HID devices, suggested `--trigger` values
-  (keyboards and HID++ mice), `hid-switch` actions that make the other
-  peripheral follow the gesture, and the `screen-switch` action for this host's
-  monitor: it probes the backend, reports why it fails when it does, and names
-  the mapping table when the monitor's brand needs one (SPEC §5.5, §5.6, §6.1).
-- `hid-switch VID:PID[:SLOT] host=N` — runs the built-in Logitech HID++
-  `changeHost` command by hand, without a server or token. Without `:SLOT` it
-  moves every peripheral still linked to that device; `host=N` is the target
-  Easy-Switch channel as printed on the key (1-3), required here because there
-  is no owner to inherit it from (SPEC §5.5).
-- `screen-switch INPUT [TABLE] [display=MATCH]` — runs the built-in monitor
-  switch by hand, without a server or token. `INPUT` is one of the table's port
-  aliases (`dp1`, `hdmi2`, `usbc1`, …) or a raw value; `TABLE` defaults to
-  `standard` and is never guessed here. It delegates to `ddcutil` on Linux and
-  to `IOAVService` on macOS, reading the monitor back on both to confirm the
-  switch (SPEC §5.6).
+- `serve [IP:]PORT` — the coordinator. Owns `owner/epoch` and one **hold** per
+  taken screen or device, serves `GET /state`, `POST /claim/{id}`,
+  `POST /take/{id}`, `POST /arrived/{id}` and `GET /wait?epoch=N&id=ME`
+  (long-poll) over mutual TLS: the server identity and the required client
+  certificate are both derived from the shared secret. Port defaults to 8700;
+  `--state` defaults to `$STATE_DIRECTORY/state.json` under systemd, else
+  `StateDir/state.json`. It advertises itself over mDNS unless `--no-advertise`
+  (SPEC §6.4, §7).
+- `connect --trigger LIST [--declare-screen DECL]... [--declare-hid DECL]... [-A COMMAND]... [-D COMMAND]... [flags]`
+  — the per-host agent. An HID attach detector feeds the pure state machine that
+  decides when to claim ownership. `--declare-screen 'NAME INPUT [TABLE]'` says
+  which input of the monitor named `NAME` (its EDID name) this host is on;
+  `--declare-hid 'NAME VID:PID[:SLOT] [host=N]'` says how the device every host
+  calls `NAME` reaches this host, and on which Easy-Switch channel; without
+  `host=N` the host watches the device and gives it away, and never takes it.
+  `-A/--on-activation` runs when the host becomes the owner, in order; two
+  command names are not exec'd but run in-process: `take-screen` and `take-hid`
+  post the declarations to the server as **takes** (SPEC §5.5, §5.6). Every
+  other host then runs each take: it writes the `VCP:SRC=VAL` the wire carries
+  to the monitor, or sends its end of the device to the holder's channel with
+  HID++ `changeHost`. A screen write has no receipt; a device's receipt is its
+  arrival on the holder, and a take that still fails after the retries is
+  notified by the previous holder (SPEC §4.3). `-D/--on-deactivation` runs when
+  the host stops being the owner. Each `DECL` and `COMMAND` is one quoted string
+  that `connect` splits into words itself. `--trigger NAME[,…]` is required and
+  takes only names `--declare-hid` declares — a device declared by a bare
+  `VID:PID` is watched as a HID node that comes and goes, one declared by
+  `VID:PID:SLOT` as one pairing slot of a receiver that stays plugged in; macOS
+  also gets `--no-guards` and `--display-match` (SPEC §5.4, §6).
+- `activate ID` — makes an identity the owner by hand and has it take, for
+  scripts and recovery: against the current owner it re-runs the takes. Fails
+  with a pointer to `--force` when the target has no live agent (SPEC §5.3).
+- `detect` — prints attached HID devices, suggested `--trigger` names (keyboards
+  and HID++ mice), the `--declare-hid` flags for this host's peripherals and the
+  `--declare-screen` flag for its monitor: it probes the backend, reports why it
+  fails when it does, and names the mapping table when the monitor's brand needs
+  one (SPEC §5.5, §5.6, §6.1).
 - `service <install|print|uninstall> [serve|connect] [args]` — Linux only:
   validates with the `serve`/`connect` flag sets and installs, prints or removes
   the canonical systemd units from `units/`, baking the raw argv into
@@ -69,13 +67,14 @@ every host, seven subcommands:
   (SPEC §5.7, §6.2).
 
 `SOFTKVM_TOKEN` (env, never a flag) is required by `serve`, `activate` and
-`connect`; `detect`, `hid-switch` and `screen-switch` need no token. The TLS
-identity and the mDNS `kh=` fingerprint are deterministic, salt-free functions
-of the token (SPEC §9). `SOFTKVM_SERVER` and `--server` override discovery.
+`connect`; `detect` needs no token. The TLS identity and the mDNS `kh=`
+fingerprint are deterministic, salt-free functions of the token (SPEC §9).
+`SOFTKVM_SERVER` and `--server` override discovery.
 
 Per-host state lives under `platform.StateDir()` — `$XDG_STATE_HOME/soft-kvm` on
 Linux, `~/Library/Application Support/soft-kvm` on macOS: `agent.json` (last
-owner) and `server` (last address that answered, the discovery cache).
+owner, last activation, takes handled) and `server` (last address that answered,
+the discovery cache).
 
 ## Code layout
 
@@ -85,23 +84,23 @@ lines. Layering is a DAG: the leaves (`state`, `identity`, `discover`,
 `platform`, `hidpp`, `screen`) import nothing internal; `detect` imports
 `hidpp`, `platform` and `screen`; `model` imports `state`; `client` imports
 `state` and `identity`; `server` those two and `hidpp` (the channel bound it
-validates on a claim); `agent` imports `model`, `state`, `client`, `discover`,
+validates on a take); `agent` imports `model`, `state`, `client`, `discover`,
 `hidpp` and `screen`.
 
-| Package    | Files                                       | Concern                                                                                                                                                                        |
-| ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| (root)     | `main.go`, `log.go`, `service_*.go`         | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)                                          |
-| `state`    | `state.go`                                  | the `/state` wire type and atomic JSON persistence                                                                                                                             |
-| `model`    | `machine.go`                                | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                                                             |
-| `identity` | `tls.go`                                    | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                                |
-| `discover` | `discover.go`                               | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                                              |
-| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go` | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal                                             |
-| `detect`   | `detect.go`, `detect_hid*.go`               | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                                                   |
-| `hidpp`    | `hidpp.go`                                  | Logitech HID++: `changeHost` for `hid-switch`, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1)                               |
-| `screen`   | `screen.go`, `screen_*.go`                  | the `screen-switch` command: the standard and vendor (`lg`) mapping tables and the per-OS write-then-confirm backends — `ddcutil` on Linux, `IOAVService` on macOS (SPEC §5.6) |
-| `client`   | `client.go`                                 | the coordinator's HTTP client                                                                                                                                                  |
-| `server`   | `server.go`                                 | the coordinator HTTP service                                                                                                                                                   |
-| `agent`    | `agent.go`, `watcher.go`, `actions.go`      | supervisor, generations, decision loop, claims; the `Detector`, `Guard` and `Runner` seams; no policy                                                                          |
+| Package    | Files                                                | Concern                                                                                                                                                                                                 |
+| ---------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (root)     | `main.go`, `log.go`, `service_*.go`                  | CLI dispatch, one `flag.FlagSet` per subcommand, token checks, wiring; the terminal log format; the systemd service installer (Linux)                                                                   |
+| `state`    | `state.go`                                           | the `/state` wire types — holds and takes among them — and atomic JSON persistence                                                                                                                      |
+| `model`    | `machine.go`                                         | the pure decision machine, `Step(Event) []Action`: no I/O, no goroutines, no clock                                                                                                                      |
+| `identity` | `tls.go`                                             | TLS server identity, derived client certificate and `kh=` fingerprint from the shared secret, via `crypto/hkdf`                                                                                         |
+| `discover` | `discover.go`                                        | mDNS advertise/browse; `Resolver` resolves the server address and caches it (cache path injected)                                                                                                       |
+| `platform` | `run.go`, `defaults*`, `guard_*`, `term.go`          | the argv runner and the §11.1 child-process conventions; flag defaults; the per-OS `Guard`; whether a writer is someone's terminal                                                                      |
+| `detect`   | `detect.go`, `detect_hid*.go`                        | HID enumeration for the subcommand and its shell-transcript output; the two attach detectors both OSes share                                                                                            |
+| `hidpp`    | `hidpp.go`                                           | Logitech HID++: device declarations, the `changeHost` send and the presence check a device take runs, the `detect` probe, and the receiver link notifications the slot detector reads (SPEC §5.5, §6.1) |
+| `screen`   | `screen.go`, `screen_*.go`                           | screen declarations, the standard and vendor (`lg`) mapping tables, the `VCP:SRC=VAL` wire form and the per-OS write backends — `ddcutil` on Linux, `IOAVService` on macOS (SPEC §5.6)                  |
+| `client`   | `client.go`                                          | the coordinator's HTTP client                                                                                                                                                                           |
+| `server`   | `server.go`                                          | the coordinator HTTP service                                                                                                                                                                            |
+| `agent`    | `agent.go`, `watcher.go`, `actions.go`, `arrival.go` | supervisor, generations, decision loop, claims, takes and the arrival watcher; the `Detector` and `Guard` interfaces and the func seams; no policy                                                      |
 
 The invariants header lives at the top of `agent/agent.go`.
 `platform.NewGuard(match, disabled, displays)` returns a concrete per-OS
@@ -174,11 +173,10 @@ Three of those surprise people:
 - Server tests run the real handler under `httptest.NewServer` with the real
   client pointed at it: a mocked client would test the mock (SPEC §11.2).
 - An interface needs two real implementations to exist. `Detector` and `Guard`
-  have them; the display does not, so the seam is the `Runner` func type and the
-  fake is a func (SPEC §11.2).
-- Not unit-tested: the activation and deactivation commands themselves and the
-  detector's event path — both need the hardware and live in the §10 integration
-  checklist.
+  have them; the commands, the monitor and the devices do not, so their seams
+  are func types and the fakes are funcs (SPEC §11.2).
+- Not unit-tested: the screen write, the device send and the detector's event
+  path — both need the hardware and live in the §10 integration checklist.
 
 ## Version control
 
@@ -254,6 +252,9 @@ jj sharp edges:
   with no expansion — never shell strings (SPEC §9). `--notify-cmd` is the
   exception: its per-OS defaults carry shell quoting, so it runs as
   `sh -c <string>`.
+- A take relays data, never a command: a host writes only the `VCP:SRC` pairs
+  its built-in tables list, and sends only a peripheral it declared, to channel
+  1-3 (SPEC §5.6, §9).
 - `cmd.Cancel` sends SIGTERM (SIGKILL only after `WaitDelay`) so cancellation
   cannot cut `ddcutil` mid-I2C transaction (SPEC §11.1).
 - Pure Go dependencies only, `CGO_ENABLED=0`.

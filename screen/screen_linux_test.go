@@ -2,141 +2,137 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen_linux_test.go: the ddcutil write-then-confirm sequence against a
-// fake runner.
+// screen_linux_test.go: the ddcutil write against a fake runner and a fake
+// /sys/class/drm.
 
 package screen
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
-// scriptRunner answers the write with nil and each read from reads, repeating
-// the last entry once the script runs out.
-type scriptRunner struct {
-	calls    [][]string
-	writeErr error
-	reads    []readResult
+// recorder is a Runner that records its calls and returns err.
+type recorder struct {
+	calls [][]string
+	err   error
 }
 
-type readResult struct {
-	out string
-	err error
-}
-
-func (r *scriptRunner) run(_ context.Context, argv []string) ([]byte, error) {
+func (r *recorder) run(_ context.Context, argv []string) ([]byte, error) {
 	r.calls = append(r.calls, argv)
-	if slices.Contains(argv, "setvcp") {
-		return nil, r.writeErr
-	}
-	n := 0
-	for _, c := range r.calls {
-		if slices.Contains(c, "getvcp") {
-			n++
-		}
-	}
-	res := r.reads[min(n, len(r.reads))-1]
-	return []byte(res.out), res.err
+	return nil, r.err
 }
 
-func shrinkConfirm(t *testing.T) {
+// attach points the EDID glob at a temp dir holding one EDID per name, as
+// connectors do under /sys/class/drm.
+func attach(t *testing.T, names ...string) {
 	t.Helper()
-	w, p := confirmWindow, confirmPoll
-	confirmWindow, confirmPoll = 40*time.Millisecond, 5*time.Millisecond
-	t.Cleanup(func() { confirmWindow, confirmPoll = w, p })
+	dir := t.TempDir()
+	for i, name := range names {
+		conn := filepath.Join(dir, fmt.Sprintf("card0-DP-%d", i+1))
+		if err := os.Mkdir(conn, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(conn, "edid"), edidFor(0x1E6D, name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A connector with nothing on it has an empty EDID.
+	empty := filepath.Join(dir, "card0-HDMI-A-1")
+	if err := os.Mkdir(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(empty, "edid"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := drmEDIDs
+	drmEDIDs = filepath.Join(dir, "*", "edid")
+	t.Cleanup(func() { drmEDIDs = old })
 }
 
-func TestDoWritesTheTable(t *testing.T) {
-	shrinkConfirm(t)
-	silent := []readResult{{err: errors.New("no DDC reply")}}
-
-	t.Run("standard", func(t *testing.T) {
-		r := &scriptRunner{reads: silent}
-		if err := mustParse(t, "hdmi1").Do(t.Context(), r.run); err != nil {
+func TestWriteDo(t *testing.T) {
+	t.Run("standard, from the default source", func(t *testing.T) {
+		attach(t, "DELL U2720Q")
+		r := &recorder{}
+		if err := (Write{0x60, 0x51, 0x11}).Do(t.Context(), r.run, "DELL U2720Q"); err != nil {
 			t.Fatalf("Do: %v", err)
 		}
-		want := []string{"ddcutil", "setvcp", "0x60", "0x11", "--noverify"}
-		if !slices.Equal(r.calls[0], want) {
-			t.Errorf("write = %v, want %v", r.calls[0], want)
+		want := []string{"ddcutil", "setvcp", "0x60", "0x11", "--noverify", "--model", "DELL U2720Q"}
+		if len(r.calls) != 1 || !slices.Equal(r.calls[0], want) {
+			t.Errorf("calls = %v, want one write %v", r.calls, want)
 		}
 	})
 
-	t.Run("lg with a display", func(t *testing.T) {
-		r := &scriptRunner{reads: silent}
-		if err := mustParse(t, "dp1", "lg", "display=LG ULTRAWIDE").Do(t.Context(), r.run); err != nil {
+	t.Run("lg, from its own source, name matched ignoring case", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{}
+		if err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "lg hdr wqhd"); err != nil {
 			t.Fatalf("Do: %v", err)
 		}
+		// One write and nothing else: the monitor is never read back.
 		want := []string{"ddcutil", "setvcp", "0xF4", "0xD0", "--noverify",
-			"--i2c-source-addr=0x50", "--model", "LG ULTRAWIDE"}
-		if !slices.Equal(r.calls[0], want) {
-			t.Errorf("write = %v, want %v", r.calls[0], want)
-		}
-		read := []string{"ddcutil", "--terse", "getvcp", "60", "--model", "LG ULTRAWIDE"}
-		if !slices.Equal(r.calls[1], read) {
-			t.Errorf("read = %v, want %v", r.calls[1], read)
-		}
-	})
-}
-
-func TestDoConfirm(t *testing.T) {
-	shrinkConfirm(t)
-	still := readResult{out: "VCP 60 SNC x0f\n"}
-
-	t.Run("silence after a few polls is the receipt", func(t *testing.T) {
-		r := &scriptRunner{reads: []readResult{still, still, {err: errors.New("no DDC reply")}}}
-		if err := mustParse(t, "hdmi1").Do(t.Context(), r.run); err != nil {
-			t.Fatalf("Do: %v", err)
-		}
-		if len(r.calls) != 4 {
-			t.Errorf("expected 1 write + 3 reads, got %v", r.calls)
+			"--i2c-source-addr=0x50", "--model", "LG HDR WQHD"}
+		if len(r.calls) != 1 || !slices.Equal(r.calls[0], want) {
+			t.Errorf("calls = %v, want one write %v", r.calls, want)
 		}
 	})
 
-	t.Run("a monitor answering on every input reports the target", func(t *testing.T) {
-		r := &scriptRunner{reads: []readResult{still, {out: "VCP 60 SNC x11\n"}}}
-		if err := mustParse(t, "hdmi1").Do(t.Context(), r.run); err != nil {
-			t.Fatalf("Do: %v", err)
+	t.Run("no monitor of that name is nothing to move", func(t *testing.T) {
+		attach(t, "DELL U2720Q")
+		r := &recorder{}
+		err := (Write{0x60, 0x51, 0x11}).Do(t.Context(), r.run, "LG HDR WQHD")
+		if !errors.Is(err, ErrNoDisplay) || len(r.calls) != 0 {
+			t.Fatalf("Do = %v after %v, want ErrNoDisplay and no call", err, r.calls)
 		}
 	})
 
-	t.Run("still on this input past the window fails", func(t *testing.T) {
-		r := &scriptRunner{reads: []readResult{still}}
-		err := mustParse(t, "hdmi1").Do(t.Context(), r.run)
-		if err == nil || !strings.Contains(err.Error(), "still on this input") {
-			t.Fatalf("Do error = %v, want a still-on-this-input failure", err)
+	t.Run("no monitor at all", func(t *testing.T) {
+		attach(t)
+		if err := (Write{0x60, 0x51, 0x11}).Do(t.Context(), (&recorder{}).run, "LG"); !errors.Is(err, ErrNoDisplay) {
+			t.Fatalf("Do = %v, want ErrNoDisplay", err)
 		}
 	})
 
-	t.Run("a failed write is reported with no read", func(t *testing.T) {
+	t.Run("two monitors of the name fail rather than pick", func(t *testing.T) {
+		attach(t, "LG HDR WQHD", "LG HDR WQHD")
+		r := &recorder{}
+		err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "LG HDR WQHD")
+		if err == nil || errors.Is(err, ErrNoDisplay) || len(r.calls) != 0 {
+			t.Fatalf("Do = %v after %v, want an ambiguity error and no call", err, r.calls)
+		}
+	})
+
+	t.Run("a failed write is reported once, not retried", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
 		boom := errors.New("ddcutil requires module i2c-dev")
-		r := &scriptRunner{writeErr: boom, reads: []readResult{still}}
-		if err := mustParse(t, "hdmi1").Do(t.Context(), r.run); !errors.Is(err, boom) {
-			t.Fatalf("Do error = %v, want the write error", err)
+		r := &recorder{err: boom}
+		if err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "LG HDR WQHD"); !errors.Is(err, boom) {
+			t.Fatalf("Do = %v, want the write error", err)
 		}
 		if len(r.calls) != 1 {
-			t.Errorf("expected the write only, got %v", r.calls)
+			t.Errorf("calls = %v, want one", r.calls)
 		}
 	})
+}
 
-	t.Run("cancellation is not a receipt", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(t.Context())
-		r := &scriptRunner{reads: []readResult{{err: context.Canceled}}}
-		run := func(c context.Context, argv []string) ([]byte, error) {
-			out, err := r.run(c, argv)
-			if slices.Contains(argv, "getvcp") {
-				cancel() // the read died because the agent is shutting down
-			}
-			return out, err
-		}
-		if err := mustParse(t, "hdmi1").Do(ctx, run); !errors.Is(err, context.Canceled) {
-			t.Fatalf("Do error = %v, want context.Canceled", err)
-		}
-	})
+func TestAttachedNamesSkipsGarbage(t *testing.T) {
+	attach(t, "LG HDR WQHD")
+	junk := filepath.Join(filepath.Dir(filepath.Dir(drmEDIDs)), "card0-DP-9")
+	if err := os.Mkdir(junk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(junk, "edid"), []byte("not an edid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := attachedNames(); !slices.Equal(got, []string{"LG HDR WQHD"}) {
+		t.Errorf("attachedNames = %q, want only the LG", got)
+	}
 }
 
 func TestProbe(t *testing.T) {
@@ -184,16 +180,4 @@ func TestProbe(t *testing.T) {
 			t.Fatalf("Probe = %+v, want %+v", r, want)
 		}
 	})
-}
-
-// Switching to the port the monitor already shows succeeds the same way
-// through either table: the read reports the target.
-func TestDoToOwnPort(t *testing.T) {
-	shrinkConfirm(t)
-	for _, args := range [][]string{{"dp1"}, {"dp1", "lg"}} {
-		r := &scriptRunner{reads: []readResult{{out: "VCP 60 SNC x0f\n"}}}
-		if err := mustParse(t, args...).Do(t.Context(), r.run); err != nil {
-			t.Errorf("screen-switch %v on dp1: %v", args, err)
-		}
-	}
 }

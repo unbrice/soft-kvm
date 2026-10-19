@@ -13,7 +13,7 @@ import (
 
 const (
 	DefaultID        = "linux"
-	DefaultNotifyCmd = "notify-send 'soft-kvm' 'Press Input on the monitor'"
+	DefaultNotifyCmd = "notify-send 'soft-kvm' 'Handover failed: switch by hand'"
 )
 
 // StateDir is $XDG_STATE_HOME/soft-kvm, defaulting to ~/.local/state/soft-kvm.

@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen_test.go: the screen-switch parser, the tables, the ddcutil output
-// parsers, and the DDC/CI framing and EDID parsing the macOS backend speaks
-// through — everything that needs no monitor.
+// screen_test.go: the declaration and wire-form parsers, the tables, the
+// ddcutil output parsers, and the DDC/CI framing and EDID parsing the macOS
+// backend speaks through — everything that needs no monitor.
 
 package screen
 
@@ -16,49 +16,131 @@ import (
 	"testing"
 )
 
-func TestParse(t *testing.T) {
+func TestParseDeclaration(t *testing.T) {
 	cases := []struct {
-		name      string
-		args      []string
-		wantTable string
-		wantValue uint8
-		wantExp   uint8
-		wantExpOK bool
-		wantDisp  string
-		wantErr   string // substring; empty means success
+		name    string
+		args    []string
+		want    Declaration
+		wantErr string // substring; empty means success
 	}{
-		{name: "alias, standard by default", args: []string{"dp1"}, wantTable: "standard", wantValue: 0x0F, wantExp: 0x0F, wantExpOK: true},
-		{name: "alias is case-insensitive", args: []string{"HDMI2"}, wantTable: "standard", wantValue: 0x12, wantExp: 0x12, wantExpOK: true},
-		{name: "raw hex", args: []string{"0x1B"}, wantTable: "standard", wantValue: 0x1B, wantExp: 0x1B, wantExpOK: true},
-		{name: "raw decimal", args: []string{"27"}, wantTable: "standard", wantValue: 27, wantExp: 27, wantExpOK: true},
-		{name: "display match", args: []string{"dp2", "display=LG ULTRAWIDE"}, wantTable: "standard", wantValue: 0x10, wantExp: 0x10, wantExpOK: true, wantDisp: "LG ULTRAWIDE"},
-		{name: "no arguments", args: nil, wantErr: "usage"},
-		{name: "unknown input", args: []string{"vga"}, wantErr: "invalid input"},
-		{name: "value out of range", args: []string{"0x100"}, wantErr: "invalid input"},
-		{name: "unknown table", args: []string{"dp1", "dell"}, wantErr: "mapping table"},
-		{name: "empty display", args: []string{"dp1", "display="}, wantErr: "invalid argument"},
-		{name: "display twice", args: []string{"dp1", "display=a", "display=b"}, wantErr: "invalid argument"},
+		{name: "alias, standard by default", args: []string{"DELL U2720Q", "dp1"},
+			want: Declaration{"DELL U2720Q", Write{0x60, 0x51, 0x0F}}},
+		{name: "alias is case-insensitive", args: []string{"X", "HDMI2"},
+			want: Declaration{"X", Write{0x60, 0x51, 0x12}}},
+		{name: "raw hex", args: []string{"X", "0x1B"}, want: Declaration{"X", Write{0x60, 0x51, 0x1B}}},
+		{name: "raw decimal", args: []string{"X", "27"}, want: Declaration{"X", Write{0x60, 0x51, 27}}},
+		{name: "lg table", args: []string{"LG HDR WQHD", "usbc1", "lg"},
+			want: Declaration{"LG HDR WQHD", Write{0xF4, 0x50, 0xD1}}},
+		{name: "table is case-insensitive", args: []string{"X", "dp1", "LG"},
+			want: Declaration{"X", Write{0xF4, 0x50, 0xD0}}},
+		{name: "raw value through lg", args: []string{"X", "0xD2", "lg"},
+			want: Declaration{"X", Write{0xF4, 0x50, 0xD2}}},
+		{name: "no arguments", args: nil, wantErr: "NAME INPUT"},
+		{name: "name only", args: []string{"X"}, wantErr: "NAME INPUT"},
+		{name: "four words", args: []string{"X", "dp1", "lg", "extra"}, wantErr: "NAME INPUT"},
+		{name: "empty name", args: []string{"", "dp1"}, wantErr: "invalid screen name"},
+		{name: "unprintable name", args: []string{"a\tb", "dp1"}, wantErr: "invalid screen name"},
+		{name: "long name", args: []string{strings.Repeat("n", 65), "dp1"}, wantErr: "invalid screen name"},
+		{name: "unknown input", args: []string{"X", "vga"}, wantErr: "invalid input"},
+		{name: "a port the table lacks", args: []string{"X", "dp2", "lg"}, wantErr: "dp1, hdmi1, hdmi2, usbc1"},
+		{name: "value out of range", args: []string{"X", "0x100"}, wantErr: "invalid input"},
+		{name: "unknown table", args: []string{"X", "dp1", "dell"}, wantErr: "invalid table"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s, err := Parse(c.args)
+			got, err := ParseDeclaration(c.args)
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
-					t.Fatalf("Parse(%v) error = %v, want substring %q", c.args, err, c.wantErr)
+					t.Fatalf("ParseDeclaration(%q) error = %v, want substring %q", c.args, err, c.wantErr)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("Parse(%v): %v", c.args, err)
-			}
-			if s.Table.Name != c.wantTable || s.Value != c.wantValue || s.Display != c.wantDisp {
-				t.Errorf("Parse(%v) = table %q value %#x display %q, want %q %#x %q",
-					c.args, s.Table.Name, s.Value, s.Display, c.wantTable, c.wantValue, c.wantDisp)
-			}
-			if s.Expect != c.wantExp || s.ExpectOK != c.wantExpOK {
-				t.Errorf("Parse(%v) expect = %#x/%v, want %#x/%v", c.args, s.Expect, s.ExpectOK, c.wantExp, c.wantExpOK)
+			if err != nil || got != c.want {
+				t.Fatalf("ParseDeclaration(%q) = %+v, %v; want %+v", c.args, got, err, c.want)
 			}
 		})
+	}
+}
+
+func TestParseWrite(t *testing.T) {
+	good := map[string]Write{
+		"F4:50=D1": {0xF4, 0x50, 0xD1},
+		"f4:50=d1": {0xF4, 0x50, 0xD1},
+		"60:51=0F": {0x60, 0x51, 0x0F},
+	}
+	for in, want := range good {
+		got, err := ParseWrite(in)
+		if err != nil || got != want {
+			t.Errorf("ParseWrite(%q) = %+v, %v; want %+v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "F4", "F4:50", "F4:50=", "F4:50=D", "F4:50=D1D1", "F4-50=D1",
+		"0xF4:50=D1", "F4:50=GG", "F4:5=D1", "F4:50=D1:00", " F4:50=D1", "+4:50=D1",
+		"-0:-0=42", "-0:-0:42", "6_:51=0F"} {
+		if got, err := ParseWrite(in); err == nil {
+			t.Errorf("ParseWrite(%q) = %+v, want an error", in, got)
+		}
+	}
+	// Well formed, but no table lists the pair: factory reset, power, and
+	// each feature from the other's source.
+	for _, in := range []string{"04:51=01", "D6:51=04", "60:50=0F", "F4:51=D1", "00:00=42"} {
+		if got, err := ParseWrite(in); err == nil || !strings.Contains(err.Error(), "refusing write") {
+			t.Errorf("ParseWrite(%q) = %+v, %v; want a refusal", in, got, err)
+		}
+	}
+}
+
+func TestWriteString(t *testing.T) {
+	if got := (Write{0x60, 0x51, 0x0F}).String(); got != "60:51=0F" {
+		t.Errorf("String() = %q, want 60:51=0F", got)
+	}
+	// What the taker sends parses back to itself.
+	d, err := ParseDeclaration([]string{"X", "usbc1", "lg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back, err := ParseWrite(d.Write.String()); err != nil || back != d.Write {
+		t.Errorf("round trip = %+v, %v; want %+v", back, err, d.Write)
+	}
+}
+
+// A writer accepts only the (feature, source) pairs its tables list, with any
+// value: the features next to Input Source include factory reset and power
+// (SPEC §5.6, §9).
+func TestWriteIsValid(t *testing.T) {
+	cases := []struct {
+		w    Write
+		want bool
+	}{
+		{Write{0x60, 0x51, 0x0F}, true},
+		{Write{0x60, 0x51, 0xFF}, true},
+		{Write{0xF4, 0x50, 0xD1}, true},
+		{Write{0x04, 0x51, 0x01}, false}, // factory reset
+		{Write{0xD6, 0x51, 0x04}, false}, // power
+		{Write{0x60, 0x50, 0x0F}, false}, // a pair no table lists
+		{Write{0xF4, 0x51, 0xD1}, false},
+	}
+	for _, c := range cases {
+		if got := c.w.IsValid(); got != c.want {
+			t.Errorf("%s.IsValid() = %v, want %v", c.w, got, c.want)
+		}
+	}
+}
+
+func TestPickByName(t *testing.T) {
+	names := []string{"DELL U2720Q", "LG HDR WQHD"}
+	if i, err := pickByName(names, "lg hdr wqhd"); err != nil || i != 1 {
+		t.Errorf("pickByName(case differs) = %d, %v; want 1", i, err)
+	}
+	if _, err := pickByName(names, "LG"); !errors.Is(err, ErrNoDisplay) {
+		t.Errorf("pickByName(substring) = %v, want ErrNoDisplay: the name is compared whole", err)
+	}
+	if _, err := pickByName(nil, "LG"); !errors.Is(err, ErrNoDisplay) {
+		t.Errorf("pickByName(none attached) = %v, want ErrNoDisplay", err)
+	}
+	_, err := pickByName([]string{"LG", "lg"}, "LG")
+	if err == nil || errors.Is(err, ErrNoDisplay) {
+		t.Errorf("pickByName(two of a name) = %v, want an ambiguity error", err)
 	}
 }
 
@@ -158,15 +240,6 @@ Display 2
 	}
 }
 
-func mustParse(t *testing.T, args ...string) *Switch {
-	t.Helper()
-	s, err := Parse(args)
-	if err != nil {
-		t.Fatalf("Parse(%v): %v", args, err)
-	}
-	return s
-}
-
 func TestLGTable(t *testing.T) {
 	lg := tableByName("lg")
 	if lg == nil {
@@ -181,9 +254,6 @@ func TestLGTable(t *testing.T) {
 	if got := strings.Join(lg.Aliases(), ","); got != "dp1,hdmi1,hdmi2,usbc1" {
 		t.Errorf("lg aliases = %q", got)
 	}
-	if _, err := Parse([]string{"dp2", "lg"}); err == nil || !strings.Contains(err.Error(), "dp1, hdmi1, hdmi2, usbc1") {
-		t.Errorf("Parse(dp2 lg) error = %v, want one listing lg's ports", err)
-	}
 	// lg writes 0xF4 but reads back the standard Input Source values.
 	for value, want := range map[uint8]string{0x0F: "dp1", 0x11: "hdmi1", 0x12: "hdmi2", 0x1B: "usbc1"} {
 		if got, ok := lg.AliasFor(value); !ok || got != want {
@@ -192,16 +262,6 @@ func TestLGTable(t *testing.T) {
 	}
 	if got, ok := lg.AliasFor(0xD0); ok {
 		t.Errorf("lg AliasFor(0xD0) = %q, want none: 0xD0 is written, never read", got)
-	}
-	if s := mustParse(t, "dp1", "lg"); !s.ExpectOK || s.Expect != 0x0F {
-		t.Errorf("Parse(dp1 lg) expect = %#x/%v, want 0x0F", s.Expect, s.ExpectOK)
-	}
-	if s := mustParse(t, "usbc1", "lg"); !s.ExpectOK || s.Expect != 0x1B {
-		t.Errorf("Parse(usbc1 lg) expect = %#x/%v, want 0x1B", s.Expect, s.ExpectOK)
-	}
-	// A raw value went to 0xF4: nothing says how the port reads back.
-	if s := mustParse(t, "0xD2", "lg"); s.Table != lg || s.ExpectOK {
-		t.Errorf("Parse(0xD2 lg) = table %q, ExpectOK %v; want lg, false", s.Table.Name, s.ExpectOK)
 	}
 }
 

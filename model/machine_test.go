@@ -2,13 +2,14 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// machine_test.go: table-driven tests of the pure switch state machine.
+// machine_test.go: table-driven tests of the pure decision state machine.
 
 package model
 
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ func testConfig(id string) MachineConfig {
 		Settle:         2 * time.Second,
 		SwitchRetries:  3,
 		RetrySpacing:   1 * time.Second,
+		ArrivalWindow:  10 * time.Second,
 		Cooldown:       5 * time.Second,
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
@@ -29,724 +31,982 @@ func testConfig(id string) MachineConfig {
 	}
 }
 
-func mkstate(owner string, epoch int64, live map[string]bool) *state.ServerState {
-	return &state.ServerState{Owner: owner, Epoch: epoch, Live: live}
+var t0 = time.Unix(1000, 0)
+
+func at(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
+
+// Hold keys used throughout.
+var (
+	lgKey    = state.HoldKey{Kind: state.KindScreen, Name: "LG"}
+	mouseKey = state.HoldKey{Kind: state.KindHID, Name: "mouse"}
+)
+
+func screenHold(name, holder, prev string, seq state.Seq) state.Hold {
+	return state.Hold{Kind: state.KindScreen, Name: name, Holder: holder, Prev: prev, Seq: seq, Input: "F4:50=D1"}
 }
 
-func exit(err error) *error { return &err }
+func hidHold(name, holder, prev string, seq state.Seq, arrived bool) state.Hold {
+	return state.Hold{Kind: state.KindHID, Name: name, Holder: holder, Prev: prev, Seq: seq, Channel: 2, Arrived: arrived}
+}
 
-func ptr(s string) *string { return &s }
-
-func checkActions(t *testing.T, got, want []Action) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("got %d actions, want %d; got=%+v", len(got), len(want), got)
+// mk builds a state with every host live.
+func mk(owner string, activation int64, holds ...state.Hold) *state.ServerState {
+	return &state.ServerState{
+		Owner:      owner,
+		Activation: activation,
+		Epoch:      activation + int64(len(holds)),
+		Live:       map[string]bool{"linux": true, "mac": true},
+		Holds:      holds,
 	}
-	for i, w := range want {
-		g := got[i]
-		if w.Claim != "" && g.Claim != w.Claim {
-			t.Errorf("action %d Claim=%q, want %q", i, g.Claim, w.Claim)
+}
+
+func notLive(s *state.ServerState, id string) *state.ServerState {
+	s.Live = map[string]bool{"linux": true, "mac": true}
+	s.Live[id] = false
+	return s
+}
+
+// agentAt is the record of an agent that follows owner at activation, having
+// handled the given holds.
+func agentAt(owner string, activation int64, seen map[state.HoldKey]state.Seq) state.AgentState {
+	rec := state.AgentState{LastOwner: owner, LastActivation: activation, Seen: map[string]state.Seq{}}
+	for k, seq := range seen {
+		rec.Seen[k.String()] = seq
+	}
+	return rec
+}
+
+func newMachine(id string, rec state.AgentState) *Machine {
+	return NewMachine(testConfig(id), rec, true)
+}
+
+// sum renders the actions that do something as short strings, so a test reads
+// as the sequence it expects. Log-only actions are left out; logs() returns
+// them.
+func sum(acts []Action) []string {
+	var out []string
+	for _, a := range acts {
+		var parts []string
+		if a.Claim != "" {
+			parts = append(parts, "claim:"+a.Claim)
 		}
-		if g.Activate != w.Activate {
-			t.Errorf("action %d Activate=%v, want %v", i, g.Activate, w.Activate)
+		if a.Activate {
+			parts = append(parts, fmt.Sprintf("activate:%d", a.Activation))
 		}
-		if g.Deactivate != w.Deactivate {
-			t.Errorf("action %d Deactivate=%v, want %v", i, g.Deactivate, w.Deactivate)
+		if a.Deactivate {
+			parts = append(parts, "deactivate")
 		}
-		if g.Retry != w.Retry {
-			t.Errorf("action %d Retry=%v, want %v", i, g.Retry, w.Retry)
+		if (a.Activate || a.Deactivate) && a.Retry {
+			parts = append(parts, "retry")
 		}
-		if g.Notify != w.Notify {
-			t.Errorf("action %d Notify=%v, want %v", i, g.Notify, w.Notify)
-		}
-		if !w.WakeAt.IsZero() && !g.WakeAt.Equal(w.WakeAt) {
-			t.Errorf("action %d WakeAt=%v, want %v", i, g.WakeAt, w.WakeAt)
-		}
-		if w.SaveOwner != nil {
-			if g.SaveOwner == nil || *g.SaveOwner != *w.SaveOwner {
-				t.Errorf("action %d SaveOwner=%v, want %v", i, deref(g.SaveOwner), *w.SaveOwner)
+		if len(a.Run) > 0 {
+			names := make([]string, len(a.Run))
+			for i, h := range a.Run {
+				names[i] = h.Key().String()
 			}
-		} else if g.SaveOwner != nil {
-			t.Errorf("action %d SaveOwner=%v, want nil", i, deref(g.SaveOwner))
+			parts = append(parts, "run:"+strings.Join(names, ","))
 		}
-		if w.Log != "" && !strings.Contains(g.Log, w.Log) {
-			t.Errorf("action %d Log=%q, want substring %q", i, g.Log, w.Log)
+		if a.Notify {
+			parts = append(parts, "notify")
+		}
+		if a.Save != nil {
+			parts = append(parts, "save")
+		}
+		if !a.WakeAt.IsZero() {
+			parts = append(parts, fmt.Sprintf("wake:%d", int(a.WakeAt.Sub(t0)/time.Second)))
+		}
+		if len(parts) > 0 {
+			out = append(out, strings.Join(parts, "+"))
 		}
 	}
+	return out
 }
 
-func deref(p *string) string {
-	if p == nil {
-		return "<nil>"
+func logs(acts []Action) string {
+	var out []string
+	for _, a := range acts {
+		if a.Log != "" {
+			out = append(out, a.Log)
+		}
 	}
-	return *p
+	return strings.Join(out, "\n")
 }
 
-func requireActionCount(t *testing.T, acts []Action, n int) {
+func want(t *testing.T, acts []Action, w ...string) {
 	t.Helper()
-	if len(acts) != n {
-		t.Fatalf("got %d actions, want %d: %+v", len(acts), n, acts)
+	if got := sum(acts); !slices.Equal(got, w) {
+		t.Fatalf("actions = %q, want %q\nlogs:\n%s", got, w, logs(acts))
 	}
 }
 
-func TestMachine(t *testing.T) {
-	t0 := time.Unix(1000, 0)
-	errStuck := errors.New("screen-switch: monitor still on this input")
-	macLive := map[string]bool{"mac": true}
+func wantLog(t *testing.T, acts []Action, substr string) {
+	t.Helper()
+	if !strings.Contains(logs(acts), substr) {
+		t.Fatalf("logs %q lack %q", logs(acts), substr)
+	}
+}
 
-	// regain feeds the state that makes the machine the owner again and
-	// completes the activation that starts, so the next transition is away
-	// from it.
-	regain := func(t *testing.T, m *Machine, at time.Time, epoch int64) {
-		t.Helper()
-		acts := m.Step(Event{Now: at, State: mkstate("linux", epoch, map[string]bool{"linux": true})})
-		checkActions(t, acts, []Action{
-			{Activate: true, Log: "activating"},
-			{WakeAt: at.Add(SwitchDeadline)},
-		})
-		acts = m.Step(Event{Now: at, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("linux"), Log: "confirmed"}})
+func saved(t *testing.T, acts []Action) *state.AgentState {
+	t.Helper()
+	var rec *state.AgentState
+	for _, a := range acts {
+		if a.Save != nil {
+			rec = a.Save
+		}
+	}
+	if rec == nil {
+		t.Fatalf("no Save in %+v", acts)
+	}
+	return rec
+}
+
+func state_(s *state.ServerState, now time.Time) Event { return Event{Now: now, State: s} }
+
+func okAll(keys ...state.HoldKey) *Exit {
+	out := map[state.HoldKey]Outcome{}
+	for _, k := range keys {
+		out[k] = Outcome{}
+	}
+	return &Exit{Takes: out}
+}
+
+func takesExit(o map[state.HoldKey]Outcome) *Exit { return &Exit{Takes: o} }
+
+var errWrite = errors.New("ddcutil: no i2c-dev")
+
+func TestFirstReconcileAdopts(t *testing.T) {
+	m := NewMachine(testConfig("linux"), state.AgentState{}, false)
+	s := mk("mac", 4, screenHold("LG", "mac", "linux", 3), hidHold("mouse", "mac", "linux", 4, false))
+
+	acts := m.Step(state_(s, at(0)))
+	want(t, acts, "save")
+	wantLog(t, acts, "adopted")
+	rec := saved(t, acts)
+	if rec.LastOwner != "mac" || rec.LastActivation != 4 ||
+		rec.Seen["screen/LG"] != 3 || rec.Seen["hid/mouse"] != 4 {
+		t.Fatalf("adopted record = %+v", rec)
 	}
 
-	t.Run("first reconcile adopts and never switches", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "", false)
+	// The adopted state is the baseline: the same state runs nothing, not an
+	// activation (I am not the owner), not a deactivation (last_owner is mac),
+	// not the takes it holds.
+	want(t, m.Step(state_(s, at(1))))
 
-		acts := m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "adopted"}})
+	// A name the agent meets after the first reconcile is new, and so is a
+	// new take of a name it adopted.
+	dell := state.HoldKey{Kind: state.KindScreen, Name: "DELL"}
+	next := mk("mac", 4, screenHold("DELL", "mac", "", 5), screenHold("LG", "mac", "linux", 3), hidHold("mouse", "mac", "linux", 4, false))
+	acts = m.Step(state_(next, at(2)))
+	want(t, acts, "run:screen/DELL", "wake:62")
+	want(t, m.Step(Event{Now: at(3), Exit: okAll(dell)}), "save")
+	next = mk("mac", 4, screenHold("DELL", "mac", "", 5), screenHold("LG", "mac", "linux", 6), hidHold("mouse", "mac", "linux", 4, false))
+	acts = m.Step(state_(next, at(10)))
+	want(t, acts, "run:screen/LG", "wake:70")
+}
 
-		// The adopted owner is now treated as our own: no transition.
-		acts = m.Step(Event{Now: t0, State: mkstate("mac", 2, macLive)})
-		checkActions(t, acts, []Action{{Log: "last_owner"}})
+// A restarted agent builds its machine from agent.json: what it handled stays
+// handled.
+func TestRecordSurvivesARestart(t *testing.T) {
+	m := newMachine("linux", agentAt("mac", 2, nil))
+	s := mk("mac", 2, screenHold("LG", "mac", "linux", 3))
+	acts := m.Step(state_(s, at(0)))
+	want(t, acts, "run:screen/LG", "wake:60")
+	acts = m.Step(Event{Now: at(1), Exit: okAll(lgKey)})
+	want(t, acts, "save")
+
+	again := NewMachine(testConfig("linux"), *saved(t, acts), true)
+	want(t, again.Step(state_(s, at(100))))
+}
+
+func TestActivation(t *testing.T) {
+	t.Run("ownership comes here: run, then save the record", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		acts := m.Step(state_(mk("linux", 2), at(0)))
+		want(t, acts, "activate:2", "wake:60")
+		if !acts[0].Activate || acts[0].Retry || acts[0].Activation != 2 {
+			t.Fatalf("first action = %+v", acts[0])
+		}
+		acts = m.Step(Event{Now: at(2), Exit: &Exit{}})
+		want(t, acts, "save")
+		if rec := saved(t, acts); rec.LastOwner != "linux" || rec.LastActivation != 2 {
+			t.Fatalf("record = %+v", rec)
+		}
+		// Nothing more for the same transition.
+		want(t, m.Step(state_(mk("linux", 2), at(3))))
 	})
 
-	t.Run("happy path", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a re-activation of the owner runs the commands again", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 2, nil))
+		want(t, m.Step(state_(mk("linux", 2), at(0))))
+		acts := m.Step(state_(mk("linux", 3), at(1)))
+		want(t, acts, "activate:3", "wake:61")
+		acts = m.Step(Event{Now: at(2), Exit: &Exit{}})
+		if rec := saved(t, acts); rec.LastActivation != 3 {
+			t.Fatalf("record = %+v", rec)
+		}
+		want(t, m.Step(state_(mk("linux", 3), at(3))))
+	})
 
-		// The transition switches at once: nothing probes first.
-		acts := m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: t0.Add(SwitchDeadline)},
-		})
+	t.Run("an agent that never activated runs on an owner it already was", func(t *testing.T) {
+		m := newMachine("linux", agentAt("", 0, nil))
+		want(t, m.Step(state_(mk("linux", 1), at(0))), "activate:1", "wake:60")
+	})
 
-		// Exit 0 is the receipt.
-		end := t0.Add(2 * time.Second)
-		acts = m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "confirmed"}})
-		if !m.cooldownUntil.Equal(end.Add(cfg.Cooldown)) {
-			t.Fatalf("cooldown set to %v", m.cooldownUntil)
+	t.Run("a failure retries only after the spacing, then is saved without a notification", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		m.Step(state_(mk("linux", 2), at(0)))
+
+		// Fast failure: the retry waits for 1 s after the previous start.
+		acts := m.Step(Event{Now: at(0), Exit: &Exit{Err: errors.New("exit 1")}})
+		want(t, acts, "wake:1")
+		acts = m.Step(Event{Now: at(1)})
+		want(t, acts, "activate:2+retry", "wake:61")
+		if acts[0].Activation != 2 {
+			t.Fatalf("retry carries activation %d, want 2", acts[0].Activation)
+		}
+		// A slow failure retries at once.
+		want(t, m.Step(Event{Now: at(5), Exit: &Exit{Err: errors.New("exit 1")}}), "activate:2+retry", "wake:65")
+		want(t, m.Step(Event{Now: at(9), Exit: &Exit{Err: errors.New("exit 1")}}), "activate:2+retry", "wake:69")
+
+		// 1 + 3 retries are spent: the failure is logged, never notified, and
+		// the record moves on so the same transition does not run again.
+		acts = m.Step(Event{Now: at(12), Exit: &Exit{Err: errors.New("exit 1")}})
+		want(t, acts, "save")
+		wantLog(t, acts, "failed after 4 attempts")
+		if rec := saved(t, acts); rec.LastOwner != "linux" || rec.LastActivation != 2 {
+			t.Fatalf("record = %+v", rec)
+		}
+		want(t, m.Step(state_(mk("linux", 2), at(13))))
+	})
+
+	t.Run("never waits behind the cooldown or the breaker", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		m.cooldownUntil[lgKey] = at(100)
+		m.breakerOpenUntil = at(100)
+		want(t, m.Step(state_(mk("linux", 2), at(0))), "activate:2", "wake:60")
+	})
+
+	t.Run("a flip away during the activation deactivates when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		m.Step(state_(mk("linux", 2), at(0)))
+		// Stashed: the activation is still running.
+		want(t, m.Step(state_(mk("mac", 3), at(1))), "wake:60")
+		// The activation spends its attempts first (a 409 each time), then the
+		// deactivation runs right after.
+		for _, sec := range []int{2, 3, 5} {
+			want(t, m.Step(Event{Now: at(sec), Exit: &Exit{Err: errors.New("409")}}), "activate:2+retry", fmt.Sprintf("wake:%d", sec+60))
+		}
+		acts := m.Step(Event{Now: at(7), Exit: &Exit{Err: errors.New("409")}})
+		want(t, acts, "save", "deactivate", "wake:67")
+		if rec := saved(t, acts); rec.LastOwner != "linux" {
+			t.Fatalf("record = %+v", rec)
 		}
 	})
 
-	t.Run("winner not live", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a flip away during a successful activation deactivates right after", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		m.Step(state_(mk("linux", 2), at(0)))
+		want(t, m.Step(state_(mk("mac", 3), at(1))), "wake:60")
+		acts := m.Step(Event{Now: at(2), Exit: &Exit{}})
+		want(t, acts, "save", "deactivate", "wake:62")
+	})
+}
 
-		acts := m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": false})})
-		requireActionCount(t, acts, 1)
-		if acts[0].Deactivate {
-			t.Fatalf("expected no switch, got %+v", acts[0])
+func TestDeactivation(t *testing.T) {
+	t.Run("ownership goes away: run, then save the new owner", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		acts := m.Step(state_(mk("mac", 2), at(0)))
+		want(t, acts, "deactivate", "wake:60")
+		if acts[0].Retry {
+			t.Fatal("first run flagged Retry")
 		}
-		if !strings.Contains(acts[0].Log, "not live") {
-			t.Fatalf("expected log mentioning not live, got %q", acts[0].Log)
+		acts = m.Step(Event{Now: at(2), Exit: &Exit{}})
+		want(t, acts, "save")
+		if rec := saved(t, acts); rec.LastOwner != "mac" {
+			t.Fatalf("record = %+v", rec)
 		}
+		want(t, m.Step(state_(mk("mac", 2), at(3))))
 	})
 
-	t.Run("owner empty", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		acts := m.Step(Event{Now: t0, State: mkstate("", 1, map[string]bool{})})
-		requireActionCount(t, acts, 1)
-		if !strings.Contains(acts[0].Log, "empty") {
-			t.Fatalf("expected log mentioning empty owner, got %q", acts[0].Log)
-		}
+	t.Run("no liveness gate", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		want(t, m.Step(state_(notLive(mk("mac", 2), "mac"), at(0))), "deactivate", "wake:60")
 	})
 
-	t.Run("failed switch retries at once past the retry spacing", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-
-		// The command spent its own confirm window before failing, so the
-		// spacing has already passed.
-		fail := t0.Add(5 * time.Second)
-		acts := m.Step(Event{Now: fail, SwitchExit: exit(errStuck)})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Retry: true, Log: "attempt 2"},
-			{WakeAt: fail.Add(SwitchDeadline)},
-		})
-		if !strings.Contains(acts[0].Log, errStuck.Error()) {
-			t.Fatalf("retry log lost the command's error: %q", acts[0].Log)
-		}
-
-		// The second attempt lands.
-		acts = m.Step(Event{Now: fail.Add(time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("mac"), Log: "confirmed"}})
+	t.Run("no cooldown and no breaker", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.cooldownUntil[lgKey] = at(100)
+		m.breakerOpenUntil = at(100)
+		want(t, m.Step(state_(mk("mac", 2), at(0))), "deactivate", "wake:60")
 	})
 
-	t.Run("fast failure waits for the retry spacing", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.SwitchRetries = 1
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-
-		fail1 := t0.Add(200 * time.Millisecond)
-		acts := m.Step(Event{Now: fail1, SwitchExit: exit(errors.New("switch error"))})
-		retryAt := t0.Add(cfg.RetrySpacing)
-		checkActions(t, acts, []Action{
-			{Log: "waiting retry spacing"},
-			{WakeAt: retryAt},
-		})
-
-		acts = m.Step(Event{Now: retryAt})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Retry: true, Log: "retry switch to \"mac\" attempt 2"},
-			{WakeAt: retryAt.Add(SwitchDeadline)},
-		})
-
-		fail2 := retryAt.Add(200 * time.Millisecond)
-		acts = m.Step(Event{Now: fail2, SwitchExit: exit(errors.New("switch error 2"))})
-		checkActions(t, acts, []Action{
-			{Notify: true, SaveOwner: ptr("mac"), Log: "failed"},
-		})
+	t.Run("an empty owner deactivates nothing", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		want(t, m.Step(state_(mk("", 0), at(0))))
 	})
 
-	t.Run("all retries exhausted then notify and stop", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a host that was not the owner has nothing to deactivate", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 1, nil))
+		want(t, m.Step(state_(mk("third", 2), at(0))))
+	})
 
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
+	t.Run("a third host as owner deactivates the previous one", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		want(t, m.Step(state_(mk("third", 2), at(0))), "deactivate", "wake:60")
+	})
 
-		at := t0
-		for i := 0; i < 1+cfg.SwitchRetries; i++ {
-			at = at.Add(5 * time.Second)
-			acts := m.Step(Event{Now: at, SwitchExit: exit(errStuck)})
-			if i < cfg.SwitchRetries {
-				if !acts[0].Deactivate || !acts[0].Retry {
-					t.Fatalf("attempt %d: wanted retry switch, got %+v", i+1, acts)
+	t.Run("failure retries, is logged, never notified, and the record moves on", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		want(t, m.Step(Event{Now: at(0), Exit: &Exit{Err: errors.New("x")}}), "wake:1")
+		want(t, m.Step(Event{Now: at(1)}), "deactivate+retry", "wake:61")
+		want(t, m.Step(Event{Now: at(3), Exit: &Exit{Err: errors.New("x")}}), "deactivate+retry", "wake:63")
+		want(t, m.Step(Event{Now: at(5), Exit: &Exit{Err: errors.New("x")}}), "deactivate+retry", "wake:65")
+		acts := m.Step(Event{Now: at(7), Exit: &Exit{Err: errors.New("x")}})
+		want(t, acts, "save")
+		wantLog(t, acts, "failed after 4 attempts")
+	})
+
+	t.Run("a flip back during the deactivation activates when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		want(t, m.Step(state_(mk("linux", 3), at(1))), "wake:60")
+		acts := m.Step(Event{Now: at(2), Exit: &Exit{}})
+		want(t, acts, "save", "activate:3", "wake:62")
+	})
+
+	t.Run("a flip back during a failing deactivation activates when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		want(t, m.Step(state_(mk("linux", 3), at(1))), "wake:60")
+		m.Step(Event{Now: at(2), Exit: &Exit{Err: errors.New("x")}})
+		m.Step(Event{Now: at(3)})
+		m.Step(Event{Now: at(5), Exit: &Exit{Err: errors.New("x")}})
+		m.Step(Event{Now: at(7), Exit: &Exit{Err: errors.New("x")}})
+		acts := m.Step(Event{Now: at(9), Exit: &Exit{Err: errors.New("x")}})
+		want(t, acts, "save", "activate:3", "wake:69")
+	})
+}
+
+func TestTakeGates(t *testing.T) {
+	// Every combination of the §4.3 gates a pending take passes.
+	for _, seenSame := range []bool{false, true} {
+		for _, arrived := range []bool{false, true} {
+			for _, holderLive := range []bool{true, false} {
+				for _, cooling := range []bool{false, true} {
+					for _, breaker := range []bool{false, true} {
+						for _, holderIsMe := range []bool{false, true} {
+							name := fmt.Sprintf("seen=%v arrived=%v live=%v cooling=%v breaker=%v mine=%v",
+								seenSame, arrived, holderLive, cooling, breaker, holderIsMe)
+							t.Run(name, func(t *testing.T) {
+								seen := map[state.HoldKey]state.Seq{}
+								if seenSame {
+									seen[mouseKey] = 7
+								} else {
+									seen[mouseKey] = 6
+								}
+								m := newMachine("linux", agentAt("mac", 2, seen))
+								holder := "mac"
+								if holderIsMe {
+									holder = "linux"
+								}
+								s := mk("mac", 2, hidHold("mouse", holder, "linux", 7, arrived))
+								notLive(s, "mac")
+								s.Live["mac"] = holderLive
+								if cooling {
+									m.cooldownUntil[mouseKey] = at(3)
+								}
+								if breaker {
+									m.breakerOpenUntil = at(30)
+								}
+								acts := m.Step(state_(s, at(0)))
+
+								switch {
+								case holderIsMe, seenSame:
+									want(t, acts)
+								case arrived:
+									want(t, acts, "save")
+									if saved(t, acts).Seen["hid/mouse"] != 7 {
+										t.Fatal("an arrived hold is not marked seen")
+									}
+								case !holderLive:
+									want(t, acts)
+									wantLog(t, acts, "not live")
+								case breaker:
+									want(t, acts, "wake:30")
+									wantLog(t, acts, "breaker open")
+								case cooling:
+									want(t, acts, "wake:3")
+									wantLog(t, acts, "cooldown")
+								default:
+									want(t, acts, "run:hid/mouse", "wake:60")
+								}
+							})
+						}
+					}
 				}
-				continue
 			}
-			checkActions(t, acts, []Action{{Notify: true, SaveOwner: ptr("mac"), Log: "failed"}})
 		}
+	}
+}
 
-		// Same transition afterwards is a no-op: last_owner is already mac.
-		acts := m.Step(Event{Now: at.Add(1 * time.Second), State: mkstate("mac", 2, macLive)})
-		requireActionCount(t, acts, 1)
-		if acts[0].Deactivate || acts[0].Notify {
-			t.Fatalf("expected no-op after failure, got %+v", acts[0])
+func TestTakeRun(t *testing.T) {
+	t.Run("a live holder's new take runs and is handled once", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		s := mk("mac", 2, screenHold("LG", "mac", "linux", 3))
+		acts := m.Step(state_(s, at(0)))
+		want(t, acts, "run:screen/LG", "wake:60")
+		if acts[0].Run[0].Input != "F4:50=D1" {
+			t.Fatalf("run = %+v", acts[0].Run)
+		}
+		acts = m.Step(Event{Now: at(1), Exit: okAll(lgKey)})
+		want(t, acts, "save")
+		if rec := saved(t, acts); rec.Seen["screen/LG"] != 3 {
+			t.Fatalf("record = %+v", rec)
+		}
+		want(t, m.Step(state_(s, at(2))))
+	})
+
+	t.Run("one run in the order /state lists them", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		s := mk("mac", 2, hidHold("keyboard", "mac", "linux", 3, false),
+			hidHold("mouse", "mac", "linux", 3, false), screenHold("LG", "mac", "linux", 3))
+		want(t, m.Step(state_(s, at(0))), "run:hid/keyboard,hid/mouse,screen/LG", "wake:60")
+	})
+
+	t.Run("nothing to move here is done, silently", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		acts := m.Step(Event{Now: at(1), Exit: takesExit(map[state.HoldKey]Outcome{lgKey: {NotHere: true}})})
+		want(t, acts, "save")
+		if strings.Contains(logs(acts), "failed") {
+			t.Fatalf("logs %q", logs(acts))
 		}
 	})
 
-	t.Run("cooldown defers then proceeds", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a failed write re-runs only that take, spaced by the retry spacing", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		s := mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false), screenHold("LG", "mac", "linux", 3))
+		m.Step(state_(s, at(0)))
+		acts := m.Step(Event{Now: at(0), Exit: takesExit(map[state.HoldKey]Outcome{
+			mouseKey: {NotHere: true}, lgKey: {Err: errWrite},
+		})})
+		want(t, acts, "wake:1")
+		acts = m.Step(Event{Now: at(1)})
+		want(t, acts, "run:screen/LG", "wake:61")
 
-		// Complete a switch to mac at t0+3s.
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		m.Step(Event{Now: t0.Add(3 * time.Second), SwitchExit: exit(nil)})
-
-		// The server now says we are the owner again.
-		regain(t, m, t0.Add(4*time.Second), 2)
-
-		// A new transition inside the cooldown is deferred.
-		cooldownEnd := t0.Add(3 * time.Second).Add(cfg.Cooldown)
-		acts := m.Step(Event{Now: t0.Add(4 * time.Second), State: mkstate("win2", 3, map[string]bool{"win2": true})})
-		checkActions(t, acts, []Action{
-			{Log: "deferring"},
-			{WakeAt: cooldownEnd},
-		})
-
-		// After the cooldown, the bare timer re-runs the reconcile and switches.
-		acts = m.Step(Event{Now: cooldownEnd})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: cooldownEnd.Add(SwitchDeadline)},
-		})
+		// A slow failure retries at once.
+		acts = m.Step(Event{Now: at(5), Exit: takesExit(map[state.HoldKey]Outcome{lgKey: {Err: errWrite}})})
+		want(t, acts, "run:screen/LG", "wake:65")
+		acts = m.Step(Event{Now: at(8), Exit: takesExit(map[state.HoldKey]Outcome{lgKey: {}})})
+		want(t, acts, "save")
 	})
 
-	t.Run("circuit breaker trips and reopens", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a take that reports nothing counts as failed", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		acts := m.Step(Event{Now: at(5), Exit: takesExit(map[state.HoldKey]Outcome{})})
+		want(t, acts, "run:screen/LG", "wake:65")
+	})
 
-		owners := []string{"mac", "win2", "win3", "win4"}
-		base := t0
-		// Three completed switch sequences inside the breaker window.
+	t.Run("failing after the last retry notifies the previous holder", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		s := mk("mac", 2, screenHold("LG", "mac", "linux", 3))
+		m.Step(state_(s, at(0)))
+		fail := takesExit(map[state.HoldKey]Outcome{lgKey: {Err: errWrite}})
+		now := 0
 		for i := 0; i < 3; i++ {
-			m.Step(Event{Now: base, State: mkstate(owners[i], int64(i), map[string]bool{owners[i]: true})})
-			m.Step(Event{Now: base.Add(3 * time.Second), SwitchExit: exit(nil)})
-			base = base.Add(3*time.Second + cfg.Cooldown)
-
-			// Back to linux so the next transition is away from us.
-			regain(t, m, base, int64(i)+10)
+			now += 2
+			acts := m.Step(Event{Now: at(now), Exit: fail})
+			want(t, acts, "run:screen/LG", fmt.Sprintf("wake:%d", now+60))
 		}
-
-		// The fourth transition is refused while the breaker is open.
-		// The breaker opened at the last success, which was one cooldown ago.
-		breakerEnd := base.Add(-cfg.Cooldown).Add(cfg.BreakerOpenFor)
-		acts := m.Step(Event{Now: base, State: mkstate(owners[3], 3, map[string]bool{owners[3]: true})})
-		checkActions(t, acts, []Action{
-			{Log: "breaker"},
-			{WakeAt: breakerEnd},
-		})
-
-		// Once the breaker closes, the deferred reconcile proceeds.
-		acts = m.Step(Event{Now: breakerEnd})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: breakerEnd.Add(SwitchDeadline)},
-		})
-	})
-
-	t.Run("activation runs when ownership comes here and is saved on success", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "mac", true)
-
-		acts := m.Step(Event{Now: t0, State: mkstate("linux", 1, nil)})
-		checkActions(t, acts, []Action{
-			{Activate: true, Log: "activating"},
-			{WakeAt: t0.Add(SwitchDeadline)},
-		})
-
-		// The same state again while it runs is stashed, not run twice.
-		requireActionCount(t, m.Step(Event{Now: t0.Add(time.Second), State: mkstate("linux", 1, nil)}), 1)
-
-		acts = m.Step(Event{Now: t0.Add(2 * time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("linux"), Log: "confirmed"}})
-
-		// Idempotent afterwards: the owner is still me.
-		acts = m.Step(Event{Now: t0.Add(3 * time.Second), State: mkstate("linux", 1, nil)})
-		checkActions(t, acts, []Action{{Log: "still me"}})
-	})
-
-	t.Run("activation is retried, then dropped without a notification", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.SwitchRetries = 1
-		m := NewMachine(cfg, "mac", true)
-
-		m.Step(Event{Now: t0, State: mkstate("linux", 1, nil)})
-
-		fail1 := t0.Add(cfg.RetrySpacing / 2) // inside the spacing, so the retry waits
-		retryAt := t0.Add(cfg.RetrySpacing)
-		acts := m.Step(Event{Now: fail1, SwitchExit: exit(errStuck)})
-		checkActions(t, acts, []Action{
-			{Log: "waiting retry spacing"},
-			{WakeAt: retryAt},
-		})
-		acts = m.Step(Event{Now: retryAt})
-		checkActions(t, acts, []Action{
-			{Activate: true, Retry: true, Log: "retry activation"},
-			{WakeAt: retryAt.Add(SwitchDeadline)},
-		})
-
-		// Out of retries: log and save, no Notify, no breaker, no cooldown.
-		fail2 := retryAt.Add(time.Second)
-		acts = m.Step(Event{Now: fail2, SwitchExit: exit(errStuck)})
-		checkActions(t, acts, []Action{{SaveOwner: ptr("linux"), Log: "activation of \"linux\" failed after 2 attempts"}})
-
-		acts = m.Step(Event{Now: fail2, State: mkstate("mac", 2, macLive)})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: fail2.Add(SwitchDeadline)},
-		})
-	})
-
-	t.Run("activation never waits behind the cooldown or the breaker", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.BreakerMax = 1
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		m.Step(Event{Now: t0.Add(time.Second), SwitchExit: exit(nil)}) // opens both gates
-
-		// Inside both gates, ownership comes back: activation runs at once.
-		regain(t, m, t0.Add(2*time.Second), 2)
-
-		// ...and the switch away that follows is the one that waits.
-		acts := m.Step(Event{Now: t0.Add(2 * time.Second), State: mkstate("mac", 3, macLive)})
-		checkActions(t, acts, []Action{
-			{Log: "deferring"},
-			{WakeAt: t0.Add(time.Second).Add(cfg.BreakerOpenFor)},
-		})
-	})
-
-	t.Run("a flip away during an activation is reconciled when it ends", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "mac", true)
-
-		m.Step(Event{Now: t0, State: mkstate("linux", 1, nil)})
-		// Ownership leaves again while the activation commands run.
-		requireActionCount(t, m.Step(Event{Now: t0.Add(time.Second), State: mkstate("mac", 2, macLive)}), 1)
-
-		end := t0.Add(2 * time.Second)
-		acts := m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("linux"), Log: "confirmed"},
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: end.Add(SwitchDeadline)},
-		})
-	})
-
-	t.Run("a flip back to me during a deactivation activates when it ends", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		// Ownership comes back while the deactivation commands run.
-		requireActionCount(t, m.Step(Event{Now: t0.Add(time.Second), State: mkstate("linux", 2, map[string]bool{"linux": true})}), 1)
-
-		end := t0.Add(2 * time.Second)
-		acts := m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("mac"), Log: "confirmed"},
-			{Activate: true, Log: "activating"},
-			{WakeAt: end.Add(SwitchDeadline)},
-		})
-	})
-
-	t.Run("a flip back to me during a failing deactivation activates when it ends", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.SwitchRetries = 0
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		requireActionCount(t, m.Step(Event{Now: t0.Add(time.Second), State: mkstate("linux", 2, map[string]bool{"linux": true})}), 1)
-
-		end := t0.Add(2 * time.Second)
-		acts := m.Step(Event{Now: end, SwitchExit: exit(errStuck)})
-		checkActions(t, acts, []Action{
-			{Notify: true, SaveOwner: ptr("mac"), Log: "failed"},
-			{Activate: true, Log: "activating"},
-			{WakeAt: end.Add(SwitchDeadline)},
-		})
-	})
-
-	t.Run("attach settle claim", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		acts := m.Step(Event{Now: t0, Attach: true})
-		requireActionCount(t, acts, 1)
-		if !acts[0].WakeAt.Equal(t0.Add(cfg.Settle)) {
-			t.Fatalf("expected wake at %v, got %v", t0.Add(cfg.Settle), acts[0].WakeAt)
+		now += 2
+		acts := m.Step(Event{Now: at(now), Exit: fail})
+		want(t, acts, "notify", "save")
+		wantLog(t, acts, "failed after 4 attempts")
+		if rec := saved(t, acts); rec.Seen["screen/LG"] != 3 {
+			t.Fatalf("a failure is final for that seq: %+v", rec)
 		}
-
-		acts = m.Step(Event{Now: t0.Add(cfg.Settle)})
-		checkActions(t, acts, []Action{{Claim: "linux", Log: "claim"}})
+		want(t, m.Step(state_(s, at(now+1))))
 	})
 
-	t.Run("attach flapping restarts settle", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, Attach: true})
-		m.Step(Event{Now: t0.Add(1 * time.Second), Attach: true})
-		m.Step(Event{Now: t0.Add(2 * time.Second), Attach: true})
-
-		acts := m.Step(Event{Now: t0.Add(2*time.Second + cfg.Settle)})
-		checkActions(t, acts, []Action{{Claim: "linux"}})
-	})
-
-	t.Run("settle survives a switch sequence", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, Attach: true}) // settle deadline at t0+2s
-
-		// A state arrives mid-settle and starts a switch; the settle deadline
-		// stays the earliest wake.
-		acts := m.Step(Event{Now: t0.Add(1 * time.Second), State: mkstate("mac", 1, macLive)})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Log: "attempt 1"},
-			{WakeAt: t0.Add(cfg.Settle)},
-		})
-
-		// The settle deadline passes while switching: no claim mid-sequence.
-		acts = m.Step(Event{Now: t0.Add(cfg.Settle)})
-		checkActions(t, acts, []Action{{WakeAt: t0.Add(1*time.Second + SwitchDeadline)}})
-
-		// The interrupted settle fires the claim once the sequence ends (SPEC
-		// §5.4: attach→claim is an independent trigger).
-		acts = m.Step(Event{Now: t0.Add(3 * time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("mac"), Log: "confirmed"},
-			{Claim: "linux"},
-		})
-	})
-
-	t.Run("attach during sequence queued", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-
-		// Attach while switching: queued, the watchdog stays the only wake.
-		acts := m.Step(Event{Now: t0.Add(500 * time.Millisecond), Attach: true})
-		checkActions(t, acts, []Action{{WakeAt: t0.Add(SwitchDeadline)}})
-
-		// The switch lands; the pending attach starts its settle.
-		end := t0.Add(1500 * time.Millisecond)
-		acts = m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("mac"), Log: "confirmed"},
-			{WakeAt: end.Add(cfg.Settle)},
-		})
-
-		acts = m.Step(Event{Now: end.Add(cfg.Settle)})
-		checkActions(t, acts, []Action{{Claim: "linux"}})
-	})
-
-	t.Run("state event during switching is stashed", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-
-		acts := m.Step(Event{Now: t0.Add(2 * time.Second), State: mkstate("win2", 2, map[string]bool{"win2": true})})
-		checkActions(t, acts, []Action{
-			{WakeAt: t0.Add(SwitchDeadline)},
-		})
-		if m.latestState == nil || m.latestState.Owner != "win2" {
-			t.Fatalf("expected latestState stashed to win2, got %+v", m.latestState)
+	t.Run("a host that is not the previous holder only logs", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "third", 3)), at(0)))
+		fail := takesExit(map[state.HoldKey]Outcome{lgKey: {Err: errWrite}})
+		var acts []Action
+		for i := 1; i <= 4; i++ {
+			acts = m.Step(Event{Now: at(2 * i), Exit: fail})
 		}
-
-		// The sequence ends; the stashed state reconciles, behind the cooldown
-		// the switch just started.
-		end := t0.Add(3 * time.Second)
-		acts = m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("mac"), Log: "confirmed"},
-			{Log: "deferring switch to \"win2\""},
-			{WakeAt: end.Add(cfg.Cooldown)},
-		})
+		want(t, acts, "save")
+		wantLog(t, acts, "I am not the previous holder")
 	})
 
-	t.Run("stale epoch still reconciles", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a first take has no previous holder and never notifies", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "", 3)), at(0)))
+		fail := takesExit(map[state.HoldKey]Outcome{lgKey: {Err: errWrite}})
+		var acts []Action
+		for i := 1; i <= 4; i++ {
+			acts = m.Step(Event{Now: at(2 * i), Exit: fail})
+		}
+		want(t, acts, "save")
+	})
 
-		// A state with a lower epoch but a different owner is still a valid
-		// input: clients never compare epochs (SPEC §7).
-		m.Step(Event{Now: t0, State: mkstate("linux", 6, map[string]bool{"linux": true})})
-		acts := m.Step(Event{Now: t0.Add(1 * time.Second), State: mkstate("win2", 2, map[string]bool{"win2": true})})
-		requireActionCount(t, acts, 2)
-		if !acts[0].Deactivate {
-			t.Fatalf("expected switch for lower-epoch win2, got %+v", acts[0])
+	t.Run("one failing take does not skip or fail the rest", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false), screenHold("LG", "mac", "linux", 3)), at(0)))
+		m.Step(Event{Now: at(2), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {Err: errWrite}, lgKey: {}})})
+		m.Step(Event{Now: at(4), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {Err: errWrite}})})
+		m.Step(Event{Now: at(6), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {Err: errWrite}})})
+		acts := m.Step(Event{Now: at(8), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {Err: errWrite}})})
+		want(t, acts, "notify", "save")
+		rec := saved(t, acts)
+		if rec.Seen["screen/LG"] != 3 || rec.Seen["hid/mouse"] != 3 {
+			t.Fatalf("record = %+v", rec)
 		}
 	})
 
-	t.Run("switch watchdog fires and retries", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-
-		watchdogTime := t0.Add(SwitchDeadline)
-		acts := m.Step(Event{Now: watchdogTime})
-		checkActions(t, acts, []Action{
-			{Deactivate: true, Retry: true, Log: "no SwitchExit within 1m0s (lost event or hung child)"},
-			{WakeAt: watchdogTime.Add(SwitchDeadline)},
-		})
-		if !strings.Contains(acts[0].Log, "attempt 1") {
-			t.Fatalf("expected attempt 1 in log, got %q", acts[0].Log)
-		}
-		if !strings.Contains(acts[0].Log, "retry switch to \"mac\" attempt 2") {
-			t.Fatalf("expected retry attempt 2 log, got %q", acts[0].Log)
-		}
+	t.Run("a state during the run is stashed, and reconciled when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		want(t, m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3), hidHold("mouse", "mac", "linux", 4, false)), at(1))), "wake:60")
+		acts := m.Step(Event{Now: at(2), Exit: okAll(lgKey)})
+		want(t, acts, "save", "run:hid/mouse", "wake:62")
 	})
 
-	t.Run("switch watchdog waits for retry spacing", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.RetrySpacing = 70 * time.Second
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a flip back to me during a run of takes activates when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		third := func(owner string, activation int64) *state.ServerState {
+			s := mk(owner, activation, screenHold("LG", "third", "linux", 3))
+			s.Live["third"] = true
+			return s
+		}
+		m.Step(state_(third("third", 2), at(0)))
+		m.Step(Event{Now: at(1), Exit: &Exit{}}) // the deactivation ends, the take starts
+		want(t, m.Step(state_(third("linux", 3), at(2))), "wake:61")
+		acts := m.Step(Event{Now: at(3), Exit: okAll(lgKey)})
+		want(t, acts, "save", "activate:3", "wake:63")
+	})
+}
 
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
+func TestArrival(t *testing.T) {
+	sent := func(t *testing.T) *Machine {
+		t.Helper()
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		want(t, m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false)), at(0))), "run:hid/mouse", "wake:60")
+		return m
+	}
 
-		watchdogTime := t0.Add(SwitchDeadline)
-		acts := m.Step(Event{Now: watchdogTime})
-		requireActionCount(t, acts, 2)
-		if acts[0].Deactivate {
-			t.Fatalf("expected no switch while waiting retry spacing, got %+v", acts[0])
+	t.Run("a sent device waits for its arrival, then is done", func(t *testing.T) {
+		m := sent(t)
+		// Sent at 1 s: the window closes at 11 s.
+		acts := m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		want(t, acts, "wake:11")
+		acts = m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, true)), at(3)))
+		want(t, acts, "save")
+		if rec := saved(t, acts); rec.Seen["hid/mouse"] != 3 {
+			t.Fatalf("record = %+v", rec)
 		}
-		if !strings.Contains(acts[0].Log, "no SwitchExit within 1m0s (lost event or hung child)") {
-			t.Fatalf("expected watchdog log, got %q", acts[0].Log)
-		}
-		if !acts[1].WakeAt.Equal(t0.Add(cfg.RetrySpacing)) {
-			t.Fatalf("expected wake at retry spacing, got %v", acts[1].WakeAt)
-		}
+		// Nothing re-sends it, and no window fires later.
+		want(t, m.Step(Event{Now: at(30)}))
 	})
 
-	t.Run("watchdog exhausts retries and trips breaker", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.SwitchRetries = 0
-		// Watchdog failures are spaced by SwitchDeadline, so widen the breaker
-		// window enough to keep all three failures in the count.
-		cfg.BreakerWindow = 300 * time.Second
-		m := NewMachine(cfg, "linux", true)
+	t.Run("the device is not done on the exit alone", func(t *testing.T) {
+		m := sent(t)
+		m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		// A state that does not show the arrival changes nothing.
+		want(t, m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false)), at(2))), "wake:11")
+	})
 
-		owners := []string{"mac", "win2", "win3", "win4"}
-		base := t0
-		var lastFail time.Time
+	t.Run("an arrival already in the state at the exit is the receipt", func(t *testing.T) {
+		m := sent(t)
+		m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, true)), at(1)))
+		want(t, m.Step(Event{Now: at(2), Exit: okAll(mouseKey)}), "save")
+	})
+
+	t.Run("no arrival within the window re-sends, spaced and counted", func(t *testing.T) {
+		m := sent(t)
+		m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		acts := m.Step(Event{Now: at(11)})
+		want(t, acts, "run:hid/mouse", "wake:71")
+		wantLog(t, acts, "did not arrive")
+	})
+
+	t.Run("never arriving notifies the previous holder after the last retry", func(t *testing.T) {
+		m := sent(t)
+		now := 1
+		m.Step(Event{Now: at(now), Exit: okAll(mouseKey)})
 		for i := 0; i < 3; i++ {
-			m.Step(Event{Now: base, State: mkstate(owners[i], int64(i), map[string]bool{owners[i]: true})})
-
-			lastFail = base.Add(SwitchDeadline)
-			acts := m.Step(Event{Now: lastFail})
-			checkActions(t, acts, []Action{{Notify: true, SaveOwner: ptr(owners[i]), Log: "failed"}})
-			if !strings.Contains(acts[0].Log, "no SwitchExit within 1m0s (lost event or hung child)") {
-				t.Fatalf("attempt %d: expected watchdog log, got %q", i+1, acts[0].Log)
-			}
-
-			// Back to linux so the next transition is away from us.
-			regain(t, m, lastFail.Add(1*time.Second), int64(i)+10)
-			base = lastFail.Add(1*time.Second + cfg.Cooldown + 1*time.Second)
+			now += 10
+			want(t, m.Step(Event{Now: at(now)}), "run:hid/mouse", fmt.Sprintf("wake:%d", now+60))
+			now++
+			want(t, m.Step(Event{Now: at(now), Exit: okAll(mouseKey)}), fmt.Sprintf("wake:%d", now+10))
 		}
-
-		// The fourth transition is refused while the breaker is open.
-		breakerEnd := lastFail.Add(cfg.BreakerOpenFor)
-		acts := m.Step(Event{Now: base, State: mkstate(owners[3], 3, map[string]bool{owners[3]: true})})
-		checkActions(t, acts, []Action{
-			{Log: "breaker"},
-			{WakeAt: breakerEnd},
-		})
+		now += 10
+		acts := m.Step(Event{Now: at(now)})
+		want(t, acts, "notify", "save")
+		wantLog(t, acts, "did not arrive")
 	})
 
-	t.Run("late SwitchExit ignored", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("a take superseded while awaiting is dropped, and its successor is pending", func(t *testing.T) {
+		m := sent(t)
+		m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		// The successor appears while the mouse awaits: the old take is dropped
+		// and the batch ends at once, without marking the new seq seen.
+		acts := m.Step(state_(mk("mac", 2, hidHold("mouse", "linux", "mac", 4, false)), at(2)))
+		want(t, acts, "save")
+		wantLog(t, acts, "a newer take replaced it")
+		if rec := saved(t, acts); rec.Seen["hid/mouse"] != 3 {
+			t.Fatalf("record = %+v, want the old seq handled and the new one not", rec)
+		}
+		// The new holder is me: nothing to run for it, and no window fires.
+		want(t, m.Step(Event{Now: at(12)}))
+	})
 
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		m.Step(Event{Now: t0.Add(2 * time.Second), SwitchExit: exit(nil)})
+	t.Run("a superseding take by another host runs after the cooldown", func(t *testing.T) {
+		m := sent(t)
+		m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		third := mk("mac", 2, hidHold("mouse", "third", "mac", 4, false))
+		third.Live["third"] = true
+		// The batch ends at 2 s; the mouse cooled down for 5 s since.
+		acts := m.Step(state_(third, at(2)))
+		want(t, acts, "save", "wake:7")
+		wantLog(t, acts, "cooldown")
+		want(t, m.Step(Event{Now: at(6)}), "wake:7")
+		want(t, m.Step(Event{Now: at(7)}), "run:hid/mouse", "wake:67")
+	})
 
-		acts := m.Step(Event{Now: t0.Add(3 * time.Second), SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{{Log: "ignoring late SwitchExit"}})
-		if acts[0].Deactivate || acts[0].Notify || acts[0].SaveOwner != nil {
-			t.Fatalf("expected only log action, got %+v", acts[0])
+	t.Run("a failed take superseded before its retry is not re-run", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false)), at(0)))
+		want(t, m.Step(Event{Now: at(0), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {Err: errWrite}})}), "wake:1")
+		acts := m.Step(state_(mk("mac", 2, hidHold("mouse", "linux", "mac", 4, false)), at(0)))
+		want(t, acts, "save")
+		want(t, m.Step(Event{Now: at(1)}))
+	})
+
+	t.Run("a hold that vanished is superseded", func(t *testing.T) {
+		m := sent(t)
+		m.Step(Event{Now: at(1), Exit: okAll(mouseKey)})
+		want(t, m.Step(state_(mk("mac", 2), at(2))), "save")
+	})
+
+	t.Run("a screen failing while a device awaits retries without waiting for the window", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false), screenHold("LG", "mac", "linux", 3)), at(0)))
+		acts := m.Step(Event{Now: at(0), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {}, lgKey: {Err: errWrite}})})
+		want(t, acts, "wake:1")
+		acts = m.Step(Event{Now: at(1)})
+		want(t, acts, "run:screen/LG", "wake:10")
+		acts = m.Step(Event{Now: at(2), Exit: takesExit(map[state.HoldKey]Outcome{lgKey: {}})})
+		want(t, acts, "wake:10")
+		want(t, m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, true), screenHold("LG", "mac", "linux", 3)), at(3))), "save")
+	})
+
+	t.Run("a device already on the holder is never sent", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		acts := m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, true)), at(0)))
+		want(t, acts, "save")
+	})
+}
+
+func TestCooldownAndBreaker(t *testing.T) {
+	handled := func(m *Machine, sec int, holds ...state.Hold) []Action {
+		return m.Step(state_(mk("mac", 2, holds...), at(sec)))
+	}
+
+	t.Run("cooldown is per name", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		handled(m, 0, screenHold("LG", "mac", "linux", 3))
+		m.Step(Event{Now: at(1), Exit: okAll(lgKey)})
+		// 2 s later: the screen cooled down until 6 s, the mouse did not.
+		acts := handled(m, 3, screenHold("LG", "mac", "linux", 4), hidHold("mouse", "mac", "linux", 4, false))
+		want(t, acts, "run:hid/mouse", "wake:63")
+		m.Step(Event{Now: at(4), Exit: takesExit(map[state.HoldKey]Outcome{mouseKey: {NotHere: true}})})
+		// The cooled screen runs when the cooldown ends.
+		want(t, m.Step(Event{Now: at(5)}), "wake:6")
+		want(t, m.Step(Event{Now: at(6)}), "run:screen/LG", "wake:66")
+	})
+
+	t.Run("three takes of one name in 30 s open the breaker for every name", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		seq := state.Seq(3)
+		for i, sec := range []int{0, 6, 12} {
+			acts := handled(m, sec, screenHold("LG", "mac", "linux", seq+state.Seq(i)))
+			want(t, acts, "run:screen/LG", fmt.Sprintf("wake:%d", sec+60))
+			m.Step(Event{Now: at(sec + 1), Exit: okAll(lgKey)})
+		}
+		// The third ended at 13 s: the breaker is open until 73 s.
+		acts := handled(m, 20, hidHold("mouse", "mac", "linux", 9, false))
+		want(t, acts, "wake:73")
+		wantLog(t, acts, "breaker open")
+		want(t, m.Step(Event{Now: at(72)}), "wake:73")
+		want(t, m.Step(Event{Now: at(73)}), "run:hid/mouse", "wake:133")
+	})
+
+	t.Run("takes spread beyond the window never trip it", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		for i, sec := range []int{0, 20, 40, 60, 80} {
+			acts := handled(m, sec, screenHold("LG", "mac", "linux", state.Seq(3+i)))
+			want(t, acts, "run:screen/LG", fmt.Sprintf("wake:%d", sec+60))
+			m.Step(Event{Now: at(sec + 1), Exit: okAll(lgKey)})
 		}
 	})
 
-	t.Run("WakeAt is a standalone tail action", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
+	t.Run("the breaker never blocks an activation or a deactivation", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		for i, sec := range []int{0, 6, 12} {
+			handled(m, sec, screenHold("LG", "mac", "linux", state.Seq(3+i)))
+			m.Step(Event{Now: at(sec + 1), Exit: okAll(lgKey)})
+		}
+		want(t, m.Step(state_(mk("linux", 3), at(14))), "activate:3", "wake:74")
+	})
+}
 
-		// The switch batch ends with a WakeAt-only action: the watchdog.
-		acts := m.Step(Event{Now: t0, State: mkstate("mac", 1, macLive)})
-		requireActionCount(t, acts, 2)
-		if !acts[0].Deactivate || !acts[0].WakeAt.IsZero() {
-			t.Fatalf("expected a switch carrying no WakeAt, got %+v", acts[0])
-		}
-		wake := acts[1]
-		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(t0.Add(SwitchDeadline)) {
-			t.Fatalf("expected wake at switch deadline, got %+v", wake)
-		}
-		if wake.Claim != "" || wake.Deactivate || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
-			t.Fatalf("expected WakeAt-only action, got %+v", wake)
-		}
+// Only takes this host attempted to move count for the cooldown and the
+// breaker: the peripheral that carried the gesture is NotHere on every
+// handover, and neither is a write.
+func TestCooldownCountsOnlyAttempts(t *testing.T) {
+	notHere := takesExit(map[state.HoldKey]Outcome{lgKey: {NotHere: true}})
+	hold := func(seq state.Seq) *state.ServerState { return mk("mac", 2, screenHold("LG", "mac", "linux", seq)) }
 
-		// A bare timer at the switch deadline fires the watchdog; the batch again
-		// ends with a standalone WakeAt.
-		watchdogTime := t0.Add(SwitchDeadline)
-		acts = m.Step(Event{Now: watchdogTime})
-		requireActionCount(t, acts, 2)
-		wake = acts[1]
-		if wake.WakeAt.IsZero() || !wake.WakeAt.Equal(watchdogTime.Add(SwitchDeadline)) {
-			t.Fatalf("expected wake at next switch deadline, got %+v", wake)
-		}
-		if wake.Claim != "" || wake.Deactivate || wake.Notify || wake.SaveOwner != nil || wake.Log != "" {
-			t.Fatalf("expected WakeAt-only action, got %+v", wake)
-		}
-
-		// A sequence that ends with nothing pending emits no WakeAt at all.
-		acts = m.Step(Event{Now: watchdogTime.Add(time.Second), SwitchExit: exit(nil)})
-		for _, a := range acts {
-			if !a.WakeAt.IsZero() {
-				t.Fatalf("expected no WakeAt once idle, got %+v", a)
+	t.Run("nothing to move starts no cooldown and never trips the breaker", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		for i, sec := range []int{0, 1, 2, 3} {
+			// Each take follows the previous at once: no cooldown defers it.
+			want(t, m.Step(state_(hold(state.Seq(3+i)), at(sec))), "run:screen/LG", fmt.Sprintf("wake:%d", sec+60))
+			acts := m.Step(Event{Now: at(sec), Exit: notHere})
+			want(t, acts, "save")
+			if rec := saved(t, acts); rec.Seen["screen/LG"] != state.Seq(3+i) {
+				t.Fatalf("a NotHere take must still be marked seen: %+v", rec)
 			}
+		}
+		if !m.breakerOpenUntil.IsZero() {
+			t.Fatalf("breaker open until %v", m.breakerOpenUntil)
+		}
+	})
+
+	t.Run("a failed write starts the cooldown and counts", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(hold(3), at(0)))
+		fail := takesExit(map[state.HoldKey]Outcome{lgKey: {Err: errWrite}})
+		for _, sec := range []int{2, 4, 6, 8} {
+			m.Step(Event{Now: at(sec), Exit: fail})
+		}
+		if got := m.cooldownUntil[lgKey]; !got.Equal(at(13)) {
+			t.Fatalf("cooldown until %v, want %v", got, at(13))
+		}
+		if len(m.completed[lgKey]) != 1 {
+			t.Fatalf("breaker count = %d, want 1", len(m.completed[lgKey]))
+		}
+		want(t, m.Step(state_(hold(4), at(9))), "wake:13")
+	})
+
+	t.Run("a take whose run never reported counts", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(hold(3), at(0)))
+		m.Step(Event{Now: at(60)})
+		m.Step(Event{Now: at(120)})
+		m.Step(Event{Now: at(180)})
+		m.Step(Event{Now: at(240)})
+		if got := m.cooldownUntil[lgKey]; !got.Equal(at(245)) || len(m.completed[lgKey]) != 1 {
+			t.Fatalf("cooldown %v, count %d; want a counted take", got, len(m.completed[lgKey]))
+		}
+	})
+
+	t.Run("a take missing from the exit counts", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(hold(3), at(0)))
+		for _, sec := range []int{2, 4, 6, 8} {
+			m.Step(Event{Now: at(sec), Exit: takesExit(map[state.HoldKey]Outcome{})})
+		}
+		if len(m.completed[lgKey]) != 1 {
+			t.Fatalf("breaker count = %d, want 1", len(m.completed[lgKey]))
+		}
+	})
+
+	t.Run("superseded before any run reported it as attempted does not count", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(hold(3), at(0)))
+		m.Step(state_(hold(4), at(1))) // the run is still outstanding
+		want(t, m.Step(Event{Now: at(2), Exit: notHere}), "save", "run:screen/LG", "wake:62")
+		if len(m.completed[lgKey]) != 0 || !m.cooldownUntil[lgKey].IsZero() {
+			t.Fatalf("cooldown %v, count %d; want neither", m.cooldownUntil[lgKey], len(m.completed[lgKey]))
+		}
+	})
+
+	t.Run("a mixed batch gates only the key that was written", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		s := func(lg, mouse state.Seq) *state.ServerState {
+			return mk("mac", 2, hidHold("mouse", "mac", "linux", mouse, false), screenHold("LG", "mac", "linux", lg))
+		}
+		want(t, m.Step(state_(s(3, 3), at(0))), "run:hid/mouse,screen/LG", "wake:60")
+		want(t, m.Step(Event{Now: at(1), Exit: takesExit(map[state.HoldKey]Outcome{
+			mouseKey: {NotHere: true}, lgKey: {},
+		})}), "save")
+		// Both are taken again at once: the screen cools down, the mouse does not.
+		acts := m.Step(state_(s(4, 4), at(2)))
+		want(t, acts, "run:hid/mouse", "wake:62")
+		wantLog(t, acts, "deferring take of screen/LG")
+		if len(m.completed[mouseKey]) != 0 || len(m.completed[lgKey]) != 1 {
+			t.Fatalf("breaker counts: mouse %d, LG %d; want 0 and 1", len(m.completed[mouseKey]), len(m.completed[lgKey]))
 		}
 	})
 }
 
-// TestMachineSequenceEndLastOwner pins the fix for the stale lastOwner bug:
-// when a sequence ends with an attach queued, postSequence starts a settle
-// and lastOwner must still track the persisted SaveOwner. A state event for
-// the same owner during the settle must not re-reconcile (no second switch).
-func TestMachineSequenceEndLastOwner(t *testing.T) {
-	t0 := time.Unix(1000, 0)
+func TestWatchdogAndLateExits(t *testing.T) {
+	t.Run("a lost Exit of a take counts as a failed attempt", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		want(t, m.Step(Event{Now: at(59)}), "wake:60")
+		acts := m.Step(Event{Now: at(60)})
+		want(t, acts, "run:screen/LG", "wake:120")
+		wantLog(t, acts, "no Exit within 1m0s")
+	})
 
-	// afterEnd checks the common tail: settle started, same-owner state is
-	// not re-reconciled, and the settle still claims.
-	afterEnd := func(t *testing.T, m *Machine, cfg MachineConfig, end time.Time) {
-		t.Helper()
-		acts := m.Step(Event{Now: end.Add(500 * time.Millisecond), State: mkstate("mac", 9, map[string]bool{"mac": true})})
-		checkActions(t, acts, []Action{
-			{Log: "not me"},
-			{WakeAt: end.Add(cfg.Settle)},
-		})
-		acts = m.Step(Event{Now: end.Add(cfg.Settle)})
-		checkActions(t, acts, []Action{{Claim: "linux"}})
+	t.Run("a lost Exit of a take exhausts the attempts and notifies", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		want(t, m.Step(Event{Now: at(60)}), "run:screen/LG", "wake:120")
+		want(t, m.Step(Event{Now: at(120)}), "run:screen/LG", "wake:180")
+		want(t, m.Step(Event{Now: at(180)}), "run:screen/LG", "wake:240")
+		want(t, m.Step(Event{Now: at(240)}), "notify", "save")
+	})
+
+	t.Run("a lost Exit of a command is retried", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		acts := m.Step(Event{Now: at(60)})
+		want(t, acts, "deactivate+retry", "wake:120")
+	})
+
+	t.Run("an Exit with no run outstanding is ignored", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		acts := m.Step(Event{Now: at(0), Exit: &Exit{}})
+		want(t, acts)
+		wantLog(t, acts, "ignoring late")
+	})
+
+	t.Run("an Exit after its batch ended is ignored", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		m.Step(Event{Now: at(1), Exit: okAll(lgKey)})
+		acts := m.Step(Event{Now: at(2), Exit: okAll(lgKey)})
+		want(t, acts)
+		wantLog(t, acts, "ignoring late")
+	})
+
+	t.Run("a command Exit during a run of takes is ignored", func(t *testing.T) {
+		m := newMachine("linux", agentAt("mac", 2, nil))
+		m.Step(state_(mk("mac", 2, screenHold("LG", "mac", "linux", 3)), at(0)))
+		acts := m.Step(Event{Now: at(1), Exit: &Exit{}})
+		wantLog(t, acts, "ignoring late or mismatched")
+		want(t, m.Step(Event{Now: at(2), Exit: okAll(lgKey)}), "save")
+	})
+
+	t.Run("a takes Exit during a command is ignored", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		acts := m.Step(Event{Now: at(1), Exit: okAll(lgKey)})
+		wantLog(t, acts, "ignoring late or mismatched")
+		want(t, m.Step(Event{Now: at(2), Exit: &Exit{}}), "save")
+	})
+}
+
+func TestAttachSettle(t *testing.T) {
+	t.Run("a stable attach claims after the settle", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		want(t, m.Step(Event{Now: at(0), Attach: true}), "wake:2")
+		want(t, m.Step(Event{Now: at(1)}), "wake:2")
+		want(t, m.Step(Event{Now: at(2)}), "claim:linux")
+		want(t, m.Step(Event{Now: at(3)}))
+	})
+
+	t.Run("a flapping attach restarts the settle", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(Event{Now: at(0), Attach: true})
+		want(t, m.Step(Event{Now: at(1), Attach: true}), "wake:3")
+		want(t, m.Step(Event{Now: at(2)}), "wake:3")
+		want(t, m.Step(Event{Now: at(3)}), "claim:linux")
+	})
+
+	t.Run("an attach during a deactivation settles when it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(state_(mk("mac", 2), at(0)))
+		want(t, m.Step(Event{Now: at(1), Attach: true}), "wake:60")
+		want(t, m.Step(Event{Now: at(5), Exit: &Exit{}}), "save", "wake:7")
+		want(t, m.Step(Event{Now: at(7)}), "claim:linux")
+	})
+
+	t.Run("a settle that elapsed during a deactivation fires once it ends", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.Step(Event{Now: at(0), Attach: true})
+		m.Step(state_(mk("mac", 2), at(1)))
+		// The settle is due at 2 s but a deactivation runs.
+		want(t, m.Step(Event{Now: at(2)}), "wake:61")
+		acts := m.Step(Event{Now: at(3), Exit: &Exit{}})
+		want(t, acts, "save", "claim:linux")
+	})
+
+	t.Run("a claim is not blocked by the cooldown or the breaker", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		m.breakerOpenUntil = at(100)
+		m.Step(Event{Now: at(0), Attach: true})
+		want(t, m.Step(Event{Now: at(2)}), "claim:linux")
+	})
+
+	t.Run("a stale epoch still reconciles", func(t *testing.T) {
+		m := newMachine("linux", agentAt("linux", 1, nil))
+		s := mk("linux", 1)
+		s.Epoch = 1
+		want(t, m.Step(state_(s, at(0))))
+		s2 := mk("mac", 2)
+		s2.Epoch = 0 // the server's state was restored from a backup
+		want(t, m.Step(state_(s2, at(1))), "deactivate", "wake:61")
+	})
+}
+
+func TestWakeAt(t *testing.T) {
+	// WakeAt is its own action, the tail of the batch, at most once.
+	m := newMachine("linux", agentAt("mac", 2, nil))
+	m.Step(Event{Now: at(0), Attach: true})
+	acts := m.Step(state_(mk("mac", 2, hidHold("mouse", "mac", "linux", 3, false), screenHold("LG", "mac", "linux", 3)), at(1)))
+	n := 0
+	for i, a := range acts {
+		if !a.WakeAt.IsZero() {
+			n++
+			if i != len(acts)-1 {
+				t.Errorf("WakeAt at %d of %d, want the tail", i, len(acts))
+			}
+			if a.Claim != "" || a.Run != nil || a.Save != nil || a.Log != "" {
+				t.Errorf("WakeAt shares an action: %+v", a)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d WakeAt actions, want 1: %+v", n, acts)
+	}
+	// The earliest deadline wins: the settle at 2 s, not the watchdog.
+	if !acts[len(acts)-1].WakeAt.Equal(at(2)) {
+		t.Fatalf("WakeAt = %v, want %v", acts[len(acts)-1].WakeAt, at(2))
 	}
 
-	t.Run("sequence success with queued attach", func(t *testing.T) {
-		cfg := testConfig("linux")
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
-		m.Step(Event{Now: t0.Add(3 * time.Second), Attach: true}) // queued
-
-		end := t0.Add(4 * time.Second)
-		acts := m.Step(Event{Now: end, SwitchExit: exit(nil)})
-		checkActions(t, acts, []Action{
-			{SaveOwner: ptr("mac"), Log: "confirmed"},
-			{WakeAt: end.Add(cfg.Settle)},
-		})
-		afterEnd(t, m, cfg, end)
-	})
-
-	t.Run("sequence failure with queued attach", func(t *testing.T) {
-		cfg := testConfig("linux")
-		cfg.SwitchRetries = 0
-		m := NewMachine(cfg, "linux", true)
-
-		m.Step(Event{Now: t0, State: mkstate("mac", 1, map[string]bool{"mac": true})})
-		m.Step(Event{Now: t0.Add(3 * time.Second), Attach: true}) // queued
-
-		// The only attempt fails: no retries left.
-		end := t0.Add(6 * time.Second)
-		acts := m.Step(Event{Now: end, SwitchExit: exit(errors.New("still here"))})
-		checkActions(t, acts, []Action{
-			{Notify: true, SaveOwner: ptr("mac"), Log: "failed"},
-			{WakeAt: end.Add(cfg.Settle)},
-		})
-		afterEnd(t, m, cfg, end)
-	})
+	// With nothing pending there is no WakeAt at all.
+	if got := newMachine("linux", agentAt("mac", 2, nil)).Step(Event{Now: at(0)}); len(got) != 0 {
+		t.Fatalf("idle machine returned %+v", got)
+	}
 }
 
 func ExampleMachine_Step() {
-	cfg := MachineConfig{
-		ID:             "linux",
-		Settle:         2 * time.Second,
-		SwitchRetries:  3,
-		RetrySpacing:   1 * time.Second,
-		Cooldown:       5 * time.Second,
-		BreakerWindow:  30 * time.Second,
-		BreakerMax:     3,
-		BreakerOpenFor: 60 * time.Second,
-	}
-	m := NewMachine(cfg, "linux", true)
-	t0 := time.Unix(0, 0)
-
+	m := NewMachine(testConfig("linux"), state.AgentState{LastOwner: "linux"}, true)
 	acts := m.Step(Event{
-		Now: t0,
+		Now: time.Unix(0, 0),
 		State: &state.ServerState{
-			Owner: "mac",
-			Live:  map[string]bool{"mac": true},
+			Owner:      "mac",
+			Activation: 2,
 		},
 	})
 	fmt.Println("action:", acts[0].Deactivate, acts[0].Log)
-	// Output: action: true switching to "mac" attempt 1: ownership transition, winner live, gates clear
+	// Output: action: true deactivating: ownership went to "mac"
 }

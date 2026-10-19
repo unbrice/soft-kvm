@@ -207,20 +207,15 @@ func validateServeArgs(args []string) error {
 
 // validateConnectArgs parses connect's raw argument tokens with the same
 // flag set connectCmd uses and applies everything connect validates after
-// parsing: a non-empty parsed --trigger, the VID:PID list, and the -A/-D
-// commands — at least one, with built-in ones that parse.
+// parsing: a non-empty parsed --trigger, its list, the declarations,
+// and the -A/-D commands with the built-in takes used consistently.
 func validateConnectArgs(args []string) error {
 	fs, v := newConnectFlagSet()
 	if err := parseArgs(fs, args); err != nil {
 		return err
 	}
-	if *v.trigger == "" {
-		return errors.New("connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
-	}
-	if _, err := detect.NewDetector(*v.trigger); err != nil {
-		return err
-	}
-	return validateCommands(fs, v)
+	_, err := validateConnect(fs, v)
+	return err
 }
 
 // validateServeInstall is pure — everything it reads is a parameter — so
@@ -280,7 +275,8 @@ export SOFTKVM_TOKEN=$(openssl rand -hex 32)
 # soft-kvm serve --help and soft-kvm connect --help list the flags.
 soft-kvm detect   # prints the connect command that fits this host
 soft-kvm serve    # then, in one terminal; and in another:
-soft-kvm connect --trigger VID:PID -D 'screen-switch DP1_HDMI_ETC'
+soft-kvm connect --trigger KEYBOARD --declare-hid 'KEYBOARD VID:PID' \
+  --declare-screen 'NAME INPUT' -A take-screen
 
 # INSTALL COORDINATOR on an always-on host of your LAN, as root; hosts
 # that only run an agent skip it. This command installs
@@ -291,8 +287,9 @@ sudo --preserve-env=SOFTKVM_TOKEN \
 # INSTALL AGENT on every host, as your regular user. This command writes
 # ~/.config/soft-kvm/env and a user unit that runs the binary you invoke
 # it with.
-/usr/local/bin/soft-kvm service install connect --trigger VID:PID \
-  -D 'screen-switch DP1_HDMI_ETC'
+/usr/local/bin/soft-kvm service install connect \
+  --trigger KEYBOARD --declare-hid 'KEYBOARD VID:PID' \
+  --declare-screen 'NAME INPUT' -A take-screen
 
 # Optional, once the services are installed:
 
