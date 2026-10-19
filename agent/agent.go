@@ -42,8 +42,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// DefaultSwitchTimeout bounds one SWITCH-CMD run. A hung I²C write must not
-// freeze the agent (§4.3).
+// DefaultSwitchTimeout bounds one --on-activation or --on-deactivation command
+// run. A hung I²C write must not freeze the agent (§4.3).
 const DefaultSwitchTimeout = 30 * time.Second
 
 const (
@@ -128,7 +128,11 @@ type Config struct {
 	Runner         Runner
 	Machine        *model.MachineConfig
 	AgentStatePath string
-	SwitchCommands [][]string
+	// OnActivation runs when this host becomes the owner, OnDeactivation when
+	// it stops being the owner; each is an ordered list of argv slices
+	// (SPEC §4.3, §5.4). Either may be empty.
+	OnActivation   [][]string
+	OnDeactivation [][]string
 	// ScreenRunner is the Runner the built-in screen-switch command drives
 	// its backend through; it reads the child's output (SPEC §5.6).
 	ScreenRunner  screen.Runner
@@ -179,9 +183,9 @@ type agent struct {
 	// hid-switch command carries no explicit host=N — the two run on
 	// different goroutines, so it is atomic rather than a plain field.
 	ownerChannel atomic.Uint32
-	// switchDone marks the switch commands that already succeeded in the
-	// current sequence. Only the action worker touches it.
-	switchDone []bool
+	// activation and deactivation are the two command lists with their
+	// progress in the current sequence. Only the action worker touches them.
+	activation, deactivation commands
 }
 
 // newBackoff returns a backoff using the configured base.
@@ -207,6 +211,8 @@ func Run(ctx context.Context, cfg Config) error {
 	m := model.NewMachine(*cfg.Machine, as.LastOwner, hasRecord)
 
 	a := &agent{cfg: cfg}
+	a.activation.argv = cfg.OnActivation
+	a.deactivation.argv = cfg.OnDeactivation
 	a.actionCh = make(chan effect, 2)
 	a.results = make(chan model.Event, 1)
 
@@ -349,11 +355,7 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 					slog.Debug("claim already in flight, coalesced", "id", act.Claim)
 				}
 			}
-			if act.Switch {
-				e := effectSwitch
-				if act.Retry {
-					e = effectSwitchRetry
-				}
+			if e, ok := commandEffect(act); ok {
 				select {
 				case a.actionCh <- e:
 				case <-ctx.Done():

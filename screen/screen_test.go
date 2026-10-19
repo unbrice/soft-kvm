@@ -140,7 +140,10 @@ Display 2
    I2C bus:  /dev/i2c-8
    Monitor:                 ACI:PA278QV:
 `
-	got := parseDetect([]byte(out))
+	got, unreachable := parseDetect([]byte(out))
+	if dell := (Display{Mfg: "DEL", Model: "DELL U2720Q"}); len(unreachable) != 1 || unreachable[0] != dell {
+		t.Errorf("parseDetect unreachable = %+v, want %+v", unreachable, dell)
+	}
 	want := []Display{{Mfg: "GSM", Model: "LG ULTRAWIDE"}, {Mfg: "ACI", Model: "PA278QV"}}
 	if len(got) != len(want) {
 		t.Fatalf("parseDetect found %d displays, want %d: %+v", len(got), len(want), got)
@@ -150,8 +153,8 @@ Display 2
 			t.Errorf("display %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	if got := parseDetect([]byte("No displays found.\n")); len(got) != 0 {
-		t.Errorf("parseDetect on no displays = %+v, want none", got)
+	if got, unreachable := parseDetect([]byte("No displays found.\n")); len(got)+len(unreachable) != 0 {
+		t.Errorf("parseDetect on no displays = %+v / %+v, want none", got, unreachable)
 	}
 }
 

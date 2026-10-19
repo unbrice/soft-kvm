@@ -220,6 +220,9 @@ type Report struct {
 	Backend  string // the program screen-switch delegates to on this OS
 	Err      error  // why the backend is unusable; nil when it answered
 	Displays []Display
+	// Unreachable are monitors known by their EDID alone: they do not answer
+	// DDC, so only Mfg and Model are set.
+	Unreachable []Display
 }
 
 // parseInputSource reads the value out of `ddcutil --terse getvcp 60`, e.g.
@@ -239,29 +242,35 @@ func parseInputSource(out []byte) (uint8, bool) {
 	return 0, false
 }
 
-// parseDetect reads the usable monitors out of `ddcutil detect --terse`: one
-// "Display N" block per monitor that answers DDC, each with a
-// "Monitor: MFG:MODEL:SERIAL" line. "Invalid display" blocks are skipped —
-// they are what the inactive input looks like.
-func parseDetect(out []byte) []Display {
-	var displays []Display
-	valid := false
+// parseDetect reads the monitors out of `ddcutil detect --terse`, each block
+// carrying a "Monitor: MFG:MODEL:SERIAL" line: the "Display N" blocks answer
+// DDC, the "Invalid display" ones do not — a monitor on another input, one
+// with DDC/CI off, an I²C bus this user may not open, a laptop panel.
+func parseDetect(out []byte) (displays, unreachable []Display) {
+	var into *[]Display
 	for line := range strings.Lines(string(out)) {
 		if line == strings.TrimLeft(line, " \t") { // a block header
-			valid = strings.HasPrefix(line, "Display ")
+			switch {
+			case strings.HasPrefix(line, "Display "):
+				into = &displays
+			case strings.HasPrefix(line, "Invalid display"):
+				into = &unreachable
+			default:
+				into = nil
+			}
 			continue
 		}
 		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Monitor:")
-		if !ok || !valid {
+		if !ok || into == nil {
 			continue
 		}
 		f := strings.SplitN(strings.TrimSpace(rest), ":", 3)
 		if len(f) < 2 {
 			continue
 		}
-		displays = append(displays, Display{Mfg: f[0], Model: f[1]})
+		*into = append(*into, Display{Mfg: f[0], Model: f[1]})
 	}
-	return displays
+	return displays, unreachable
 }
 
 // The confirm window: how long the monitor may keep answering on this input

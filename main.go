@@ -22,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/unbrice/soft-kvm/agent"
 	"github.com/unbrice/soft-kvm/client"
@@ -76,7 +77,11 @@ func newLogHandler(w *os.File, level slog.Leveler) slog.Handler {
 func printFlags(fs *flag.FlagSet, w io.Writer) {
 	fs.VisitAll(func(f *flag.Flag) {
 		name, usage := flag.UnquoteUsage(f)
-		decl := "  --" + f.Name
+		dash := "--"
+		if len(f.Name) == 1 {
+			dash = "-"
+		}
+		decl := "  " + dash + f.Name
 		if name != "" {
 			decl += " " + name
 		}
@@ -150,7 +155,7 @@ func usageTo(w io.Writer) {
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
-  connect [flags] -- CMD ARGS... [-- CMD ARGS...]
+  connect --trigger VID:PID[:SLOT][,...] [-A COMMAND]... [-D COMMAND]... [flags]
   detect
   hid-switch VID:PID[:SLOT] host=N
   screen-switch INPUT [TABLE] [display=MATCH]
@@ -159,9 +164,11 @@ func usageTo(w io.Writer) {
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
 serve, activate and connect; detect, hid-switch and screen-switch need no
 token. SOFTKVM_SERVER overrides server discovery (SPEC §5); SOFTKVM_LOG=debug
-turns on debug logs. connect switch commands named "hid-switch" and
-"screen-switch" are built in, not exec'd (SPEC §5.5, §5.6); detect prints the
-ones that fit this host.`)
+turns on debug logs. connect's -A (--on-activation) and -D (--on-deactivation)
+commands run when this host becomes, or stops being, the active one; each is
+one quoted string, split into an argv without a shell (SPEC §5.4, §9). Commands
+named "hid-switch" and "screen-switch" are built in, not exec'd (SPEC §5.5,
+§5.6); detect prints the ones that fit this host.`)
 }
 
 // checkToken applies the shared-secret length rules. The TLS identity and
@@ -380,15 +387,17 @@ func activateCmd(ctx context.Context) error {
 
 // connectFlags holds the values bound by newConnectFlagSet.
 type connectFlags struct {
-	id            *string
-	serverFlag    *string
-	trigger       *string
-	settle        *time.Duration
-	switchRetries *int
-	switchTimeout *time.Duration
-	notifyCmd     *string
-	noGuards      bool
-	displayMatch  string
+	id             *string
+	serverFlag     *string
+	trigger        *string
+	settle         *time.Duration
+	switchRetries  *int
+	switchTimeout  *time.Duration
+	notifyCmd      *string
+	onActivation   *commandList
+	onDeactivation *commandList
+	noGuards       bool
+	displayMatch   string
 }
 
 // newConnectFlagSet builds connect's FlagSet and its bound values. connectCmd
@@ -402,16 +411,23 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
 		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID[:SLOT]` filters — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
-		switchRetries: fs.Int("switch-retries", 3, "re-runs of the switch commands that failed before giving up"),
-		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one SWITCH-CMD run, so a hung I²C write cannot freeze the agent"),
-		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the switch still fails after the retries"),
+		switchRetries: fs.Int("switch-retries", 3, "re-runs of the --on-deactivation commands that failed before giving up"),
+		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, so a hung I²C write cannot freeze the agent"),
+		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the --on-deactivation commands still fail after the retries"),
+
+		onActivation:   &commandList{},
+		onDeactivation: &commandList{},
 	}
+	fs.Var(v.onActivation, "on-activation", "run `COMMAND` when this host becomes active; repeat for several, they run in order")
+	fs.Var(v.onActivation, "A", "short for --on-activation `COMMAND`")
+	fs.Var(v.onDeactivation, "on-deactivation", "run `COMMAND` when this host becomes inactive, e.g. 'screen-switch dp1'; repeat for several, they run in order")
+	fs.Var(v.onDeactivation, "D", "short for --on-deactivation `COMMAND`")
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")
 		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: any external)")
 	}
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect [flags] -- CMD ARGS... [-- CMD ARGS...]")
+		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect --trigger VID:PID[:SLOT][,...] [-A COMMAND]... [-D COMMAND]... [flags]")
 		printFlags(fs, fs.Output())
 	}
 	return fs, v
@@ -441,9 +457,8 @@ func connectCmd(ctx context.Context) error {
 	// through screen, which platform cannot import.
 	guard := platform.NewGuard(flags.displayMatch, flags.noGuards, screen.DisplayNames)
 
-	// The trailing commands are argv slices, never shell strings (SPEC §9).
-	switchCommands, err := parseSwitchCommands(fs.Args())
-	if err != nil {
+	// The commands are argv slices, never shell strings (SPEC §9).
+	if err := validateCommands(fs, flags); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
@@ -485,7 +500,8 @@ func connectCmd(ctx context.Context) error {
 		Runner:         platform.Run,
 		Machine:        &machineCfg,
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
-		SwitchCommands: switchCommands,
+		OnActivation:   flags.onActivation.argv,
+		OnDeactivation: flags.onDeactivation.argv,
 		ScreenRunner:   platform.Output,
 		NotifyArgv:     platform.ShellArgv(*flags.notifyCmd),
 		SwitchTimeout:  *flags.switchTimeout,
@@ -496,56 +512,120 @@ func connectCmd(ctx context.Context) error {
 	return agent.Run(ctx, cfg)
 }
 
-// parseSwitchCommands is what connect and the service-install validator both
-// apply to the trailing arguments: at least one switch command — there is no
-// default, since which input to select is this host's wiring and `detect` is
-// what knows it (SPEC §5.4) — and built-in commands that parse.
-func parseSwitchCommands(args []string) ([][]string, error) {
-	cmds, err := splitSwitchCommands(args)
-	if err != nil {
-		return nil, err
+// validateCommands is what connect and the service-install validator both
+// apply once the flags are parsed: no stray positional arguments — the old
+// trailing `-- CMD` form gets a pointer to -D — at least one command, since
+// there is no default (which input to select is this host's wiring, and
+// `detect` is what knows it, SPEC §5.4), and built-in commands that parse.
+func validateCommands(fs *flag.FlagSet, v *connectFlags) error {
+	if args := fs.Args(); len(args) > 0 {
+		return fmt.Errorf("connect: unexpected argument %q: commands are given with -A/--on-activation and -D/--on-deactivation, one quoted string each (e.g. -D 'screen-switch dp1')", args[0])
 	}
-	if len(cmds) == 0 {
-		return nil, errors.New("connect: a switch command is required after `--` (run `soft-kvm detect` to print one for this host)")
+	if len(v.onActivation.argv) == 0 && len(v.onDeactivation.argv) == 0 {
+		return errors.New("connect: at least one of -A/--on-activation and -D/--on-deactivation is required (run `soft-kvm detect` to print one for this host)")
 	}
-	for _, argv := range cmds {
-		switch argv[0] {
-		case "hid-switch":
-			_, err = hidpp.Parse(argv[1:])
-		case "screen-switch":
-			_, err = screen.Parse(argv[1:])
+	for _, list := range []*commandList{v.onActivation, v.onDeactivation} {
+		for _, argv := range list.argv {
+			var err error
+			switch argv[0] {
+			case "hid-switch":
+				_, err = hidpp.Parse(argv[1:])
+			case "screen-switch":
+				_, err = screen.Parse(argv[1:])
+			}
+			if err != nil {
+				return fmt.Errorf("connect: %w", err)
+			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("connect: %w", err)
-		}
 	}
-	return cmds, nil
+	return nil
 }
 
-// splitSwitchCommands splits the trailing arguments on bare "--" tokens: each
-// chunk is one switch command's argv (SPEC §5.4). flag.Parse has already
-// consumed the first "--"; later ones arrive literally. An empty chunk is a
-// user error.
-func splitSwitchCommands(args []string) ([][]string, error) {
-	var cmds [][]string
-	var cur []string
-	for _, arg := range args {
-		if arg == "--" {
-			if len(cur) == 0 {
-				return nil, errors.New("connect: empty switch command (lone `--`)")
+// commandList is a repeatable flag: each use is one command, split into an
+// argv by splitCommand.
+type commandList struct{ argv [][]string }
+
+func (c *commandList) String() string {
+	if c == nil {
+		return ""
+	}
+	parts := make([]string, len(c.argv))
+	for i, argv := range c.argv {
+		parts[i] = strings.Join(argv, " ")
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (c *commandList) Set(v string) error {
+	argv, err := splitCommand(v)
+	if err != nil {
+		return err
+	}
+	c.argv = append(c.argv, argv)
+	return nil
+}
+
+// splitCommand splits one command string into its argv: whitespace separates
+// words; single quotes keep everything literal, double quotes keep it too bar
+// \" and \\, and a backslash outside quotes escapes the next character. There
+// is no expansion of any kind — no variables, globs, substitution or
+// operators — so the result is exactly what is exec'd (SPEC §9).
+func splitCommand(s string) ([]string, error) {
+	var argv []string
+	var cur strings.Builder
+	inWord := false
+	var quote rune // 0, '\'' or '"'
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		switch {
+		case quote == '\'':
+			if r == '\'' {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
 			}
-			cmds = append(cmds, cur)
-			cur = nil
-			continue
+		case quote == '"':
+			switch {
+			case r == '"':
+				quote = 0
+			case r == '\\' && i+1 < len(rs) && (rs[i+1] == '"' || rs[i+1] == '\\'):
+				i++
+				cur.WriteRune(rs[i])
+			default:
+				cur.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			inWord = true
+		case r == '\\':
+			if i+1 == len(rs) {
+				return nil, errors.New("trailing backslash in command")
+			}
+			i++
+			cur.WriteRune(rs[i])
+			inWord = true
+		case unicode.IsSpace(r):
+			if inWord {
+				argv = append(argv, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+		default:
+			cur.WriteRune(r)
+			inWord = true
 		}
-		cur = append(cur, arg)
 	}
-	if len(cur) > 0 {
-		cmds = append(cmds, cur)
-	} else if len(cmds) > 0 {
-		return nil, errors.New("connect: empty switch command (trailing `--`)")
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated %c quote in command", quote)
 	}
-	return cmds, nil
+	if inWord {
+		argv = append(argv, cur.String())
+	}
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, errors.New("empty command")
+	}
+	return argv, nil
 }
 
 func detectCmd(ctx context.Context) error {
@@ -567,7 +647,12 @@ func hidSwitchCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("hid-switch", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID[:SLOT] host=N")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "  VID:PID  a Logitech receiver or peripheral, as soft-kvm detect prints it:")
+		fmt.Fprintln(os.Stderr, "           moves every peripheral still linked to it")
+		fmt.Fprintln(os.Stderr, "  :SLOT    moves only the peripheral in that pairing slot of a receiver")
+		fmt.Fprintln(os.Stderr, "  host=N   the target Easy-Switch channel, as printed on the key (1-3).")
+		fmt.Fprintln(os.Stderr, "           Required by hand; optional after `connect --`, where the")
+		fmt.Fprintln(os.Stderr, "           host taking over publishes its own channel")
 	}
 	if err := parseArgs(fs, os.Args[2:]); err != nil {
 		return err

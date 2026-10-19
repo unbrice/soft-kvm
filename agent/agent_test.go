@@ -166,7 +166,7 @@ func agentTestConfig(t *testing.T, base, statePath string, s *server.Server, det
 		Runner:         runner,
 		Machine:        agentMachineConfig("linux"),
 		AgentStatePath: statePath,
-		SwitchCommands: [][]string{{"switch", "cmd"}},
+		OnDeactivation: [][]string{{"switch", "cmd"}},
 		NotifyArgv:     []string{"notify", "cmd"},
 		SwitchTimeout:  1 * time.Second,
 		GuardPoll:      20 * time.Millisecond,
@@ -251,7 +251,7 @@ func TestAgentSwitchPath(t *testing.T) {
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
 	// A second switch command (e.g. a USB device) runs after the display one.
-	cfg.SwitchCommands = append(cfg.SwitchCommands, []string{"switch", "usb"})
+	cfg.OnDeactivation = append(cfg.OnDeactivation, []string{"switch", "usb"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -269,11 +269,51 @@ func TestAgentSwitchPath(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 runner calls, got %d: %v", len(calls), calls)
 	}
-	if !slices.Equal(calls[0], cfg.SwitchCommands[0]) {
-		t.Errorf("call 0 = %v, want switch %v", calls[0], cfg.SwitchCommands[0])
+	if !slices.Equal(calls[0], cfg.OnDeactivation[0]) {
+		t.Errorf("call 0 = %v, want switch %v", calls[0], cfg.OnDeactivation[0])
 	}
-	if !slices.Equal(calls[1], cfg.SwitchCommands[1]) {
-		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.SwitchCommands[1])
+	if !slices.Equal(calls[1], cfg.OnDeactivation[1]) {
+		t.Errorf("call 1 = %v, want switch %v", calls[1], cfg.OnDeactivation[1])
+	}
+}
+
+// Ownership coming to this host runs --on-activation, and only that: the
+// deactivation commands are for the host that is left (SPEC §4.3).
+func TestAgentActivationPath(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	client := newTestClient(t, testToken)
+
+	if _, err := client.Claim(context.Background(), base, "other", true, 0); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "agent.json")
+	if err := state.Save(statePath, state.AgentState{LastOwner: "other"}); err != nil {
+		t.Fatalf("save agent state: %v", err)
+	}
+
+	det := newFakeDetector()
+	runner := &recordingRunner{}
+	guard := &fakeGuard{ok: true}
+	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
+	cfg.OnActivation = [][]string{{"activate", "cmd"}, {"activate", "usb"}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runAgent(ctx, t, cfg)
+
+	waitForLive(t, s, "linux")
+
+	if _, err := client.Claim(context.Background(), base, "linux", true, 0); err != nil {
+		t.Fatalf("force claim linux: %v", err)
+	}
+
+	waitForLastOwner(t, statePath, "linux")
+	calls := runner.Calls()
+	if !slices.EqualFunc(calls, cfg.OnActivation, slices.Equal[[]string]) {
+		t.Errorf("calls = %v, want exactly the activation commands %v", calls, cfg.OnActivation)
 	}
 }
 
@@ -302,7 +342,7 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 	runner := &recordingRunner{errs: []error{errors.New("monitor still here"), nil, nil}}
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.SwitchCommands = append(cfg.SwitchCommands, []string{"switch", "usb"})
+	cfg.OnDeactivation = append(cfg.OnDeactivation, []string{"switch", "usb"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -316,7 +356,7 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 
 	waitForLastOwner(t, statePath, "other")
 	calls := runner.Calls()
-	want := [][]string{cfg.SwitchCommands[0], cfg.SwitchCommands[1], cfg.SwitchCommands[0]}
+	want := [][]string{cfg.OnDeactivation[0], cfg.OnDeactivation[1], cfg.OnDeactivation[0]}
 	if len(calls) != len(want) {
 		t.Fatalf("expected %d runner calls, got %d: %v", len(want), len(calls), calls)
 	}
@@ -356,7 +396,7 @@ func TestAgentScreenSwitchIsBuiltIn(t *testing.T) {
 	screenRunner := &recordingRunner{errs: []error{nil, errors.New("no DDC reply")}}
 	guard := &fakeGuard{ok: true}
 	cfg := agentTestConfig(t, base, statePath, s, det, guard, runner.run)
-	cfg.SwitchCommands = [][]string{{"screen-switch", "dp1"}}
+	cfg.OnDeactivation = [][]string{{"screen-switch", "dp1"}}
 	cfg.ScreenRunner = func(ctx context.Context, argv []string) ([]byte, error) {
 		return nil, screenRunner.run(ctx, argv)
 	}

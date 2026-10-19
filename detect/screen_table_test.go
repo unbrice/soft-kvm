@@ -9,6 +9,7 @@ package detect
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -21,9 +22,38 @@ func TestScreenCommandVendorTable(t *testing.T) {
 	if got, want := screenCommand(screen.Report{Displays: []screen.Display{lg}}), "screen-switch DP1_HDMI_ETC lg"; got != want {
 		t.Errorf("screenCommand = %q, want %q", got, want)
 	}
-	got := screenCommand(screen.Report{Displays: []screen.Display{lg, dell}})
-	if want := "screen-switch DP1_HDMI_ETC lg 'display=LG ULTRAWIDE'"; got != want {
+	// A monitor that does not answer DDC still names its table, ahead of a
+	// panel that maps to none.
+	unreachable := screen.Report{Err: errors.New("denied"), Unreachable: []screen.Display{dell, lg}}
+	if got, want := screenCommand(unreachable), "screen-switch DP1_HDMI_ETC lg"; got != want {
 		t.Errorf("screenCommand = %q, want %q", got, want)
+	}
+	got := screenCommand(screen.Report{Displays: []screen.Display{lg, dell}})
+	if want := `screen-switch DP1_HDMI_ETC lg "display=LG ULTRAWIDE"`; got != want {
+		t.Errorf("screenCommand = %q, want %q", got, want)
+	}
+}
+
+func TestRenderScreenUnreachable(t *testing.T) {
+	var buf bytes.Buffer
+	r := screen.Report{
+		Backend:     "ddcutil",
+		Err:         errors.New("ddcutil: permission denied on /dev/i2c-*."),
+		Unreachable: []screen.Display{{Mfg: "GSM", Model: "LG ULTRAWIDE"}},
+	}
+	if err := renderScreen(&buf, r); err != nil {
+		t.Fatalf("renderScreen: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"port: dp1, hdmi1, hdmi2, usbc1, or a raw",
+		"# Monitor: LG ULTRAWIDE (GSM), mapping table lg.\n" +
+			"soft-kvm screen-switch DP1_HDMI_ETC lg\n" +
+			"# ⚠️ ddcutil: permission denied on /dev/i2c-*.\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
 	}
 }
 
@@ -40,7 +70,7 @@ func TestRenderScreenVendorTable(t *testing.T) {
 	out := buf.String()
 	for _, want := range []string{
 		"# Monitor: LG ULTRAWIDE (GSM), mapping table lg, showing this host on dp1.\n",
-		"# hdmi1, hdmi2, usbc1 — or a raw value",
+		"port: hdmi1, hdmi2, usbc1, or a raw",
 		"\nsoft-kvm screen-switch DP1_HDMI_ETC lg\n",
 	} {
 		if !strings.Contains(out, want) {
