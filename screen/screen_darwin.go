@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen_darwin.go: screen-switch over IOAVService, in-process — write, then
-// confirm the monitor left this input, as on Linux (SPEC §4.3, §5.6).
+// screen_darwin.go: the screen write over IOAVService, in-process, aimed by
+// EDID name (SPEC §4.3, §5.6).
 
 package screen
 
@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 const backend = "IOAVService"
@@ -22,7 +21,7 @@ type monitor struct {
 	svc avService
 }
 
-// monitors opens the external displays screen-switch can drive, named from
+// monitors opens the external displays a write can drive, named from
 // their EDID. Apple's monitors are left out, like the built-in panel: neither
 // has an input to select. The caller closes them.
 func monitors() ([]monitor, error) {
@@ -68,62 +67,29 @@ func DisplayNames() ([]string, error) {
 	return names, nil
 }
 
-// pick finds the one monitor display=MATCH names — a case-insensitive
-// substring of its EDID name — or the only one when no MATCH is given.
-func (s *Switch) pick(ms []monitor) (monitor, error) {
-	var found []monitor
-	var names []string
-	for _, m := range ms {
-		names = append(names, m.Model)
-		if strings.Contains(strings.ToLower(m.Model), strings.ToLower(s.Display)) {
-			found = append(found, m)
-		}
-	}
-	switch {
-	case len(ms) == 0:
-		return monitor{}, errors.New("screen-switch: no external display has an IOAVService")
-	case len(found) == 1:
-		return found[0], nil
-	case len(found) == 0:
-		return monitor{}, fmt.Errorf("screen-switch: no display matches %q among %s",
-			s.Display, strings.Join(names, ", "))
-	default:
-		return monitor{}, fmt.Errorf("screen-switch: %d displays match %q (%s): name one with display=MATCH",
-			len(found), s.Display, strings.Join(names, ", "))
-	}
-}
-
-// Do writes the input over IOAVService and reports whether the monitor moved,
-// by the same receipt as on Linux: this host's own read fails, or reports the
-// target, once the switch landed. run is unused: the DDC/CI exchange happens
+// Do writes w once over IOAVService to the attached monitor named name,
+// ignoring case, and never reads it back (SPEC §4.3). ErrNoDisplay means no
+// attached monitor has the name. run is unused: the DDC/CI exchange happens
 // in-process.
-func (s *Switch) Do(ctx context.Context, _ Runner) error {
+func (w Write) Do(ctx context.Context, _ Runner, name string) error {
 	ms, err := monitors()
 	if err != nil {
-		return fmt.Errorf("screen-switch: %w", err)
+		return fmt.Errorf("screen write: %w", err)
 	}
 	defer closeAll(ms)
-	m, err := s.pick(ms)
+	names := make([]string, len(ms))
+	for i, m := range ms {
+		names[i] = m.Model
+	}
+	i, err := pickByName(names, name)
 	if err != nil {
 		return err
 	}
-	src := s.Table.Source
-	if src == 0 {
-		src = ddcHost
+	w.mustBeValid()
+	if err := ms[i].svc.setVCP(ctx, w.Source, w.VCP, uint16(w.Value)); err != nil {
+		return fmt.Errorf("screen write: %w", err)
 	}
-	if err := m.svc.setVCP(ctx, src, s.Table.VCP, uint16(s.Value)); err != nil {
-		return fmt.Errorf("screen-switch: %w", err)
-	}
-	if err := sleep(ctx, ddcDelay); err != nil {
-		return err
-	}
-	return s.confirm(ctx, func(ctx context.Context) (uint8, bool, error) {
-		v, err := m.svc.getVCP(ctx, inputSourceVCP)
-		if errors.Is(err, errNoReply) {
-			return 0, false, err
-		}
-		return uint8(v), err == nil, nil
-	})
+	return nil
 }
 
 // Probe reports which external monitors IOAVService reaches and the input

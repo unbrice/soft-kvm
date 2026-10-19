@@ -13,7 +13,7 @@ import (
 
 const (
 	DefaultID        = "mac"
-	DefaultNotifyCmd = `osascript -e 'display notification "Press Input on the monitor" with title "soft-kvm"'`
+	DefaultNotifyCmd = `osascript -e 'display notification "Handover failed: switch by hand" with title "soft-kvm"'`
 )
 
 // StateDir is ~/Library/Application Support/soft-kvm (SPEC §4.3).

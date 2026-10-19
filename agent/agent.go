@@ -10,17 +10,22 @@
 //  1. *Machine is owned by the loop goroutine and never shared: it lives on
 //     the loop, not on agent.
 //  2. No event carries a timestamp; the loop stamps Now at processing time.
-//  3. Channels are scoped by freshness (§4.1): attachCh/stateCh are created
-//     per generation; results is run-level, capacity 1; actionCh is run-level,
-//     chan effect, capacity 2 (the worst case is a two-effect batch while an
-//     earlier command still runs). State, result and effect sends are blocking
-//     (must not be lost); attach sends inside a generation are non-blocking
-//     and coalescing (idempotent triggers).
+//  3. Channels are scoped by freshness (§4.1): attachCh/stateCh/arrivalCh are
+//     created per generation; results is run-level, capacity 1; actionCh is
+//     run-level, chan effect, capacity 4 (the worst case is a notification and
+//     the next run in one batch while an earlier effect still runs). State,
+//     result and effect sends are blocking (must not be lost); attach sends
+//     inside a generation are non-blocking and coalescing (idempotent
+//     triggers); arrivalCh is capacity 1 and latest-wins, so the arrival
+//     watcher can never stall the loop.
 //  4. Every goroutine belongs to exactly one errgroup and exits only on its
 //     context or a sentinel. No goroutine outlives run.
-//  5. No blocking I/O on the loop goroutine. Exception: SaveOwner does a small
+//  5. No blocking I/O on the loop goroutine. Exception: Save does a small
 //     atomic file write inline; nothing downstream depends on it synchronously,
 //     and moving it would reorder it against logs for no gain.
+//  6. The loop decides nothing: every decision is a model.Action. The action
+//     worker and the arrival watcher execute and report, and a result is an
+//     ordinary event.
 
 package agent
 
@@ -31,11 +36,11 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
-	"sync/atomic"
 	"time"
 
 	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/discover"
+	"github.com/unbrice/soft-kvm/hidpp"
 	"github.com/unbrice/soft-kvm/model"
 	"github.com/unbrice/soft-kvm/screen"
 	"github.com/unbrice/soft-kvm/state"
@@ -43,8 +48,16 @@ import (
 )
 
 // DefaultSwitchTimeout bounds one --on-activation or --on-deactivation command
-// run. A hung I²C write must not freeze the agent (§4.3).
+// run, and one write of a take. A hung I²C write must not freeze the agent
+// (§4.3).
 const DefaultSwitchTimeout = 30 * time.Second
+
+const (
+	// DefaultArrivalPoll and DefaultArrivalFor are how often, and for how
+	// long after a take, the holder polls a device it took (SPEC §4.3).
+	DefaultArrivalPoll = 1 * time.Second
+	DefaultArrivalFor  = 60 * time.Second
+)
 
 const (
 	// backoffBase and backoffCap bound the exponential backoff with full
@@ -116,6 +129,20 @@ type Guard interface {
 // error, never streamed.
 type Runner func(ctx context.Context, argv []string) error
 
+// ScreenWriter writes w to the attached monitor named name, once. It returns
+// screen.ErrNoDisplay when none has the name. Implemented by screen.Write.Do;
+// a func type for the reason Runner is (SPEC §11.2).
+type ScreenWriter func(ctx context.Context, w screen.Write, name string) error
+
+// DeviceSender sends the device to an Easy-Switch channel. sent is false, with
+// a nil error, when the device is not linked to this host. Implemented by
+// hidpp.Target.Send (SPEC §11.2).
+type DeviceSender func(ctx context.Context, t hidpp.Target, channel uint8) (sent bool, err error)
+
+// DevicePresence reports whether the device is linked to this host.
+// Implemented by hidpp.Target.Present (SPEC §11.2).
+type DevicePresence func(ctx context.Context, t hidpp.Target) (bool, error)
+
 // Config is the wiring the agent loop needs. It contains no policy; that
 // lives in Machine (SPEC §11.3).
 type Config struct {
@@ -130,21 +157,29 @@ type Config struct {
 	AgentStatePath string
 	// OnActivation runs when this host becomes the owner, OnDeactivation when
 	// it stops being the owner; each is an ordered list of argv slices
-	// (SPEC §4.3, §5.4). Either may be empty.
+	// (SPEC §4.3, §5.4). Either may be empty. In OnActivation the argv
+	// take-screen and take-hid run in-process.
 	OnActivation   [][]string
 	OnDeactivation [][]string
-	// ScreenRunner is the Runner the built-in screen-switch command drives
-	// its backend through; it reads the child's output (SPEC §5.6).
-	ScreenRunner  screen.Runner
+	// Screens and HIDs are this host's declarations: what take-screen and
+	// take-hid post, and — for HIDs, by name — how this host reaches a device
+	// another host took (SPEC §5.5, §5.6).
+	Screens []screen.Declaration
+	HIDs    []hidpp.Declaration
+	// WriteScreen, SendHID and HIDPresent are the seams to the monitor and the
+	// peripherals.
+	WriteScreen   ScreenWriter
+	SendHID       DeviceSender
+	HIDPresent    DevicePresence
 	NotifyArgv    []string
 	SwitchTimeout time.Duration
 	GuardPoll     time.Duration
 	BackoffBase   time.Duration
-	Resolver      *discover.Resolver
-	// OwnChannel reports the Easy-Switch channel (1-3) this host occupies on
-	// the trigger peripheral, so a claim can publish it for the loser to
-	// switch towards (SPEC §5.5). nil when there is nothing to ask.
-	OwnChannel func(context.Context) (uint8, error)
+	// ArrivalPoll and ArrivalFor pace the arrival watcher; zero means the
+	// defaults.
+	ArrivalPoll time.Duration
+	ArrivalFor  time.Duration
+	Resolver    *discover.Resolver
 }
 
 func (c Config) switchTimeoutOrDefault() time.Duration {
@@ -161,6 +196,20 @@ func (c Config) guardPollOrDefault() time.Duration {
 	return defaultGuardPoll
 }
 
+func (c Config) arrivalPollOrDefault() time.Duration {
+	if c.ArrivalPoll > 0 {
+		return c.ArrivalPoll
+	}
+	return DefaultArrivalPoll
+}
+
+func (c Config) arrivalForOrDefault() time.Duration {
+	if c.ArrivalFor > 0 {
+		return c.ArrivalFor
+	}
+	return DefaultArrivalFor
+}
+
 func (c Config) backoffBaseOrDefault() time.Duration {
 	if c.BackoffBase > 0 {
 		return c.BackoffBase
@@ -175,16 +224,10 @@ type agent struct {
 	actionCh chan effect
 	results  chan model.Event
 
-	// ownChannel caches this host's own Easy-Switch channel: it is a property
-	// of how the peripheral was paired, so it is read once and kept.
-	ownChannel atomic.Uint32
-	// ownerChannel is the channel last published by whoever owns the display.
-	// Written by the loop as states arrive, read by the action worker when a
-	// hid-switch command carries no explicit host=N — the two run on
-	// different goroutines, so it is atomic rather than a plain field.
-	ownerChannel atomic.Uint32
+	// hids indexes the local device declarations by name.
+	hids map[string]hidpp.Declaration
 	// activation and deactivation are the two command lists with their
-	// progress in the current sequence. Only the action worker touches them.
+	// progress in the current command run. Only the action worker touches them.
 	activation, deactivation commands
 }
 
@@ -208,12 +251,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	// Invariant 1: the Machine lives on the loop goroutine, never on agent.
-	m := model.NewMachine(*cfg.Machine, as.LastOwner, hasRecord)
+	m := model.NewMachine(*cfg.Machine, as, hasRecord)
 
-	a := &agent{cfg: cfg}
+	a := &agent{cfg: cfg, hids: make(map[string]hidpp.Declaration, len(cfg.HIDs))}
+	for _, d := range cfg.HIDs {
+		a.hids[d.Name] = d
+	}
 	a.activation.argv = cfg.OnActivation
 	a.deactivation.argv = cfg.OnDeactivation
-	a.actionCh = make(chan effect, 2)
+	a.actionCh = make(chan effect, 4)
 	a.results = make(chan model.Event, 1)
 
 	return a.run(ctx, m)
@@ -277,7 +323,7 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 	return true
 }
 
-// generation runs one guards-up generation. Its four goroutines share a
+// generation runs one guards-up generation. Its five goroutines share a
 // context cancelled on first error. The only non-nil errors a generation
 // goroutine may return are errGuardsDown and ctx.Err(); transient failures
 // (HTTP, HID) are retried in place. runCtx is the run-level context the loop
@@ -285,13 +331,15 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 func (a *agent) generation(ctx context.Context, m *model.Machine) error {
 	attachCh := make(chan struct{}, 1)
 	stateCh := make(chan *state.ServerState, 1)
+	arrivalCh := make(chan *state.ServerState, 1)
 
 	runCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return a.detectorLoop(ctx, attachCh) })
 	g.Go(func() error { return a.watch(ctx, stateCh) })
 	g.Go(func() error { return a.guardWatch(ctx) })
-	g.Go(func() error { return a.loop(ctx, m, attachCh, stateCh, runCtx) })
+	g.Go(func() error { return a.arrivalWatch(ctx, arrivalCh) })
+	g.Go(func() error { return a.loop(ctx, m, attachCh, stateCh, arrivalCh, runCtx) })
 	return g.Wait()
 }
 
@@ -336,8 +384,16 @@ func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) erro
 // loop is the only goroutine that touches m. It stamps Now at processing time
 // and dispatches the Actions the Machine returns. runCtx is the run-level
 // context claims run under; everything else uses the generation ctx.
-func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, runCtx context.Context) error {
+func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, arrivalCh chan *state.ServerState, runCtx context.Context) error {
 	timer := stoppedTimer()
+	send := func(e effect) error {
+		select {
+		case a.actionCh <- e:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	step := func(ev model.Event) error {
 		ev.Now = time.Now() // the loop is the only clock (§11.3)
 		sawWake := false
@@ -345,8 +401,8 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 			if act.Log != "" {
 				slog.Info(act.Log)
 			}
-			if act.SaveOwner != nil {
-				if err := state.Save(a.cfg.AgentStatePath, state.AgentState{LastOwner: *act.SaveOwner}); err != nil {
+			if act.Save != nil {
+				if err := state.Save(a.cfg.AgentStatePath, *act.Save); err != nil {
 					slog.Error("failed to save agent state", "path", a.cfg.AgentStatePath, "error", err)
 				}
 			}
@@ -356,17 +412,18 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 				}
 			}
 			if e, ok := commandEffect(act); ok {
-				select {
-				case a.actionCh <- e:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := send(e); err != nil {
+					return err
+				}
+			}
+			if len(act.Run) > 0 {
+				if err := send(effect{kind: effectRun, holds: act.Run}); err != nil {
+					return err
 				}
 			}
 			if act.Notify {
-				select {
-				case a.actionCh <- effectNotify:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := send(effect{kind: effectNotify}); err != nil {
+					return err
 				}
 			}
 			if !act.WakeAt.IsZero() {
@@ -395,9 +452,7 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 		case <-attachCh:
 			ev = model.Event{Attach: true}
 		case s := <-stateCh:
-			// Record before stepping: a state that makes this host the loser
-			// can emit a Switch in the same step, and the worker reads this.
-			a.ownerChannel.Store(uint32(s.OwnerChannel))
+			offerLatest(arrivalCh, s)
 			ev = model.Event{State: s}
 		case r := <-a.results:
 			ev = r
@@ -405,6 +460,24 @@ func (a *agent) loop(ctx context.Context, m *model.Machine, attachCh <-chan stru
 		}
 		if err := step(ev); err != nil {
 			return err
+		}
+	}
+}
+
+// offerLatest hands s to the arrival watcher without ever blocking: a state
+// it has not read yet is replaced, since only the newest one matters. The
+// loop is the only sender, so the second send cannot lose a race.
+func offerLatest(ch chan *state.ServerState, s *state.ServerState) {
+	select {
+	case ch <- s:
+	default:
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- s:
+		default:
 		}
 	}
 }
@@ -430,9 +503,8 @@ func (a *agent) claim(ctx context.Context, id string) {
 
 		cctx, cancel := context.WithTimeout(ctx, stateTimeout)
 		claimed := false
-		channel := a.resolveOwnChannel(cctx)
 		for base := range a.cfg.Resolver.Resolve(cctx, a.cfg.ExplicitServer, a.cfg.KeyFP) {
-			changed, err := a.cfg.Client.Claim(cctx, base, id, false, channel)
+			changed, err := a.cfg.Client.Claim(cctx, base, id, false, false)
 			if err != nil {
 				slog.Debug("claim: candidate failed", "base", base, "attempt", attempt+1, "error", err)
 				continue
@@ -452,25 +524,4 @@ func (a *agent) claim(ctx context.Context, id string) {
 			slog.Error("claim: no candidate answered", "attempt", attempt+1)
 		}
 	}
-}
-
-// resolveOwnChannel returns this host's Easy-Switch channel, reading it once
-// and caching it. A failure is logged and returns 0: the claim still goes
-// through, and the peer falls back to an explicit host=N. The read costs one
-// RF round trip, which is why it does not repeat on every claim.
-func (a *agent) resolveOwnChannel(ctx context.Context) uint8 {
-	if v := a.ownChannel.Load(); v != 0 {
-		return uint8(v)
-	}
-	if a.cfg.OwnChannel == nil {
-		return 0
-	}
-	ch, err := a.cfg.OwnChannel(ctx)
-	if err != nil || ch == 0 {
-		slog.Debug("could not read this host's Easy-Switch channel", "error", err)
-		return 0
-	}
-	slog.Info("this host is on Easy-Switch channel", "channel", ch)
-	a.ownChannel.Store(uint32(ch))
-	return ch
 }

@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// screen_linux.go: screen-switch through ddcutil — write, then confirm the
-// monitor left this input (SPEC §4.3, §5.6).
+// screen_linux.go: the screen write through ddcutil, aimed by EDID name
+// (SPEC §4.3, §5.6).
 
 package screen
 
@@ -12,46 +12,60 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
 const backend = "ddcutil"
 
+// drmEDIDs is where the kernel publishes the EDID of every connector. A
+// variable so the tests can point it at a temp dir.
+var drmEDIDs = "/sys/class/drm/*/edid"
+
 // DisplayNames is the macOS guard's presence check. The Linux desktop has no
 // guards (SPEC §6.1), so nothing calls it here.
 func DisplayNames() ([]string, error) { return nil, errors.ErrUnsupported }
 
-func (s *Switch) selector() []string {
-	if s.Display == "" {
-		return nil
+// attachedNames lists the EDID names of the monitors attached now. It reads
+// files only — no DDC traffic — so it costs milliseconds. A connector with no
+// monitor has an empty EDID, and one that does not parse is skipped.
+func attachedNames() []string {
+	paths, _ := filepath.Glob(drmEDIDs)
+	var names []string
+	for _, p := range paths {
+		edid, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if _, name, ok := parseEDID(edid); ok && name != "" {
+			names = append(names, name)
+		}
 	}
-	return []string{"--model", s.Display}
+	return names
 }
 
-// Do writes the input and reports whether the monitor moved. The write is
-// unacknowledged in practice and --noverify is load-bearing — read-back
-// verification fails on firmware that goes silent on the inactive input — so
-// the receipt is this host's own read: it fails, or reports the target, once
-// the switch landed. A non-nil error is a switch that did not land.
-func (s *Switch) Do(ctx context.Context, run Runner) error {
-	argv := []string{backend, "setvcp",
-		fmt.Sprintf("0x%02X", s.Table.VCP), fmt.Sprintf("0x%02X", s.Value), "--noverify"}
-	if s.Table.Source != 0 {
-		argv = append(argv, fmt.Sprintf("--i2c-source-addr=0x%02X", s.Table.Source))
-	}
-	if _, err := run(ctx, append(argv, s.selector()...)); err != nil {
+// Do writes w once to the attached monitor named name, ignoring case, and
+// never reads it back: the monitor's answer is not a receipt (SPEC §4.3).
+// ErrNoDisplay means no attached monitor has the name. --noverify is
+// load-bearing: ddcutil's own verification fails on firmware that goes silent
+// on the input it just left, so a verifying write reports failure after
+// succeeding. The monitor is selected by --model rather than a bus number,
+// which changes on hotplug and across reboots (SPEC §6.1).
+func (w Write) Do(ctx context.Context, run Runner, name string) error {
+	names := attachedNames()
+	i, err := pickByName(names, name)
+	if err != nil {
 		return err
 	}
-
-	read := append([]string{backend, "--terse", "getvcp", "60"}, s.selector()...)
-	return s.confirm(ctx, func(ctx context.Context) (uint8, bool, error) {
-		out, err := run(ctx, read)
-		if err != nil {
-			return 0, false, err
-		}
-		v, ok := parseInputSource(out)
-		return v, ok, nil
-	})
+	argv := []string{backend, "setvcp",
+		fmt.Sprintf("0x%02X", w.VCP), fmt.Sprintf("0x%02X", w.Value), "--noverify"}
+	if w.Source != ddcHost {
+		argv = append(argv, fmt.Sprintf("--i2c-source-addr=0x%02X", w.Source))
+	}
+	w.mustBeValid()
+	_, err = run(ctx, append(argv, "--model", names[i]))
+	return err
 }
 
 // unreachableErr says why no monitor answers DDC although ddcutil exited 0

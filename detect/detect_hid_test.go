@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/telesma-app/hid"
+	"github.com/unbrice/soft-kvm/hidpp"
 )
 
 func dev(path string, vid, pid uint16) *hid.DeviceInfo {
@@ -85,20 +86,23 @@ func TestPresenceRemoveUnknown(t *testing.T) {
 }
 
 func TestParseTriggers(t *testing.T) {
+	named := map[string]hidpp.Target{
+		"ergo-k860": {VID: 0x046d, PID: 0xc52b, Slot: 2},
+		"lift":      {VID: 0x046d, PID: 0xb031},
+	}
 	cases := []struct {
 		in   string
 		want []trigger
 	}{
-		{"046d:c548", []trigger{{vidpid{0x046d, 0xc548}, 0}}},
-		{"046d:c52b:2", []trigger{{vidpid{0x046d, 0xc52b}, 2}}},
-		{"046d:c52b:2,046d:4088", []trigger{
+		{"lift", []trigger{{vidpid{0x046d, 0xb031}, 0}}},
+		{"ergo-k860", []trigger{{vidpid{0x046d, 0xc52b}, 2}}},
+		{" ergo-k860 , lift", []trigger{
 			{vidpid{0x046d, 0xc52b}, 2},
-			{vidpid{0x046d, 0x4088}, 0},
+			{vidpid{0x046d, 0xb031}, 0},
 		}},
-		{" 046d:c52b:6 ", []trigger{{vidpid{0x046d, 0xc52b}, 6}}},
 	}
 	for _, c := range cases {
-		got, err := parseTriggers(c.in)
+		got, err := parseTriggers(c.in, named)
 		if err != nil {
 			t.Errorf("parseTriggers(%q): %v", c.in, err)
 			continue
@@ -110,23 +114,26 @@ func TestParseTriggers(t *testing.T) {
 }
 
 func TestParseTriggersRejects(t *testing.T) {
-	// Slot 0 and slot 7 are outside the addressable pairing range; a slot is
-	// decimal, so "0x2" and hex-looking values must not slip through.
-	for _, in := range []string{
-		"", "046d", "046d:c52b:2:3", "zzzz:c52b", "046d:zzzz",
-		"046d:c52b:0", "046d:c52b:7", "046d:c52b:x", "046d:c52b:",
-	} {
-		if got, err := parseTriggers(in); err == nil {
+	// Only a declared name is a trigger: an address is spelled in its
+	// declaration, never here.
+	named := map[string]hidpp.Target{"lift": {VID: 0x046d, PID: 0xb031}}
+	for _, in := range []string{"", "lift,", "mouse", "046d:b031", "046d:c52b:2", "LIFT"} {
+		if got, err := parseTriggers(in, named); err == nil {
 			t.Errorf("parseTriggers(%q) = %v, want error", in, got)
 		}
 	}
 }
 
-// Each entry must reach the detector that can actually see it: plain VID:PID
-// to the HID watcher, VID:PID:SLOT to the receiver watcher, with slots of one
-// receiver gathered under a single target.
+// Each entry must reach the detector that can actually see it: a device
+// declared by VID:PID to the HID watcher, one declared by VID:PID:SLOT to the
+// receiver watcher, with slots of one receiver gathered under a single target.
 func TestNewDetectorRoutesAndGroups(t *testing.T) {
-	d, err := NewDetector("046d:c548,046d:c52b:2,046d:c52b:1,046d:c548")
+	d, err := NewDetector("dongle,kbd,mouse,dongle-again", map[string]hidpp.Target{
+		"dongle":       {VID: 0x046d, PID: 0xc548},
+		"kbd":          {VID: 0x046d, PID: 0xc52b, Slot: 2},
+		"mouse":        {VID: 0x046d, PID: 0xc52b, Slot: 1},
+		"dongle-again": {VID: 0x046d, PID: 0xc548},
+	})
 	if err != nil {
 		t.Fatalf("NewDetector: %v", err)
 	}

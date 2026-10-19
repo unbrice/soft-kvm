@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -122,10 +123,6 @@ func main() {
 		err = connectCmd(ctx)
 	case "detect":
 		err = detectCmd(ctx)
-	case "hid-switch":
-		err = hidSwitchCmd(ctx)
-	case "screen-switch":
-		err = screenSwitchCmd(ctx)
 	case "service":
 		err = serviceCmd(ctx)
 	default:
@@ -155,20 +152,22 @@ func usageTo(w io.Writer) {
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
-  connect --trigger VID:PID[:SLOT][,...] [-A COMMAND]... [-D COMMAND]... [flags]
+  connect --trigger NAME[,...] [--declare-screen DECL]... [--declare-hid DECL]...
+          [-A COMMAND]... [-D COMMAND]... [flags]
   detect
-  hid-switch VID:PID[:SLOT] host=N
-  screen-switch INPUT [TABLE] [display=MATCH]
   service <install|print|uninstall> [serve|connect] [args]
 
 Flags precede positional arguments. SOFTKVM_TOKEN (env) is required for
-serve, activate and connect; detect, hid-switch and screen-switch need no
-token. SOFTKVM_SERVER overrides server discovery (SPEC §5); SOFTKVM_LOG=debug
-turns on debug logs. connect's -A (--on-activation) and -D (--on-deactivation)
-commands run when this host becomes, or stops being, the active one; each is
-one quoted string, split into an argv without a shell (SPEC §5.4, §9). Commands
-named "hid-switch" and "screen-switch" are built in, not exec'd (SPEC §5.5,
-§5.6); detect prints the ones that fit this host.`)
+serve, activate and connect; detect needs no token. SOFTKVM_SERVER overrides
+server discovery (SPEC §5); SOFTKVM_LOG=debug turns on debug logs. connect's
+-A (--on-activation) and -D (--on-deactivation) commands run when this host
+becomes, or stops being, the owner; each is one quoted string, split into an
+argv without a shell (SPEC §5.4, §9). "take-screen" and "take-hid" are
+commands of the -A list, run at their place in the order; connect runs them
+itself instead of exec'ing them. They post this host's --declare-screen and
+--declare-hid declarations so the other hosts move the monitor and the
+peripherals here (SPEC §5.5, §5.6). -D refuses them: only the owner takes.
+detect prints the connect line that fits this host.`)
 }
 
 // checkToken applies the shared-secret length rules. The TLS identity and
@@ -190,7 +189,7 @@ func checkToken(token string) (string, error) {
 		return "", fmt.Errorf("%w: %d chars is too short, need %d+ (generate one, e.g. `openssl rand -hex 32`)", errToken, len(token), tokenMinLen)
 	}
 	if len(token) < tokenGoodLen {
-		slog.Warn("SOFTKVM_TOKEN is short; prefer a generated token of 32+ chars (SPEC §9)", "length", len(token))
+		slog.Warn("SOFTKVM_TOKEN is short; prefer a generated token of 32+ chars (openssl rand -hex 32)", "length", len(token))
 	}
 	return token, nil
 }
@@ -356,7 +355,7 @@ func activateCmd(ctx context.Context) error {
 	var lastErr error
 	for candidate := range resolver.Resolve(ctx, *serverFlag, identity.KeyFingerprint(token)) {
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ch, err := c.Claim(cctx, candidate, id, *force, 0)
+		ch, err := c.Claim(cctx, candidate, id, *force, true)
 		cancel()
 		if err != nil {
 			if errors.Is(err, client.ErrNoLiveAgent) && !*force {
@@ -381,7 +380,7 @@ func activateCmd(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("owner=%s epoch=%d changed=%v\n", st.Owner, st.Epoch, changed)
+	fmt.Printf("owner=%s epoch=%d activation=%d changed=%v\n", st.Owner, st.Epoch, st.Activation, changed)
 	return nil
 }
 
@@ -394,6 +393,8 @@ type connectFlags struct {
 	switchRetries  *int
 	switchTimeout  *time.Duration
 	notifyCmd      *string
+	declareScreen  *commandList
+	declareHID     *commandList
 	onActivation   *commandList
 	onDeactivation *commandList
 	noGuards       bool
@@ -409,25 +410,29 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	v := &connectFlags{
 		id:            fs.String("id", platform.DefaultID, "claimed identity"),
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
-		trigger:       fs.String("trigger", "", "required: comma-separated `VID:PID[:SLOT]` filters — run soft-kvm detect to list them"),
+		trigger:       fs.String("trigger", "", "required: comma-separated `NAME`s of --declare-hid devices to watch — run soft-kvm detect to list them"),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
-		switchRetries: fs.Int("switch-retries", 3, "re-runs of the --on-deactivation commands that failed before giving up"),
-		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, so a hung I²C write cannot freeze the agent"),
-		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run when the --on-deactivation commands still fail after the retries"),
+		switchRetries: fs.Int("switch-retries", 3, "re-runs of the commands or takes that failed before giving up"),
+		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, and on one write of a take, so a hung I²C write cannot freeze the agent"),
+		notifyCmd:     fs.String("notify-cmd", platform.DefaultNotifyCmd, "command run by the previous holder when a take still fails after the retries"),
 
+		declareScreen:  &commandList{},
+		declareHID:     &commandList{},
 		onActivation:   &commandList{},
 		onDeactivation: &commandList{},
 	}
-	fs.Var(v.onActivation, "on-activation", "run `COMMAND` when this host becomes active; repeat for several, they run in order")
+	fs.Var(v.declareScreen, "declare-screen", "this host shows the monitor `'NAME INPUT [TABLE]'` on INPUT; repeat per monitor; required by take-screen")
+	fs.Var(v.declareHID, "declare-hid", "the device `'NAME VID:PID[:SLOT] [host=N]'` reaches this host, on Easy-Switch channel N; repeat per device; take-hid takes those with a host=N")
+	fs.Var(v.onActivation, "on-activation", "run `COMMAND` when this host becomes the owner; repeat for several, they run in order; take-screen and take-hid are commands of this list only")
 	fs.Var(v.onActivation, "A", "short for --on-activation `COMMAND`")
-	fs.Var(v.onDeactivation, "on-deactivation", "run `COMMAND` when this host becomes inactive, e.g. 'screen-switch dp1'; repeat for several, they run in order")
+	fs.Var(v.onDeactivation, "on-deactivation", "run `COMMAND` when this host stops being the owner; repeat for several, they run in order")
 	fs.Var(v.onDeactivation, "D", "short for --on-deactivation `COMMAND`")
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")
 		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: any external)")
 	}
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect --trigger VID:PID[:SLOT][,...] [-A COMMAND]... [-D COMMAND]... [flags]")
+		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect --trigger NAME[,...] [--declare-screen DECL]... [--declare-hid DECL]... [-A COMMAND]... [-D COMMAND]... [flags]")
 		printFlags(fs, fs.Output())
 	}
 	return fs, v
@@ -438,16 +443,13 @@ func connectCmd(ctx context.Context) error {
 	if err := parseArgs(fs, os.Args[2:]); err != nil {
 		return err
 	}
-	if *flags.trigger == "" {
-		fmt.Fprintln(os.Stderr, "connect: --trigger is required (run `soft-kvm detect` to list VID:PIDs)")
+	// The commands are argv slices, never shell strings (SPEC §9).
+	wiring, err := validateConnect(fs, flags)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return errUsage
 	}
 	token, err := requireToken()
-	if err != nil {
-		return err
-	}
-
-	detector, err := detect.NewDetector(*flags.trigger)
 	if err != nil {
 		return err
 	}
@@ -457,10 +459,8 @@ func connectCmd(ctx context.Context) error {
 	// through screen, which platform cannot import.
 	guard := platform.NewGuard(flags.displayMatch, flags.noGuards, screen.DisplayNames)
 
-	// The commands are argv slices, never shell strings (SPEC §9).
-	if err := validateCommands(fs, flags); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return errUsage
+	if !wiring.takes {
+		slog.Warn("no take-screen or take-hid in -A: this host gives its screens and devices away and never gets them back")
 	}
 
 	c, err := client.NewClient(token)
@@ -473,6 +473,7 @@ func connectCmd(ctx context.Context) error {
 		Settle:         *flags.settle,
 		SwitchRetries:  *flags.switchRetries,
 		RetrySpacing:   1 * time.Second,
+		ArrivalWindow:  10 * time.Second,
 		Cooldown:       5 * time.Second,
 		BreakerWindow:  30 * time.Second,
 		BreakerMax:     3,
@@ -485,16 +486,11 @@ func connectCmd(ctx context.Context) error {
 	}
 	resolver := discover.NewResolver(filepath.Join(stateDir, "server"))
 
-	// The winner publishes which Easy-Switch channel it is on, read off the
-	// trigger peripheral. Only a HID++ trigger can answer, so a plain HID
-	// trigger leaves it nil and the peer needs an explicit host=N (SPEC §5.5).
-	ownChannel := detector.OwnChannelFunc()
-
 	cfg := agent.Config{
 		ID:             *flags.id,
 		ExplicitServer: *flags.serverFlag,
 		KeyFP:          identity.KeyFingerprint(token),
-		Detector:       detector,
+		Detector:       wiring.detector,
 		Guard:          guard,
 		Client:         c,
 		Runner:         platform.Run,
@@ -502,47 +498,119 @@ func connectCmd(ctx context.Context) error {
 		AgentStatePath: filepath.Join(stateDir, "agent.json"),
 		OnActivation:   flags.onActivation.argv,
 		OnDeactivation: flags.onDeactivation.argv,
-		ScreenRunner:   platform.Output,
-		NotifyArgv:     platform.ShellArgv(*flags.notifyCmd),
-		SwitchTimeout:  *flags.switchTimeout,
-		Resolver:       resolver,
-		OwnChannel:     ownChannel,
+		Screens:        wiring.screens,
+		HIDs:           wiring.hids,
+		WriteScreen: func(ctx context.Context, w screen.Write, name string) error {
+			return w.Do(ctx, platform.Output, name)
+		},
+		SendHID: func(ctx context.Context, t hidpp.Target, channel uint8) (bool, error) {
+			return t.Send(ctx, channel)
+		},
+		HIDPresent: func(ctx context.Context, t hidpp.Target) (bool, error) {
+			return t.Present(ctx)
+		},
+		NotifyArgv:    platform.ShellArgv(*flags.notifyCmd),
+		SwitchTimeout: *flags.switchTimeout,
+		Resolver:      resolver,
 	}
 
 	return agent.Run(ctx, cfg)
 }
 
-// validateCommands is what connect and the service-install validator both
-// apply once the flags are parsed: no stray positional arguments — the old
-// trailing `-- CMD` form gets a pointer to -D — at least one command, since
-// there is no default (which input to select is this host's wiring, and
-// `detect` is what knows it, SPEC §5.4), and built-in commands that parse.
-func validateCommands(fs *flag.FlagSet, v *connectFlags) error {
-	if args := fs.Args(); len(args) > 0 {
-		return fmt.Errorf("connect: unexpected argument %q: commands are given with -A/--on-activation and -D/--on-deactivation, one quoted string each (e.g. -D 'screen-switch dp1')", args[0])
-	}
-	if len(v.onActivation.argv) == 0 && len(v.onDeactivation.argv) == 0 {
-		return errors.New("connect: at least one of -A/--on-activation and -D/--on-deactivation is required (run `soft-kvm detect` to print one for this host)")
-	}
-	for _, list := range []*commandList{v.onActivation, v.onDeactivation} {
-		for _, argv := range list.argv {
-			var err error
-			switch argv[0] {
-			case "hid-switch":
-				_, err = hidpp.Parse(argv[1:])
-			case "screen-switch":
-				_, err = screen.Parse(argv[1:])
-			}
-			if err != nil {
-				return fmt.Errorf("connect: %w", err)
-			}
-		}
-	}
-	return nil
+// wiring is what connect's flags declare about this host once they parse.
+type wiring struct {
+	screens []screen.Declaration
+	hids    []hidpp.Declaration
+	// detector watches --trigger, whose entries may name a declared device.
+	detector *detect.Detector
+	// takes reports whether -A holds a take-screen or take-hid.
+	takes bool
 }
 
-// commandList is a repeatable flag: each use is one command, split into an
-// argv by splitCommand.
+// validateConnect is what connect and the service-install validator both
+// apply once the flags are parsed (SPEC §5.4, §5.7): no stray positional
+// arguments — the old trailing `-- CMD` form gets a pointer to -D —, a
+// --trigger list of declared names, declarations that parse
+// with names unique within their kind, and the
+// built-in take commands used consistently: only in -A, with no argument, and
+// each with the declarations it posts. `--declare-hid` without take-hid is
+// fine: this host still gives the device away.
+func validateConnect(fs *flag.FlagSet, v *connectFlags) (wiring, error) {
+	var w wiring
+	if args := fs.Args(); len(args) > 0 {
+		return w, fmt.Errorf("connect: unexpected argument %q: commands are given with -A/--on-activation and -D/--on-deactivation, one quoted string each (e.g. -A take-screen)", args[0])
+	}
+	if *v.trigger == "" {
+		return w, errors.New("connect: --trigger is required (run `soft-kvm detect` to list candidates)")
+	}
+
+	seen := map[string]bool{}
+	for _, argv := range v.declareScreen.argv {
+		d, err := screen.ParseDeclaration(argv)
+		if err != nil {
+			return w, fmt.Errorf("connect: --declare-screen: %w", err)
+		}
+		key := strings.ToLower(d.Name)
+		if seen[key] {
+			return w, fmt.Errorf("connect: --declare-screen: the monitor %q is declared twice", d.Name)
+		}
+		seen[key] = true
+		w.screens = append(w.screens, d)
+	}
+	seen = map[string]bool{}
+	for _, argv := range v.declareHID.argv {
+		d, err := hidpp.ParseDeclaration(argv)
+		if err != nil {
+			return w, fmt.Errorf("connect: --declare-hid: %w", err)
+		}
+		if seen[d.Name] {
+			return w, fmt.Errorf("connect: --declare-hid: the device %q is declared twice", d.Name)
+		}
+		seen[d.Name] = true
+		w.hids = append(w.hids, d)
+	}
+	named := make(map[string]hidpp.Target, len(w.hids))
+	for _, d := range w.hids {
+		named[d.Name] = d.Target
+	}
+	var err error
+	if w.detector, err = detect.NewDetector(*v.trigger, named); err != nil {
+		return w, fmt.Errorf("connect: %w", err)
+	}
+
+	for _, argv := range v.onDeactivation.argv {
+		if isTake(argv[0]) {
+			return w, fmt.Errorf("connect: %s belongs in -A: the server accepts a take from the owner only", argv[0])
+		}
+	}
+	var takeScreen, takeHID bool
+	for _, argv := range v.onActivation.argv {
+		if !isTake(argv[0]) {
+			continue
+		}
+		if len(argv) > 1 {
+			return w, fmt.Errorf("connect: %s takes no argument, got %q", argv[0], argv[1:])
+		}
+		takeScreen = takeScreen || argv[0] == agent.TakeScreen
+		takeHID = takeHID || argv[0] == agent.TakeHID
+	}
+	switch {
+	case takeScreen && len(w.screens) == 0:
+		return w, errors.New("connect: take-screen needs at least one --declare-screen (run `soft-kvm detect` to print one)")
+	case !takeScreen && len(w.screens) > 0:
+		return w, errors.New("connect: --declare-screen does nothing without -A take-screen")
+	case takeHID && !slices.ContainsFunc(w.hids, func(d hidpp.Declaration) bool { return d.Channel != 0 }):
+		return w, errors.New("connect: take-hid needs at least one --declare-hid with its host=N (run `soft-kvm detect` to print one)")
+	}
+	w.takes = takeScreen || takeHID
+	return w, nil
+}
+
+// isTake reports whether name is one of the built-in take commands.
+func isTake(name string) bool { return name == agent.TakeScreen || name == agent.TakeHID }
+
+// commandList is a repeatable flag: each use is one string — a command or a
+// declaration — split into an argv by splitCommand.
 type commandList struct{ argv [][]string }
 
 func (c *commandList) String() string {
@@ -641,53 +709,4 @@ func detectCmd(ctx context.Context) error {
 		return errUsage
 	}
 	return detect.Run(ctx, os.Stdout)
-}
-
-func hidSwitchCmd(ctx context.Context) error {
-	fs := flag.NewFlagSet("hid-switch", flag.ContinueOnError)
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm hid-switch VID:PID[:SLOT] host=N")
-		fmt.Fprintln(os.Stderr, "  VID:PID  a Logitech receiver or peripheral, as soft-kvm detect prints it:")
-		fmt.Fprintln(os.Stderr, "           moves every peripheral still linked to it")
-		fmt.Fprintln(os.Stderr, "  :SLOT    moves only the peripheral in that pairing slot of a receiver")
-		fmt.Fprintln(os.Stderr, "  host=N   the target Easy-Switch channel, as printed on the key (1-3).")
-		fmt.Fprintln(os.Stderr, "           Required by hand; optional after `connect --`, where the")
-		fmt.Fprintln(os.Stderr, "           host taking over publishes its own channel")
-	}
-	if err := parseArgs(fs, os.Args[2:]); err != nil {
-		return err
-	}
-	sw, err := hidpp.Parse(fs.Args())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return errUsage
-	}
-	// Run by hand there is no owner to inherit a channel from, so host=N is
-	// not optional here — Do says so if it is missing.
-	return sw.Do(ctx, 0)
-}
-
-func screenSwitchCmd(ctx context.Context) error {
-	fs := flag.NewFlagSet("screen-switch", flag.ContinueOnError)
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm screen-switch INPUT [TABLE] [display=MATCH]")
-		fmt.Fprintln(os.Stderr, "  INPUT  one of the table's ports, or a raw value such as 0x1B")
-		fmt.Fprintln(os.Stderr, "  TABLE  how this monitor selects inputs; soft-kvm detect prints the one it needs")
-		for i, t := range screen.Tables() {
-			note := ""
-			if i == 0 {
-				note = " (default)"
-			}
-			fmt.Fprintf(os.Stderr, "           %-9s %s%s\n", t.Name, strings.Join(t.Aliases(), ", "), note)
-		}
-	}
-	if err := parseArgs(fs, os.Args[2:]); err != nil {
-		return err
-	}
-	sw, err := screen.Parse(fs.Args())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return errUsage
-	}
-	return sw.Do(ctx, platform.Output)
 }

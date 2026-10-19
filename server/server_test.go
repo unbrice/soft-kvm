@@ -7,16 +7,20 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/unbrice/soft-kvm/client"
 	"github.com/unbrice/soft-kvm/identity"
 	"github.com/unbrice/soft-kvm/server"
 	"github.com/unbrice/soft-kvm/state"
@@ -453,61 +457,372 @@ func TestServerRunShutdown(t *testing.T) {
 	}
 }
 
-// The winner's Easy-Switch channel travels with the claim and comes back on
-// /state: the losing host cannot work it out locally (SPEC §5.5).
-func TestServerClaimPublishesChannel(t *testing.T) {
-	_, srv := testServer(t)
-	defer srv.Close()
-
-	resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true&channel=2", nil)
-	mustStatus(t, resp, http.StatusOK)
-	_ = resp.Body.Close()
-
-	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
-	mustStatus(t, resp, http.StatusOK)
-	var st state.ServerState
-	readJSON(t, resp, &st)
-	if st.OwnerChannel != 2 {
-		t.Fatalf("OwnerChannel = %d, want 2", st.OwnerChannel)
+// baseOf returns the host:port the real client dials.
+func baseOf(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", srv.URL, err)
 	}
+	return u.Host
+}
 
-	// A re-claim by the same owner is idempotent on the epoch but still
-	// refreshes the channel: the agent may learn it only after winning.
-	resp = doReq(t, http.MethodPost, srv.URL+"/claim/linux?channel=3", nil)
-	mustStatus(t, resp, http.StatusOK)
-	var claim map[string]any
-	readJSON(t, resp, &claim)
-	if claim["changed"] != false {
-		t.Fatalf("re-claim changed the owner: %+v", claim)
+func realClient(t *testing.T) *client.Client {
+	t.Helper()
+	c, err := client.NewClient(testToken)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
 	}
-	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
-	mustStatus(t, resp, http.StatusOK)
-	readJSON(t, resp, &st)
-	if st.OwnerChannel != 3 {
-		t.Fatalf("OwnerChannel after re-claim = %d, want 3", st.OwnerChannel)
-	}
+	return c
+}
 
-	// A claim with no channel leaves the owner's channel unknown rather than
-	// inheriting the previous owner's.
-	resp = doReq(t, http.MethodPost, srv.URL+"/claim/mac?force=true", nil)
-	mustStatus(t, resp, http.StatusOK)
-	_ = resp.Body.Close()
-	resp = doReq(t, http.MethodGet, srv.URL+"/state", nil)
-	mustStatus(t, resp, http.StatusOK)
-	st = state.ServerState{}
-	readJSON(t, resp, &st)
-	if st.OwnerChannel != 0 {
-		t.Fatalf("OwnerChannel = %d, want 0 for an owner that published none", st.OwnerChannel)
+// claimAs makes id the owner, forced: no agent is live in these tests.
+func claimAs(t *testing.T, c *client.Client, base, id string) {
+	t.Helper()
+	if _, err := c.Claim(t.Context(), base, id, true, false); err != nil {
+		t.Fatalf("claim %s: %v", id, err)
 	}
 }
 
-func TestServerClaimRejectsBadChannel(t *testing.T) {
-	_, srv := testServer(t)
-	defer srv.Close()
+func screenTake(name, input string) state.Take {
+	return state.Take{Kind: state.KindScreen, Name: name, Input: input}
+}
 
-	for _, q := range []string{"channel=0", "channel=4", "channel=x"} {
-		resp := doReq(t, http.MethodPost, srv.URL+"/claim/linux?force=true&"+q, nil)
-		mustStatus(t, resp, http.StatusBadRequest)
-		_ = resp.Body.Close()
+func hidTake(name string, channel uint8, arrived bool) state.Take {
+	return state.Take{Kind: state.KindHID, Name: name, Channel: channel, Arrived: arrived}
+}
+
+func TestServerClaimActivation(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	claimAs(t, c, base, "linux")
+	if st := s.CurrentState(); st.Owner != "linux" || st.Activation != 1 || st.Epoch != 1 {
+		t.Fatalf("after first claim: %+v", st)
+	}
+
+	// An idempotent re-claim moves nothing.
+	if changed, err := c.Claim(t.Context(), base, "linux", false, false); err != nil || changed {
+		t.Fatalf("re-claim = %v, %v; want unchanged", changed, err)
+	}
+	if st := s.CurrentState(); st.Activation != 1 || st.Epoch != 1 {
+		t.Fatalf("re-claim moved the state: %+v", st)
+	}
+
+	// A retake of the same owner bumps the activation and the epoch, and
+	// wakes the waiters.
+	woke := make(chan *http.Response, 1)
+	go func() { woke <- doReq(t, http.MethodGet, srv.URL+"/wait?epoch=1&id=linux", nil) }()
+	waitForLive(t, s, "linux")
+	since := s.CurrentState().Since
+	if changed, err := c.Claim(t.Context(), base, "linux", false, true); err != nil || !changed {
+		t.Fatalf("retake = %v, %v; want changed", changed, err)
+	}
+	mustStatus(t, <-woke, http.StatusOK)
+	st := s.CurrentState()
+	if st.Owner != "linux" || st.Activation != 2 || st.Epoch != 2 || !st.Since.Equal(since) {
+		t.Fatalf("after retake: %+v (since was %v)", st, since)
+	}
+
+	// A change of owner bumps both again.
+	claimAs(t, c, base, "mac")
+	if st := s.CurrentState(); st.Owner != "mac" || st.Activation != 3 || st.Epoch != 3 {
+		t.Fatalf("after owner change: %+v", st)
+	}
+}
+
+// The liveness rule applies to a retake as it does to a claim.
+func TestServerRetakeNeedsLiveAgent(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	claimAs(t, c, base, "linux")
+	if _, err := c.Claim(t.Context(), base, "linux", false, true); !errors.Is(err, client.ErrNoLiveAgent) {
+		t.Fatalf("retake of an owner with no live agent: %v, want ErrNoLiveAgent", err)
+	}
+	if _, err := c.Claim(t.Context(), base, "linux", true, true); err != nil {
+		t.Fatalf("forced retake: %v", err)
+	}
+	if st := s.CurrentState(); st.Activation != 2 {
+		t.Fatalf("activation = %d, want 2", st.Activation)
+	}
+}
+
+func TestServerTakeRecordsHolds(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	if st := s.CurrentState(); st.Holds == nil {
+		t.Fatal("holds is nil on a fresh server")
+	}
+	resp := doReq(t, http.MethodGet, srv.URL+"/state", nil)
+	var raw map[string]json.RawMessage
+	readJSON(t, resp, &raw)
+	if string(raw["holds"]) != "[]" {
+		t.Fatalf("holds on the wire = %s, want []", raw["holds"])
+	}
+
+	claimAs(t, c, base, "linux") // epoch 1, activation 1
+	err := c.Take(t.Context(), base, "linux", 1, []state.Take{
+		hidTake("mouse", 2, false),
+		screenTake("LG HDR WQHD", "f4:50=d1"),
+		hidTake("keyboard", 1, true),
+	})
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	st := s.CurrentState()
+	if st.Epoch != 2 {
+		t.Fatalf("epoch = %d, want one step for the whole request", st.Epoch)
+	}
+	want := []state.Hold{
+		{Kind: "hid", Name: "keyboard", Holder: "linux", Seq: 2, Channel: 1, Arrived: true},
+		{Kind: "hid", Name: "mouse", Holder: "linux", Seq: 2, Channel: 2},
+		{Kind: "screen", Name: "LG HDR WQHD", Holder: "linux", Seq: 2, Input: "F4:50=D1"},
+	}
+	if !reflect.DeepEqual(st.Holds, want) {
+		t.Fatalf("holds = %+v\nwant    %+v", st.Holds, want)
+	}
+
+	// The same take again, same activation: nothing changes, nothing wakes.
+	err = c.Take(t.Context(), base, "linux", 1, []state.Take{hidTake("mouse", 2, false), screenTake("LG HDR WQHD", "F4:50=D1")})
+	if err != nil {
+		t.Fatalf("re-take: %v", err)
+	}
+	if got := s.CurrentState(); got.Epoch != 2 || !reflect.DeepEqual(got.Holds, want) {
+		t.Fatalf("an identical take moved the state: %+v", got)
+	}
+
+	// Another input from the same holder replaces the hold; prev stays.
+	if err := c.Take(t.Context(), base, "linux", 1, []state.Take{screenTake("LG HDR WQHD", "F4:50=D0")}); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	got := s.CurrentState()
+	if h := got.Holds[2]; h.Input != "F4:50=D0" || h.Seq != 3 || h.Prev != "" || got.Epoch != 3 {
+		t.Fatalf("replaced hold = %+v, epoch %d", h, got.Epoch)
+	}
+
+	// A new holder: prev becomes the old one, seq the new epoch, and the
+	// arrival the take reported.
+	claimAs(t, c, base, "mac") // epoch 4, activation 2
+	if err := c.Take(t.Context(), base, "mac", 2, []state.Take{hidTake("mouse", 3, false), screenTake("LG HDR WQHD", "F4:50=D1")}); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	got = s.CurrentState()
+	byName := map[string]state.Hold{}
+	for _, h := range got.Holds {
+		byName[h.Kind+"/"+h.Name] = h
+	}
+	if h := byName["hid/mouse"]; h.Holder != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Channel != 3 || h.Arrived {
+		t.Fatalf("mouse = %+v", h)
+	}
+	if h := byName["screen/LG HDR WQHD"]; h.Holder != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Input != "F4:50=D1" {
+		t.Fatalf("screen = %+v", h)
+	}
+	if h := byName["hid/keyboard"]; h.Holder != "linux" || h.Seq != 2 {
+		t.Fatalf("an untouched hold changed: %+v", h)
+	}
+}
+
+// A restarted agent re-posts its takes for free, but a re-activation records
+// them anew (SPEC §7).
+func TestServerTakeNewActivationRecordsAgain(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	claimAs(t, c, base, "linux")
+	takes := []state.Take{hidTake("mouse", 2, false)}
+	if err := c.Take(t.Context(), base, "linux", 1, takes); err != nil {
+		t.Fatal(err)
+	}
+	first := s.CurrentState().Holds[0]
+	if _, err := c.Claim(t.Context(), base, "linux", true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Take(t.Context(), base, "linux", 2, takes); err != nil {
+		t.Fatal(err)
+	}
+	again := s.CurrentState().Holds[0]
+	if again.Seq == first.Seq || again.Prev != "" || again.Holder != "linux" {
+		t.Fatalf("hold after re-activation = %+v, was %+v", again, first)
+	}
+}
+
+func TestServerTakeRefusals(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+	takes := []state.Take{hidTake("mouse", 2, false)}
+
+	// Nobody owns yet.
+	if err := c.Take(t.Context(), base, "linux", 0, takes); !errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("take with no owner: %v, want ErrNotOwner", err)
+	}
+	claimAs(t, c, base, "linux")
+	// Not the owner.
+	if err := c.Take(t.Context(), base, "mac", 1, takes); !errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("take by a non-owner: %v, want ErrNotOwner", err)
+	}
+	// A stale activation: the flip back landed while the commands ran.
+	claimAs(t, c, base, "mac")
+	claimAs(t, c, base, "linux") // activation 3
+	if err := c.Take(t.Context(), base, "linux", 1, takes); !errors.Is(err, client.ErrNotOwner) {
+		t.Fatalf("take under a stale activation: %v, want ErrNotOwner", err)
+	}
+	if st := s.CurrentState(); len(st.Holds) != 0 || st.Epoch != 3 {
+		t.Fatalf("a refused take changed the state: %+v", st)
+	}
+	if err := c.Take(t.Context(), base, "linux", 3, takes); err != nil {
+		t.Fatalf("take under the current activation: %v", err)
+	}
+}
+
+func TestServerTakeValidation(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	claimAs(t, realClient(t), baseOf(t, srv), "linux")
+
+	many := make([]state.Take, 17)
+	for i := range many {
+		many[i] = hidTake(fmt.Sprintf("d%d", i), 1, false)
+	}
+	cases := []struct {
+		name  string
+		takes any
+	}{
+		{"unknown kind", []state.Take{{Kind: "led", Name: "x", Channel: 1}}},
+		{"empty name", []state.Take{hidTake("", 1, false)}},
+		{"long name", []state.Take{hidTake(strings.Repeat("n", 65), 1, false)}},
+		{"unprintable name", []state.Take{hidTake("a\nb", 1, false)}},
+		{"screen without input", []state.Take{screenTake("LG", "")}},
+		{"screen input not hex", []state.Take{screenTake("LG", "F4:50=ZZ")}},
+		{"screen input malformed", []state.Take{screenTake("LG", "F4-50=D1")}},
+		{"screen input with a channel", []state.Take{{Kind: "screen", Name: "LG", Input: "60:51=0F", Channel: 1}}},
+		{"hid channel 0", []state.Take{hidTake("mouse", 0, false)}},
+		{"hid channel 4", []state.Take{hidTake("mouse", 4, false)}},
+		{"hid with input", []state.Take{{Kind: "hid", Name: "mouse", Channel: 1, Input: "60:51=0F"}}},
+		{"taken twice", []state.Take{hidTake("mouse", 1, false), hidTake("mouse", 2, false)}},
+		{"seventeen takes", many},
+		{"not an object", "nope"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]any{"activation": 1, "takes": tc.takes})
+			resp := doReq(t, http.MethodPost, srv.URL+"/take/linux", strings.NewReader(string(body)))
+			mustStatus(t, resp, http.StatusBadRequest)
+			_ = resp.Body.Close()
+		})
+	}
+	if st := s.CurrentState(); len(st.Holds) != 0 {
+		t.Fatalf("a malformed take left holds: %+v", st.Holds)
+	}
+
+	// Sixteen takes and a 64-character name are the limits, and fit.
+	ok := many[:16]
+	ok[0].Name = strings.Repeat("n", 64)
+	body, _ := json.Marshal(map[string]any{"activation": 1, "takes": ok})
+	resp := doReq(t, http.MethodPost, srv.URL+"/take/linux", strings.NewReader(string(body)))
+	mustStatus(t, resp, http.StatusOK)
+	_ = resp.Body.Close()
+
+	resp = doReq(t, http.MethodPost, srv.URL+"/take/bad$id", strings.NewReader("{}"))
+	mustStatus(t, resp, http.StatusBadRequest)
+	_ = resp.Body.Close()
+}
+
+func TestServerArrived(t *testing.T) {
+	s, srv := testServer(t)
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	claimAs(t, c, base, "mac")
+	if err := c.Take(t.Context(), base, "mac", 1, []state.Take{hidTake("mouse", 3, false), screenTake("LG", "60:51=0F")}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := s.CurrentState().Epoch
+	seq := s.CurrentState().Holds[0].Seq
+
+	// None of these matches a current hold of the sender: ignored, 200.
+	for name, a := range map[string]struct {
+		id string
+		a  state.Arrival
+	}{
+		"another host": {"linux", state.Arrival{Kind: "hid", Name: "mouse", Seq: seq}},
+		"stale seq":    {"mac", state.Arrival{Kind: "hid", Name: "mouse", Seq: seq - 1}},
+		"unknown name": {"mac", state.Arrival{Kind: "hid", Name: "pen", Seq: seq}},
+		"wrong kind":   {"mac", state.Arrival{Kind: "screen", Name: "mouse", Seq: seq}},
+	} {
+		if err := c.Arrived(t.Context(), base, a.id, a.a); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := s.CurrentState(); got.Epoch != epoch || got.Holds[0].Arrived {
+			t.Fatalf("%s moved the state: %+v", name, got)
+		}
+	}
+
+	woke := make(chan *http.Response, 1)
+	go func() {
+		woke <- doReq(t, http.MethodGet, fmt.Sprintf("%s/wait?epoch=%d&id=linux", srv.URL, epoch), nil)
+	}()
+	waitForLive(t, s, "linux")
+	if err := c.Arrived(t.Context(), base, "mac", state.Arrival{Kind: "hid", Name: "mouse", Seq: seq}); err != nil {
+		t.Fatal(err)
+	}
+	mustStatus(t, <-woke, http.StatusOK)
+	got := s.CurrentState()
+	if h := got.Holds[0]; !h.Arrived || h.Seq != seq || got.Epoch != epoch+1 {
+		t.Fatalf("after arrival: %+v, epoch %d", h, got.Epoch)
+	}
+
+	// A second report of the same arrival changes nothing.
+	if err := c.Arrived(t.Context(), base, "mac", state.Arrival{Kind: "hid", Name: "mouse", Seq: seq}); err != nil {
+		t.Fatal(err)
+	}
+	if s.CurrentState().Epoch != epoch+1 {
+		t.Fatal("a repeated arrival moved the epoch")
+	}
+}
+
+func TestServerHoldsPersist(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s := server.NewServer(statePath, testToken)
+	srv := httptest.NewUnstartedServer(s.Handler())
+	tlsCfg, err := identity.ServerTLSConfig(testToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.TLS = tlsCfg
+	srv.StartTLS()
+	defer srv.Close()
+	c, base := realClient(t), baseOf(t, srv)
+
+	claimAs(t, c, base, "mac")
+	takes := []state.Take{hidTake("mouse", 3, false), screenTake("LG", "F4:50=D1")}
+	if err := c.Take(t.Context(), base, "mac", 1, takes); err != nil {
+		t.Fatal(err)
+	}
+	before := s.CurrentState()
+
+	s2 := server.NewServer(statePath, testToken)
+	after := s2.CurrentState()
+	if after.Owner != "mac" || after.Activation != 1 || after.Epoch != before.Epoch || !reflect.DeepEqual(after.Holds, before.Holds) {
+		t.Fatalf("reloaded %+v, want %+v", after, before)
+	}
+
+	// The reloaded server remembers the activation each hold was taken under:
+	// an identical re-take from a restarted agent changes nothing.
+	srv2 := httptest.NewUnstartedServer(s2.Handler())
+	srv2.TLS = tlsCfg
+	srv2.StartTLS()
+	defer srv2.Close()
+	if err := c.Take(t.Context(), baseOf(t, srv2), "mac", 1, takes); err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.CurrentState(); got.Epoch != before.Epoch {
+		t.Fatalf("re-take after a restart moved the epoch to %d", got.Epoch)
 	}
 }
