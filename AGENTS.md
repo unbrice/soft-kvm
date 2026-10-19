@@ -36,7 +36,7 @@ every host, five subcommands:
   `--declare-hid 'NAME VID:PID[:SLOT] [host=N]'` says how the device every host
   calls `NAME` reaches this host, and on which Easy-Switch channel; without
   `host=N` the host watches the device and gives it away, and never takes it.
-  `-A/--on-activation` runs when the host becomes the owner, in order; two
+  `-A/--on-activation` runs when the host becomes the owner, in parallel; two
   command names are not exec'd but run in-process: `take-screen` and `take-hid`
   post the declarations to the server as **takes**, which it records as
   **assignments** (SPEC §5.5, §5.6). Every other host then gives away what each
@@ -241,8 +241,16 @@ jj sharp edges:
   function name covers everything it does. `now time.Time` is a first parameter,
   after `ctx`.
 - **Layering:** state lives with what it describes, and callers ask it rather
-  than reach into it — `m.job.busy()`, not `m.job[0]`; no field set as a side
-  effect of another function.
+  than reach into it — `m.job.busy()`, not a loop over its tasks; no field set
+  as a side effect of another function. The kind of a thing is its type: one
+  struct per kind, held in typed fields (`job.commands`, `job.assignments`),
+  never a mixed list read through its first element.
+- **State:** store what happened, derive what to do. A deadline is a past event
+  plus a configured duration, computed when read (`lastIssued` plus
+  `RetrySpacing`); what is called for is recomputed from the facts each time
+  (reconcile runs whenever the decider is idle), so nothing scheduled goes
+  stale. A stored intention needs a reason, such as an edge with no level to
+  derive it from (`lastAttach`, answered by `claimedAttach`).
 - **Cancellation:** one context from `main` down; `context.Context` is a first
   parameter, never a struct field. The three blocking things that need special
   handling — HID watcher, child processes, in-flight long-polls — are fixed in
