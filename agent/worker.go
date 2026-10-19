@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/unbrice/soft-kvm/client"
@@ -95,17 +96,22 @@ func (a *agent) runCommand(ctx context.Context, c model.Command) error {
 	return a.cfg.Runner(ctx, c.Argv)
 }
 
-// runCommands runs commands in order, each with its own timeout, and reports
-// one result per command for the decider. One failure does not skip the rest:
-// the commands target independent things.
+// runCommands runs commands in parallel, each with its own timeout, and
+// reports one result per command, in the order given, once all are over. One
+// failure does not stop the rest: the commands target independent things, and
+// a user who needs an order gives one command that runs them in it.
 func (a *agent) runCommands(ctx context.Context, cmds []model.Command) {
 	results := make([]error, len(cmds))
+	var wg sync.WaitGroup
 	for i, c := range cmds {
-		results[i] = a.bounded(ctx, func(ctx context.Context) error { return a.runCommand(ctx, c) })
-		if results[i] != nil {
-			slog.Warn("command failed", "command", c.String(), "error", results[i])
-		}
+		wg.Go(func() {
+			results[i] = a.bounded(ctx, func(ctx context.Context) error { return a.runCommand(ctx, c) })
+			if results[i] != nil {
+				slog.Warn("command failed", "command", c.String(), "error", results[i])
+			}
+		})
 	}
+	wg.Wait()
 	a.post(ctx, model.Observation{Ran: &model.CommandsRun{Results: results}})
 }
 
@@ -173,15 +179,47 @@ func (a *agent) eachServer(ctx context.Context, fn func(ctx context.Context, bas
 	return last
 }
 
-// giveAway gives away a batch of assignments, in order, each write bounded by
-// --switch-timeout. One failing does not skip the rest: they target
-// independent devices.
+// giveAway gives away a batch of assignments and reports the results.
 func (a *agent) giveAway(ctx context.Context, assignments []state.Assignment) {
-	results := make(map[state.AssignmentKey]error, len(assignments))
+	a.post(ctx, model.Observation{GaveAway: &model.AssignmentsGivenAway{Results: a.giveAwayAll(ctx, assignments)}})
+}
+
+// giveAwayAll gives away a batch of assignments in parallel, each write bounded
+// by --switch-timeout, so a hung monitor write does not hold the mouse back.
+// Writes in one queue run in order, as given (see writeQueue). One failing does
+// not skip the rest: they target independent devices.
+func (a *agent) giveAwayAll(ctx context.Context, assignments []state.Assignment) map[state.AssignmentKey]error {
+	queues := make(map[string][]state.Assignment)
 	for _, h := range assignments {
-		results[h.Key()] = a.giveAwayAssignment(ctx, h)
+		q := a.writeQueue(h)
+		queues[q] = append(queues[q], h)
 	}
-	a.post(ctx, model.Observation{GaveAway: &model.AssignmentsGivenAway{Results: results}})
+	results := make(map[state.AssignmentKey]error, len(assignments))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, q := range queues {
+		wg.Go(func() {
+			for _, h := range q {
+				err := a.giveAwayAssignment(ctx, h)
+				mu.Lock()
+				results[h.Key()] = err
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	return results
+}
+
+// writeQueue names the hardware an assignment's write goes through. Devices
+// behind one receiver share its node, and the HID++ replies on it are matched
+// to their request, so their sends must not overlap; each monitor has its own
+// DDC/CI link.
+func (a *agent) writeQueue(h state.Assignment) string {
+	if d, ok := a.hids[h.Name]; ok && h.Kind == state.KindHID {
+		return fmt.Sprintf("receiver %04x:%04x", d.Target.VID, d.Target.PID)
+	}
+	return h.Key().String()
 }
 
 // giveAwayAssignment moves one thing on this host to its assignee: a screen is

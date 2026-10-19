@@ -227,14 +227,19 @@ as its writes added up, and a decider-side bound would retry while the worker is
 still busy, then take the late result for the retry's. A result is accepted only
 while its issue is outstanding — a late one is ignored and logged.
 
-1. Give away every pending assignment, in the order `/state` lists them. One
-   failing does not skip the rest: they target independent devices.
+1. Give away every pending assignment in parallel, so a hung monitor write does
+   not hold the mouse back. Writes through one piece of hardware keep the order
+   `/state` lists them in: devices behind one receiver share its node, and HID++
+   replies on it are matched to their request. One failing does not skip the
+   rest: they target independent devices.
 2. Screen written, device arrived, or nothing to move here ⇒ that assignment is
    done.
 3. A write that failed, died or never reported, or a device that did not arrive
    within 10 s ⇒ retry **only those assignments**, up to `--switch-retries 3`,
    each at least 1 s after its last attempt. An assignment superseded by a newer
-   take of the same name is dropped.
+   take of the same name is dropped. One whose assignee is no longer live stops
+   being retried and is not recorded: it stays pending, as the liveness gate
+   would have held it at reconcile.
 4. Still failing after the last retry ⇒ the previous assignee runs
    `--notify-cmd`; every other host logs and stops.
 
@@ -254,15 +259,19 @@ runs the `--on-activation` commands; `handled_owner == me && owner != me` runs
 the `--on-deactivation` commands. Neither is a door, so no liveness gate,
 cooldown, breaker or notification applies. They share the `handled_owner` record
 — an agent with no record adopts the owner and runs nothing — and the retry
-path: commands run in order, each bounded by `--switch-timeout`, and only those
-that failed re-run, up to `--switch-retries`, so a take the server already
-accepted is not posted again. A failure after the last retry is logged.
-`take-screen` and `take-hid` exit 0 when the server accepted the take; a 409 is
-a failure like any other. Once the commands are over, success or not, the job
-records the ownership they ran for — `handled_owner` and `handled_activation`,
-from the `/state` that crossed the edge — so an agent restarted mid-run runs the
-commands again and one that ran them does not repeat them for the same
-transition.
+path: commands run in parallel, each bounded by `--switch-timeout`, and only
+those that failed re-run, up to `--switch-retries`, so a take the server already
+accepted is not posted again. Commands that need an order go in one command that
+runs them in it, `-A "sh -c 'a; b'"`; `take-screen` and `take-hid` run
+in-process, so nothing can be ordered after them. A newer state that expires the
+edge — another owner or activation for an activation, the ownership back for a
+deactivation — drops every retry; the commands running finish. A failure after
+the last retry is logged. `take-screen` and `take-hid` exit 0 when the server
+accepted the take; a 409 is a failure like any other. Once the commands are
+over, success or not, the job records the ownership they ran for —
+`handled_owner` and `handled_activation`, from the `/state` that crossed the
+edge — so an agent restarted mid-run runs the commands again and one that ran
+them does not repeat them for the same transition.
 
 **Re-activation.** `soft-kvm activate ID` against the current owner bumps
 `activation` without changing the owner (§5.3). The owner's agent compares it
@@ -281,7 +290,11 @@ assignment the rate limit deferred is given away once the limit lifts.
 Reconciling a state again changes nothing once its job is over, since every job
 records what it handled. Why an assignment is held back is logged once, and
 again only when the reason changes. A claim waits out `--settle` from the last
-attach, then for the job in flight to end.
+attach, then for the job in flight to end: the decider does one thing at a time.
+While a job runs, a newer state only updates it: the tasks it no longer calls
+for are dropped, never cut off mid-way, and the server's own checks — a take
+under a stale activation gets a 409 — cover the moment before the agent sees
+that state.
 
 ## 5. CLI surface
 
@@ -400,8 +413,8 @@ else knows it: `soft-kvm detect` prints them.
 | `--trigger LIST`                  | required                                                   | required                                                                                      | Comma-separated `NAME`s for the trigger detector, each one a `--declare-hid` declares: an address is spelled once, in its declaration (§5.5). A device declared by `VID:PID` is watched as a HID node that genuinely comes and goes — a moved receiver, a Bluetooth keyboard (§6.3); one declared by `VID:PID:SLOT` as one pairing slot of a receiver that stays plugged in (§6.1). `soft-kvm detect` prints the candidates with their declarations |
 | `--declare-screen DECL`           | none                                                       | none                                                                                          | `NAME INPUT [TABLE]`: the monitor named `NAME` shows this host on `INPUT` (§5.6). Repeat per monitor. Required by `take-screen`, and useless without it                                                                                                                                                                                                                                                                                             |
 | `--declare-hid DECL`              | none                                                       | none                                                                                          | `NAME VID:PID[:SLOT] [host=N]`: the device every host calls `NAME` reaches this host at that address, on Easy-Switch channel `N` (§5.5). Repeat per device. `--trigger` names one; `take-hid` takes those with a `host=N`, and this host gives the others away without taking them                                                                                                                                                                  |
-| `-A`, `--on-activation COMMAND`   | none                                                       | none                                                                                          | Run when this host becomes the owner (§4.3). Repeat for several; they run in order. `take-screen` and `take-hid` are commands of this list only                                                                                                                                                                                                                                                                                                     |
-| `-D`, `--on-deactivation COMMAND` | none                                                       | none                                                                                          | Run when this host stops being the owner (§4.3). Repeat for several; they run in order                                                                                                                                                                                                                                                                                                                                                              |
+| `-A`, `--on-activation COMMAND`   | none                                                       | none                                                                                          | Run when this host becomes the owner (§4.3). Repeat for several; they run in parallel. `take-screen` and `take-hid` are commands of this list only                                                                                                                                                                                                                                                                                                  |
+| `-D`, `--on-deactivation COMMAND` | none                                                       | none                                                                                          | Run when this host stops being the owner (§4.3). Repeat for several; they run in parallel                                                                                                                                                                                                                                                                                                                                                           |
 | `--switch-timeout 30s`            | 30s                                                        | 30s                                                                                           | Bound on one `-A` or `-D` command, and on one write giving an assignment away — a hung I²C write must not freeze the agent (§4.3)                                                                                                                                                                                                                                                                                                                   |
 | `--settle 2s`                     | 2s                                                         | 2s                                                                                            | Attach must persist this long before claiming                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `--switch-retries 3`              | 3                                                          | 3                                                                                             | Re-runs of the commands, and new attempts at giving assignments away, that failed, at least 1 s apart, before giving up                                                                                                                                                                                                                                                                                                                             |
@@ -1168,7 +1181,7 @@ type AssignmentsGivenAway struct {
 
 type Decision struct {
     Claim    string             // non-empty: POST /claim/<id>
-    Run      []Command          // run these commands, in order
+    Run      []Command          // run these commands, in parallel
     GiveAway []state.Assignment // give away what these assignments name: move each screen or device to its assignee
     Notify   bool               // run --notify-cmd
     Save     *state.AgentState  // non-nil: persist this as agent.json

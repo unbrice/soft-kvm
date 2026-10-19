@@ -116,30 +116,40 @@ func (g *fakeGuard) OK(context.Context) (bool, string) {
 	return false, "guards down"
 }
 
+// recordingRunner records the commands run. Commands run in parallel, so it
+// fails them by argv, not by call order: fails holds, per argv joined by
+// spaces, the results of its successive runs; a run past them succeeds.
 type recordingRunner struct {
 	mu    sync.Mutex
 	calls [][]string
-	errs  []error
-	idx   int
+	fails map[string][]error
 }
 
 func (r *recordingRunner) run(_ context.Context, argv []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, argv)
-	if r.idx < len(r.errs) {
-		err := r.errs[r.idx]
-		r.idx++
-		return err
+	key := strings.Join(argv, " ")
+	if errs := r.fails[key]; len(errs) > 0 {
+		r.fails[key] = errs[1:]
+		return errs[0]
 	}
 	return nil
 }
 
+// Calls returns the commands run, sorted: parallel runs have no order.
 func (r *recordingRunner) Calls() [][]string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([][]string, len(r.calls))
-	copy(out, r.calls)
+	out := slices.Clone(r.calls)
+	slices.SortFunc(out, func(a, b []string) int { return slices.Compare(a, b) })
+	return out
+}
+
+// sortedCalls sorts calls as Calls does.
+func sortedCalls(calls [][]string) [][]string {
+	out := slices.Clone(calls)
+	slices.SortFunc(out, func(a, b []string) int { return slices.Compare(a, b) })
 	return out
 }
 
@@ -302,7 +312,7 @@ func TestAgentActivationPath(t *testing.T) {
 	}
 
 	waitForLastOwner(t, statePath, "linux")
-	if calls := runner.Calls(); !slices.EqualFunc(calls, cfg.Decider.OnActivation, slices.Equal[[]string]) {
+	if calls := runner.Calls(); !slices.EqualFunc(calls, sortedCalls(cfg.Decider.OnActivation), slices.Equal[[]string]) {
 		t.Errorf("calls = %v, want exactly the activation commands %v", calls, cfg.Decider.OnActivation)
 	}
 }
@@ -354,9 +364,9 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 	seedOwner(t, base, "linux", statePath, "linux")
 
 	det := newFakeDetector()
-	// Attempt 1: the first command fails, the second succeeds. Attempt 2: the
-	// first command succeeds.
-	runner := &recordingRunner{errs: []error{errors.New("monitor still here"), nil, nil}}
+	// Attempt 1: switch display fails, switch usb succeeds. Attempt 2: switch
+	// display succeeds.
+	runner := &recordingRunner{fails: map[string][]error{"switch display": {errors.New("monitor still here")}}}
 	cfg := agentTestConfig(t, base, statePath, s, det, &fakeGuard{ok: true}, runner.run)
 	cfg.Decider.OnDeactivation = [][]string{{"switch", "display"}, {"switch", "usb"}}
 
@@ -370,7 +380,7 @@ func TestAgentRetryRunsOnlyFailedCommands(t *testing.T) {
 	}
 
 	waitForLastOwner(t, statePath, "other")
-	want := [][]string{cfg.Decider.OnDeactivation[0], cfg.Decider.OnDeactivation[1], cfg.Decider.OnDeactivation[0]}
+	want := sortedCalls([][]string{cfg.Decider.OnDeactivation[0], cfg.Decider.OnDeactivation[1], cfg.Decider.OnDeactivation[0]})
 	if calls := runner.Calls(); !slices.EqualFunc(calls, want, slices.Equal[[]string]) {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}
@@ -588,6 +598,60 @@ func TestGiveAwayAssignmentTimesOut(t *testing.T) {
 	got := a.giveAwayAssignment(context.Background(), state.Assignment{Kind: state.KindScreen, Name: "LG", Input: "60:51=0F"})
 	if !errors.Is(got, errSwitchTimeout) {
 		t.Fatalf("error = %v, want errSwitchTimeout", got)
+	}
+}
+
+// A batch is given away in parallel: the devices do not wait behind a hung
+// monitor write, and two devices behind one receiver are sent one after the
+// other.
+func TestGiveAwayRunsInParallel(t *testing.T) {
+	release := make(chan struct{})
+	sent := make(chan string, 2)
+	var inFlight, overlapped atomic.Int32
+	a := &agent{
+		cfg: Config{
+			SwitchTimeout: time.Minute,
+			WriteScreen: func(context.Context, screen.Write, string) error {
+				<-release
+				return nil
+			},
+			SendHID: func(_ context.Context, tg hidpp.Target, _ uint8) (bool, error) {
+				if inFlight.Add(1) > 1 {
+					overlapped.Store(1)
+				}
+				time.Sleep(10 * time.Millisecond)
+				inFlight.Add(-1)
+				sent <- tg.String()
+				return true, nil
+			},
+		},
+		hids: map[string]hidpp.Declaration{
+			"keyboard": {Name: "keyboard", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 1}, Channel: 1},
+			"mouse":    {Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}, Channel: 1},
+		},
+	}
+	batch := []state.Assignment{
+		{Kind: state.KindScreen, Name: "LG", Assignee: "mac", Seq: 3, Input: "F4:50=D1"},
+		{Kind: state.KindHID, Name: "keyboard", Assignee: "mac", Seq: 3, Channel: 2},
+		{Kind: state.KindHID, Name: "mouse", Assignee: "mac", Seq: 3, Channel: 2},
+	}
+	done := make(chan map[state.AssignmentKey]error)
+	go func() { done <- a.giveAwayAll(context.Background(), batch) }()
+	for range 2 {
+		select {
+		case <-sent:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the devices waited behind the monitor write")
+		}
+	}
+	close(release)
+	for key, err := range <-done {
+		if err != nil {
+			t.Errorf("%s: %v", key, err)
+		}
+	}
+	if overlapped.Load() != 0 {
+		t.Fatal("two sends overlapped on one receiver")
 	}
 }
 

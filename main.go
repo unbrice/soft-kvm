@@ -423,9 +423,9 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	}
 	fs.Var(v.declareScreen, "declare-screen", "this host shows the monitor `'NAME INPUT [TABLE]'` on INPUT; repeat per monitor; required by take-screen")
 	fs.Var(v.declareHID, "declare-hid", "the device `'NAME VID:PID[:SLOT] [host=N]'` reaches this host, on Easy-Switch channel N; repeat per device; take-hid takes those with a host=N")
-	fs.Var(v.onActivation, "on-activation", "run `COMMAND` when this host becomes the owner; repeat for several, they run in order; take-screen and take-hid are commands of this list only")
+	fs.Var(v.onActivation, "on-activation", "run `COMMAND` when this host becomes the owner; repeat for several, they run in parallel (for an order, one sh -c 'a; b'); take-screen and take-hid are commands of this list only")
 	fs.Var(v.onActivation, "A", "short for --on-activation `COMMAND`")
-	fs.Var(v.onDeactivation, "on-deactivation", "run `COMMAND` when this host stops being the owner; repeat for several, they run in order")
+	fs.Var(v.onDeactivation, "on-deactivation", "run `COMMAND` when this host stops being the owner; repeat for several, they run in parallel (for an order, one sh -c 'a; b')")
 	fs.Var(v.onDeactivation, "D", "short for --on-deactivation `COMMAND`")
 	if runtime.GOOS == "darwin" {
 		fs.BoolVar(&v.noGuards, "no-guards", false, "disable macOS AC-power and display guards")

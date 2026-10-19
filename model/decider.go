@@ -49,7 +49,7 @@ var ErrNotHere = errors.New("nothing to move on this host")
 // results back as the next Observation (SPEC §11.3).
 type Decision struct {
 	Claim    string             // non-empty: POST /claim/<id>
-	Run      []Command          // run these commands, in order
+	Run      []Command          // run these commands, in parallel
 	GiveAway []state.Assignment // give away what these assignments name: move each screen or device to its assignee
 	Notify   bool               // run --notify-cmd
 	Save     *state.AgentState  // non-nil: persist this as agent.json
@@ -126,7 +126,7 @@ const (
 	awaitingArrival               // a device sent: waiting for the assignee to report it arrived
 	failed                        // the issue failed, or the device did not arrive in time
 	done                          // succeeded, arrived, or nothing to move here
-	superseded                    // a newer take of the same name replaced its assignment
+	dropped                       // a newer state no longer called for it: see dropReason
 )
 
 // ownership is who owns, under which activation: what /state says, and what
@@ -173,20 +173,40 @@ func (h handled) agentState() *state.AgentState {
 // rateLimiter holds back giving an assignment away, never commands (SPEC
 // §4.3), two ways: a cooldown per name after each attempt, and a circuit
 // breaker: BreakerMax attempts of one name within BreakerWindow pause every
-// name for BreakerPause.
+// name for BreakerPause. It stores when the attempts were made, and derives
+// both from them.
 type rateLimiter struct {
-	cfg           DeciderConfig
-	cooldownUntil map[state.AssignmentKey]time.Time
-	pausedUntil   time.Time                           // every name, by the breaker
-	recent        map[state.AssignmentKey][]time.Time // attempts per name, within the breaker window
+	cfg DeciderConfig
+	// recent is the attempts per name still within the cooldown or the
+	// breaker window.
+	recent    map[state.AssignmentKey][]time.Time
+	trippedAt time.Time // the attempt that last tripped the breaker
 }
 
 func newRateLimiter(cfg DeciderConfig) rateLimiter {
 	return rateLimiter{
-		cfg:           cfg,
-		cooldownUntil: make(map[state.AssignmentKey]time.Time),
-		recent:        make(map[state.AssignmentKey][]time.Time),
+		cfg:    cfg,
+		recent: make(map[state.AssignmentKey][]time.Time),
 	}
+}
+
+// cooldownEnds is when the cooldown after the last attempt of key ends; zero
+// when key was never attempted.
+func (l *rateLimiter) cooldownEnds(key state.AssignmentKey) time.Time {
+	r := l.recent[key]
+	if len(r) == 0 {
+		return time.Time{}
+	}
+	return r[len(r)-1].Add(l.cfg.Cooldown)
+}
+
+// pauseEnds is when the pause the breaker last tripped ends; zero when it
+// never tripped.
+func (l *rateLimiter) pauseEnds() time.Time {
+	if l.trippedAt.IsZero() {
+		return time.Time{}
+	}
+	return l.trippedAt.Add(l.cfg.BreakerPause)
 }
 
 // limitedUntil reports until when key may not be given away, and why; the zero
@@ -194,34 +214,36 @@ func newRateLimiter(cfg DeciderConfig) rateLimiter {
 func (l *rateLimiter) limitedUntil(now time.Time, key state.AssignmentKey) (time.Time, string) {
 	var until time.Time
 	var parts []string
-	if t := l.cooldownUntil[key]; now.Before(t) {
+	if t := l.cooldownEnds(key); now.Before(t) {
 		until = t
 		parts = append(parts, fmt.Sprintf("cooldown until %v", t))
 	}
-	if now.Before(l.pausedUntil) {
-		if l.pausedUntil.After(until) {
-			until = l.pausedUntil
+	if t := l.pauseEnds(); now.Before(t) {
+		if t.After(until) {
+			until = t
 		}
-		parts = append(parts, fmt.Sprintf("every give-away paused until %v", l.pausedUntil))
+		parts = append(parts, fmt.Sprintf("every give-away paused until %v", t))
 	}
 	return until, strings.Join(parts, ", ")
 }
 
-// count records an attempt to give key away: its cooldown starts, and it counts
-// toward the breaker.
+// count records an attempt to give key away at now, and trips the breaker
+// when it makes BreakerMax attempts of key within BreakerWindow.
 func (l *rateLimiter) count(now time.Time, key state.AssignmentKey) {
-	l.cooldownUntil[key] = now.Add(l.cfg.Cooldown)
-	cutoff := now.Add(-l.cfg.BreakerWindow)
+	cutoff := now.Add(-max(l.cfg.BreakerWindow, l.cfg.Cooldown))
+	inWindow := 1
 	var kept []time.Time
 	for _, at := range l.recent[key] {
 		if at.After(cutoff) {
 			kept = append(kept, at)
 		}
+		if at.After(now.Add(-l.cfg.BreakerWindow)) {
+			inWindow++
+		}
 	}
-	kept = append(kept, now)
-	l.recent[key] = kept
-	if len(kept) >= l.cfg.BreakerMax {
-		l.pausedUntil = now.Add(l.cfg.BreakerPause)
+	l.recent[key] = append(kept, now)
+	if inWindow >= l.cfg.BreakerMax {
+		l.trippedAt = now
 	}
 }
 
@@ -233,17 +255,55 @@ type taskHeader struct {
 	status      status
 	attempts    int
 	lastFailure string    // why it last failed
-	retryAt     time.Time // failed: not issued again before this
+	lastIssued  time.Time // when it was last issued
+	// dropReason is why a newer state no longer calls for the task. An issued
+	// task is only marked, since the worker is still on it: once its result
+	// arrives, it is done if it succeeded and dropped otherwise.
+	dropReason string
+}
+
+// drop drops the task for reason, or marks it when it is issued. A finished
+// task stays as it is.
+func (h *taskHeader) drop(reason string) {
+	switch h.status {
+	case done, dropped:
+		return
+	case issued:
+		if h.dropReason == "" {
+			h.dropReason = reason
+		}
+		return
+	}
+	h.status, h.dropReason = dropped, reason
+}
+
+// report records the result of the task's issue: done, or failed — dropped
+// instead when it was marked meanwhile, as no retry is called for.
+func (h *taskHeader) report(err error) {
+	switch {
+	case err == nil:
+		h.status = done
+	case h.dropReason != "":
+		h.status = dropped
+	default:
+		h.status, h.lastFailure = failed, err.Error()
+	}
 }
 
 func (h *taskHeader) retriable(maxAttempts int) bool {
 	return h.status == failed && h.attempts < maxAttempts
 }
 
+// retryAt is when a failed task may be issued again: spacing after its last
+// issue.
+func (h *taskHeader) retryAt(spacing time.Duration) time.Time {
+	return h.lastIssued.Add(spacing)
+}
+
 // due reports whether the task is to be issued at now: it never was, or it
-// failed with attempts left and its retryAt has passed.
-func (h *taskHeader) due(now time.Time, maxAttempts int) bool {
-	return h.status == pending || h.retriable(maxAttempts) && !now.Before(h.retryAt)
+// failed with attempts left and spacing has passed since its last issue.
+func (h *taskHeader) due(now time.Time, maxAttempts int, spacing time.Duration) bool {
+	return h.status == pending || h.retriable(maxAttempts) && !now.Before(h.retryAt(spacing))
 }
 
 // issueLog names the task in the log of its issue: by name the first time,
@@ -256,10 +316,10 @@ func (h *taskHeader) issueLog() string {
 }
 
 // issue marks the task issued at now.
-func (h *taskHeader) issue(now time.Time, spacing time.Duration) {
+func (h *taskHeader) issue(now time.Time) {
 	h.status = issued
 	h.attempts++
-	h.retryAt = now.Add(spacing)
+	h.lastIssued = now
 }
 
 // commandTask runs one -A or -D command. Each is retried on its own, so a
@@ -278,10 +338,12 @@ type assignmentTask struct {
 	// and the breaker. Nothing to move here is not a write, and the breaker
 	// exists to stop write loops.
 	triedToMove bool
-	// obsolete is set when a newer take replaces the assignment of an issued
-	// task: it is superseded once its result arrives, whatever the result.
-	obsolete        bool
-	arrivalDeadline time.Time // awaitingArrival: when the arrival window closes
+	sentAt      time.Time // awaitingArrival: when the worker reported the device sent
+}
+
+// arrivalDeadline is when the arrival window of a device sent closes.
+func (t *assignmentTask) arrivalDeadline(window time.Duration) time.Time {
+	return t.sentAt.Add(window)
 }
 
 // record is what a job adds to handled once its tasks are settled, whether or
@@ -302,15 +364,18 @@ func (r record) String() string {
 	if len(r.seqs) > 0 {
 		parts = append(parts, fmt.Sprintf("%d assignments", len(r.seqs)))
 	}
+	if len(parts) == 0 {
+		return "nothing"
+	}
 	return strings.Join(parts, ", ")
 }
 
 // job is the work in flight: the -A or -D commands an ownership change runs,
-// or the assignments a reconcile gives away, issued together; then, once every
-// task is settled, the record of what it handled — a restart before the
-// record runs the tasks again. A job is built whole, its tasks pending.
+// or the assignments a reconcile gives away, issued together; then, once every task is settled, the record of what it handled —
+// a restart before the record runs the tasks again. A job is built whole, its
+// tasks pending, and drops the tasks a newer state no longer calls for.
 type job struct {
-	commands    []*commandTask    // in the order the flags list them
+	commands    []*commandTask    // in the order the flags list them, run in parallel
 	assignments []*assignmentTask // in the order /state lists them
 	record      record
 }
@@ -332,7 +397,7 @@ func (j *job) headers() iter.Seq[*taskHeader] {
 }
 
 // settled reports whether nothing is left to issue, in flight or left to
-// retry: every task is done, superseded or out of attempts.
+// retry: every task is done, dropped or out of attempts.
 func (j *job) settled(maxAttempts int) bool {
 	for h := range j.headers() {
 		if h.status == pending || h.status == issued || h.status == awaitingArrival || h.retriable(maxAttempts) {
@@ -354,24 +419,24 @@ func (j *job) busy() bool {
 }
 
 // issue marks the tasks due at now issued and returns the Decision that
-// carries them out; ok is false when none is due.
+// carries them out; ok is false when none is due. The tasks due go together:
+// the worker runs them in parallel.
 func (j *job) issue(now time.Time, maxAttempts int, spacing time.Duration) (d Decision, ok bool) {
 	starting := false
-	for h := range j.headers() {
-		starting = starting || h.status == pending
-	}
 	var commands, assignments []string
 	for _, t := range j.commands {
-		if t.due(now, maxAttempts) {
+		if t.due(now, maxAttempts, spacing) {
+			starting = starting || t.status == pending
 			commands = append(commands, t.issueLog())
-			t.issue(now, spacing)
+			t.issue(now)
 			d.Run = append(d.Run, t.cmd)
 		}
 	}
 	for _, t := range j.assignments {
-		if t.due(now, maxAttempts) {
+		if t.due(now, maxAttempts, spacing) {
+			starting = starting || t.status == pending
 			assignments = append(assignments, t.issueLog())
-			t.issue(now, spacing)
+			t.issue(now)
 			d.GiveAway = append(d.GiveAway, t.assignment)
 		}
 	}
@@ -396,7 +461,7 @@ func (j *job) issue(now time.Time, maxAttempts int, spacing time.Duration) (d De
 // expire fails the assignments awaiting arrival whose window closed by now.
 func (j *job) expire(now time.Time, window time.Duration) {
 	for _, t := range j.assignments {
-		if t.status == awaitingArrival && !now.Before(t.arrivalDeadline) {
+		if t.status == awaitingArrival && !now.Before(t.arrivalDeadline(window)) {
 			t.status = failed
 			t.lastFailure = fmt.Sprintf("did not arrive within %v", window)
 		}
@@ -405,17 +470,17 @@ func (j *job) expire(now time.Time, window time.Duration) {
 
 // deadlines lists when the job next needs attention: the arrival windows, and
 // — once no issue is outstanding — the retries.
-func (j *job) deadlines(maxAttempts int) []time.Time {
+func (j *job) deadlines(maxAttempts int, spacing, window time.Duration) []time.Time {
 	var ds []time.Time
 	for _, t := range j.assignments {
 		if t.status == awaitingArrival {
-			ds = append(ds, t.arrivalDeadline)
+			ds = append(ds, t.arrivalDeadline(window))
 		}
 	}
 	if !j.busy() {
 		for h := range j.headers() {
 			if h.retriable(maxAttempts) {
-				ds = append(ds, h.retryAt)
+				ds = append(ds, h.retryAt(spacing))
 			}
 		}
 	}
@@ -437,29 +502,21 @@ func (j *job) reportRun(results []error) (ok bool) {
 			err = results[i]
 		}
 		i++
-		if err != nil {
-			t.status, t.lastFailure = failed, err.Error()
-		} else {
-			t.status = done
-		}
+		t.report(err)
 	}
 	return ok
 }
 
-// reportGiveAway records the results of the assignments issued. An assignment
-// with no result counts as failed: its batch never reported it. A device sent
-// away awaits its arrival until now+window. ok is false when no assignment is
+// reportGiveAway records the results of the assignments issued, reported at
+// now. An assignment with no result counts as failed: its batch never reported
+// it. A device sent away awaits its arrival. ok is false when no assignment is
 // issued: the result is late.
-func (j *job) reportGiveAway(now time.Time, results map[state.AssignmentKey]error, window time.Duration) (ok bool) {
+func (j *job) reportGiveAway(now time.Time, results map[state.AssignmentKey]error) (ok bool) {
 	for _, t := range j.assignments {
 		if t.status != issued {
 			continue
 		}
 		ok = true
-		if t.obsolete {
-			t.status = superseded
-			continue
-		}
 		key := t.assignment.Key()
 		err, reported := results[key]
 		notHere := errors.Is(err, ErrNotHere)
@@ -475,41 +532,65 @@ func (j *job) reportGiveAway(now time.Time, results map[state.AssignmentKey]erro
 			// A screen has no receipt: the write was made, and that is all.
 			t.status = done
 		default:
-			t.status, t.arrivalDeadline = awaitingArrival, now.Add(window)
+			t.status, t.sentAt = awaitingArrival, now
+		}
+		if t.dropReason != "" && t.status != done {
+			// Not retried, and a device sent is not waited for.
+			t.status = dropped
 		}
 	}
 	return ok
 }
 
-// applyState brings the assignment tasks up to date with a newer state s:
-// those it made obsolete are superseded, and the devices it shows arrived are
-// done.
-func (j *job) applyState(s *state.ServerState) {
+// applyState brings the job up to date with the newest state s, as host me
+// sees it: it drops the tasks s no longer calls for, and finishes the devices
+// s shows arrived. It is idempotent, so it runs on every step of the job.
+func (j *job) applyState(s *state.ServerState, me string) {
 	if s == nil {
 		return
 	}
+	if reason := j.commandsExpired(s, me); reason != "" {
+		for _, t := range j.commands {
+			t.drop(reason)
+		}
+	}
 	current := assignmentsByKey(s)
-	j.supersedeObsoleteAssignments(current)
+	j.dropExpiredAssignments(s, current)
 	j.markArrived(current)
 }
 
-// supersedeObsoleteAssignments drops the assignment tasks a newer state made
-// obsolete: an assignment that is gone or has a new seq was superseded, and the
-// new one is pending on its own, not part of this job. Only unfinished work is
-// superseded: a done task already moved its screen or device. An issued task is
-// only marked: it is superseded once its result arrives.
-func (j *job) supersedeObsoleteAssignments(current map[state.AssignmentKey]state.Assignment) {
+// commandsExpired says why s no longer calls for the job's commands, "" when
+// it still does: an activation once s shows another owner or activation, a
+// deactivation once the ownership is back on me.
+func (j *job) commandsExpired(s *state.ServerState, me string) string {
+	o := j.record.ownership
+	switch {
+	case o == nil:
+		return ""
+	case o.owner == me && (s.Owner != me || s.Activation != o.activation):
+		return fmt.Sprintf("the ownership moved on (owner %q, activation %d)", s.Owner, s.Activation)
+	case o.owner != me && s.Owner == me:
+		return "the ownership came back to me"
+	}
+	return ""
+}
+
+// dropExpiredAssignments drops the assignment tasks s no longer calls for. An
+// assignment that is gone or has a new seq was replaced by a newer take, which
+// is pending on its own, not part of this job; the record keeps the old seq
+// as handled. An assignee no longer live stops the tasks not in flight, and
+// leaves the assignment out of the record, so it stays pending until a state
+// shows the assignee live again — the gate that held it back at reconcile.
+func (j *job) dropExpiredAssignments(s *state.ServerState, current map[state.AssignmentKey]state.Assignment) {
 	for _, t := range j.assignments {
-		if t.status == done {
-			continue
-		}
-		if a, ok := current[t.assignment.Key()]; ok && a.Seq == t.assignment.Seq {
-			continue
-		}
-		if t.status == issued {
-			t.obsolete = true
-		} else {
-			t.status = superseded
+		key := t.assignment.Key()
+		a, ok := current[key]
+		switch {
+		case !ok || a.Seq != t.assignment.Seq:
+			t.drop("a newer take replaced its assignment")
+		case !s.Live[t.assignment.Assignee] && t.status != issued && t.status != done && t.status != dropped:
+			t.drop(fmt.Sprintf("assignee %q is not live; it stays pending", t.assignment.Assignee))
+			delete(j.record.seqs, key)
 		}
 	}
 }
@@ -548,8 +629,8 @@ func (j *job) failureLogs() []Decision {
 		switch h.status {
 		case failed:
 			ds = append(ds, Decision{Log: fmt.Sprintf("%s failed after %d attempts (%s)", h.name, h.attempts, h.lastFailure)})
-		case superseded:
-			ds = append(ds, Decision{Log: fmt.Sprintf("%s dropped: a newer take replaced its assignment", h.name)})
+		case dropped:
+			ds = append(ds, Decision{Log: fmt.Sprintf("%s dropped: %s", h.name, h.dropReason)})
 		}
 	}
 	return ds
@@ -597,9 +678,10 @@ type Decider struct {
 	// given away: a reason is logged again only once it changed.
 	reasons map[state.AssignmentKey]string
 
-	// claimAt is when to claim the ownership, once no job is in flight: Settle
-	// after the last attach. Zero when no claim waits.
-	claimAt time.Time
+	// lastAttach is when the last attach edge arrived, and claimedAttach the
+	// attach the last claim answered: a claim waits while they differ.
+	lastAttach    time.Time
+	claimedAttach time.Time
 }
 
 // NewDecider creates a decider from what agent.json says this host handled.
@@ -666,16 +748,22 @@ func (m *Decider) handleState(s *state.ServerState) []Decision {
 		}}
 	}
 	m.latest = s
-	if m.job != nil {
-		m.job.applyState(s)
-	}
 	return nil
 }
 
 // handleAttach processes a receiver attach edge: the claim waits Settle after
-// it, so a flapping receiver claims once it is stable.
+// the last one, so a flapping receiver claims once it is stable.
 func (m *Decider) handleAttach(now time.Time) {
-	m.claimAt = now.Add(m.cfg.Settle)
+	m.lastAttach = now
+}
+
+// claimAt is when to claim the ownership, once no job is in flight: Settle
+// after an attach no claim answered yet; zero when every attach was answered.
+func (m *Decider) claimAt() time.Time {
+	if m.lastAttach.Equal(m.claimedAttach) {
+		return time.Time{}
+	}
+	return m.lastAttach.Add(m.cfg.Settle)
 }
 
 // handleRan records the results of the commands in flight. A result is
@@ -690,11 +778,9 @@ func (m *Decider) handleRan(d *CommandsRun) []Decision {
 // handleGaveAway records the results of the assignments in flight. A result is
 // accepted only while its issue is outstanding (SPEC §4.3).
 func (m *Decider) handleGaveAway(now time.Time, d *AssignmentsGivenAway) []Decision {
-	if m.job == nil || !m.job.reportGiveAway(now, d.Results, m.cfg.ArrivalWindow) {
+	if m.job == nil || !m.job.reportGiveAway(now, d.Results) {
 		return []Decision{{Log: "ignoring a late give-away result"}}
 	}
-	// The latest state may already show a sent device arrived.
-	m.job.applyState(m.latest)
 	return nil
 }
 
@@ -857,8 +943,8 @@ func (m *Decider) advanceTime(now time.Time, ds *[]Decision) {
 			if m.job != nil {
 				return
 			}
-		case !m.claimAt.IsZero() && !m.claimAt.After(now):
-			m.claimAt = time.Time{}
+		case !m.claimAt().IsZero() && !m.claimAt().After(now):
+			m.claimedAttach = m.lastAttach
 			*ds = append(*ds, Decision{Claim: m.cfg.ID, Log: fmt.Sprintf("claim %q", m.cfg.ID)})
 		case m.latest != nil:
 			j, more := m.reconcile(now, m.latest)
@@ -873,12 +959,14 @@ func (m *Decider) advanceTime(now time.Time, ds *[]Decision) {
 	}
 }
 
-// advanceJob moves the job in flight on at now: it expires closed arrival
-// windows and, once no issue is outstanding, issues the tasks due. Once every
+// advanceJob moves the job in flight on at now: it brings it up to date with
+// the latest state, expires closed arrival windows and, once no issue is
+// outstanding, issues the tasks due. Once every
 // task is settled, the job is over: what it handled is recorded and saved, the
 // names it tried to move count toward the rate limit, what failed is logged
 // and, when this host was the previous assignee, notified.
 func (m *Decider) advanceJob(now time.Time, ds *[]Decision) {
+	m.job.applyState(m.latest, m.cfg.ID)
 	m.job.expire(now, m.cfg.ArrivalWindow)
 	if m.job.busy() {
 		return
@@ -906,10 +994,10 @@ func (m *Decider) advanceJob(now time.Time, ds *[]Decision) {
 // wakeAt returns the earliest future deadline the decider is tracking: the
 // claim, then the job's deadlines, or the rate limiter when idle.
 func (m *Decider) wakeAt(now time.Time) time.Time {
-	candidates := []time.Time{m.claimAt}
+	candidates := []time.Time{m.claimAt()}
 	switch {
 	case m.job != nil:
-		candidates = append(candidates, m.job.deadlines(m.maxAttempts())...)
+		candidates = append(candidates, m.job.deadlines(m.maxAttempts(), m.cfg.RetrySpacing, m.cfg.ArrivalWindow)...)
 	case m.latest != nil:
 		candidates = append(candidates, limitLifts(pendingAssignments(now, m.latest, m.cfg.ID, *m.handled, &m.limiter)))
 	}

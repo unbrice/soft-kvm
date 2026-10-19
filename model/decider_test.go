@@ -189,6 +189,18 @@ func saved(t *testing.T, ds outcome) *state.AgentState {
 	return rec
 }
 
+// coolUntil makes key's cooldown end at t: its last attempt was Cooldown
+// before.
+func coolUntil(m *Decider, key state.AssignmentKey, t time.Time) {
+	m.limiter.recent[key] = []time.Time{t.Add(-m.cfg.Cooldown)}
+}
+
+// pauseUntil makes the breaker's pause end at t: it tripped BreakerPause
+// before.
+func pauseUntil(m *Decider, t time.Time) {
+	m.limiter.trippedAt = t.Add(-m.cfg.BreakerPause)
+}
+
 func state_(s *state.ServerState) Observation { return Observation{State: s} }
 
 // ran is the result of a run of commands, one error per command.
@@ -315,23 +327,21 @@ func TestActivation(t *testing.T) {
 
 	t.Run("never waits behind the cooldown or the breaker", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 1, nil))
-		m.limiter.cooldownUntil[lgKey] = at(100)
-		m.limiter.pausedUntil = at(100)
+		coolUntil(m, lgKey, at(100))
+		pauseUntil(m, at(100))
 		want(t, m.decide(at(0), state_(mk("linux", 2))), "run:take-screen@2")
 	})
 
-	t.Run("a flip away during the activation deactivates when it ends", func(t *testing.T) {
+	t.Run("a flip away during the activation deactivates when its command returns", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
 		// Stashed: the activation is still running.
 		want(t, m.decide(at(1), state_(mk("mac", 3))))
-		// The activation spends its attempts first (a 409 each time), then the
-		// deactivation runs right after.
-		for _, sec := range []int{2, 3, 5} {
-			want(t, m.decide(at(sec), Observation{Ran: ran(errors.New("409"))}), "run:take-screen@2")
-		}
-		ds := m.decide(at(7), Observation{Ran: ran(errors.New("409"))})
+		// Its 409 is not retried: the flip expired the activation, which is
+		// recorded as run, and the deactivation follows at once.
+		ds := m.decide(at(2), Observation{Ran: ran(errors.New("409"))})
 		want(t, ds, "save", "run:down")
+		wantLog(t, ds, "-A take-screen dropped: the ownership moved on")
 		if rec := saved(t, ds); rec.HandledOwner != "linux" {
 			t.Fatalf("record = %+v", rec)
 		}
@@ -366,8 +376,8 @@ func TestDeactivation(t *testing.T) {
 
 	t.Run("no cooldown and no breaker", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
-		m.limiter.cooldownUntil[lgKey] = at(100)
-		m.limiter.pausedUntil = at(100)
+		coolUntil(m, lgKey, at(100))
+		pauseUntil(m, at(100))
 		want(t, m.decide(at(0), state_(mk("mac", 2))), "run:down")
 	})
 
@@ -406,21 +416,19 @@ func TestDeactivation(t *testing.T) {
 		want(t, ds, "save", "run:take-screen@3")
 	})
 
-	t.Run("a flip back during a failing deactivation activates when it ends", func(t *testing.T) {
+	t.Run("a flip back during a failing deactivation stops it and activates", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(1), state_(mk("linux", 3))))
-		m.decide(at(2), Observation{Ran: ran(errors.New("x"))})
-		m.decide(at(3), Observation{})
-		m.decide(at(5), Observation{Ran: ran(errors.New("x"))})
-		m.decide(at(7), Observation{Ran: ran(errors.New("x"))})
-		ds := m.decide(at(9), Observation{Ran: ran(errors.New("x"))})
+		ds := m.decide(at(2), Observation{Ran: ran(errors.New("x"))})
 		want(t, ds, "save", "run:take-screen@3")
+		wantLog(t, ds, "-D down dropped: the ownership came back to me")
 	})
 }
 
-// Each -A or -D command is a task of its own: a retry re-runs only those that
-// failed, in their order (SPEC §4.3).
+// Each -A or -D command is a task of its own, all issued together and run in
+// parallel: a retry re-runs only those that failed, and a flip drops the
+// retries (SPEC §4.3).
 func TestCommands(t *testing.T) {
 	two := func(t *testing.T, id string, rec state.AgentState) *Decider {
 		cfg := testConfig(id)
@@ -441,7 +449,21 @@ func TestCommands(t *testing.T) {
 	t.Run("a command with no result counts as failed", func(t *testing.T) {
 		m := two(t, "linux", agentAt("mac", 1, nil))
 		m.decide(at(0), state_(mk("linux", 2)))
-		want(t, m.decide(at(5), Observation{Ran: ran(nil)}), "run:b,c")
+		ds := m.decide(at(5), Observation{Ran: ran(nil)})
+		want(t, ds, "run:b,c")
+		wantLog(t, ds, "-A b attempt 2 after no result for it")
+	})
+
+	t.Run("a flip drops the retries; what succeeded is done", func(t *testing.T) {
+		m := two(t, "linux", agentAt("mac", 1, nil))
+		m.decide(at(0), state_(mk("linux", 2)))
+		want(t, m.decide(at(1), state_(mk("mac", 3))))
+		ds := m.decide(at(2), Observation{Ran: ran(nil, errors.New("x"), nil)})
+		want(t, ds, "save", "run:down")
+		wantLog(t, ds, "-A b dropped: the ownership moved on")
+		if strings.Contains(logs(ds), "-A a dropped") {
+			t.Fatalf("logs %q drop a command that ran", logs(ds))
+		}
 	})
 
 	t.Run("a command still failing is logged by name, and the record moves on", func(t *testing.T) {
@@ -502,10 +524,10 @@ func TestGiveAwayGates(t *testing.T) {
 								notLive(s, "mac")
 								s.Live["mac"] = assigneeLive
 								if cooling {
-									m.limiter.cooldownUntil[mouseKey] = at(3)
+									coolUntil(m, mouseKey, at(3))
 								}
 								if breaker {
-									m.limiter.pausedUntil = at(30)
+									pauseUntil(m, at(30))
 								}
 								ds := m.decide(at(0), state_(s))
 
@@ -813,6 +835,21 @@ func TestArrival(t *testing.T) {
 		want(t, m.decide(at(3), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true), screenAssignment("LG", "mac", "linux", 3)))), "save")
 	})
 
+	t.Run("an assignee no longer live stops the retries, and the assignment stays pending", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		lg := screenAssignment("LG", "mac", "linux", 3)
+		m.decide(at(0), state_(mk("mac", 2, lg)))
+		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:1")
+		ds := m.decide(at(0), state_(notLive(mk("mac", 2, lg), "mac")))
+		want(t, ds, "save")
+		wantLog(t, ds, `screen/LG dropped: assignee "mac" is not live`)
+		if _, ok := saved(t, ds).HandledSeqs["screen/LG"]; ok {
+			t.Fatalf("record = %+v, want LG left pending", saved(t, ds))
+		}
+		// Back, and past the cooldown its attempt started: given away again.
+		want(t, m.decide(at(6), state_(mk("mac", 2, lg))), "give:screen/LG")
+	})
+
 	t.Run("a device already on the assignee is never sent", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true))))
@@ -906,8 +943,8 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 				t.Fatalf("an ErrNotHere assignment must still be marked seen: %+v", rec)
 			}
 		}
-		if !m.limiter.pausedUntil.IsZero() {
-			t.Fatalf("paused until %v", m.limiter.pausedUntil)
+		if !m.limiter.pauseEnds().IsZero() {
+			t.Fatalf("paused until %v", m.limiter.pauseEnds())
 		}
 	})
 
@@ -918,7 +955,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 		for _, sec := range []int{2, 4, 6, 8} {
 			m.decide(at(sec), Observation{GaveAway: fail})
 		}
-		if got := m.limiter.cooldownUntil[lgKey]; !got.Equal(at(13)) {
+		if got := m.limiter.cooldownEnds(lgKey); !got.Equal(at(13)) {
 			t.Fatalf("cooldown until %v, want %v", got, at(13))
 		}
 		if len(m.limiter.recent[lgKey]) != 1 {
@@ -943,8 +980,8 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 		m.decide(at(0), state_(assignment(3)))
 		m.decide(at(1), state_(assignment(4))) // the job is still in flight
 		want(t, m.decide(at(2), Observation{GaveAway: notHere}), "save", "give:screen/LG")
-		if len(m.limiter.recent[lgKey]) != 0 || !m.limiter.cooldownUntil[lgKey].IsZero() {
-			t.Fatalf("cooldown %v, count %d; want neither", m.limiter.cooldownUntil[lgKey], len(m.limiter.recent[lgKey]))
+		if len(m.limiter.recent[lgKey]) != 0 || !m.limiter.cooldownEnds(lgKey).IsZero() {
+			t.Fatalf("cooldown %v, count %d; want neither", m.limiter.cooldownEnds(lgKey), len(m.limiter.recent[lgKey]))
 		}
 	})
 
@@ -1047,7 +1084,7 @@ func TestAttachSettle(t *testing.T) {
 
 	t.Run("a claim is not blocked by the cooldown or the breaker", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
-		m.limiter.pausedUntil = at(100)
+		pauseUntil(m, at(100))
 		m.decide(at(0), Observation{Attach: true})
 		want(t, m.decide(at(2), Observation{}), "claim:linux")
 	})
