@@ -88,9 +88,9 @@ func TestRenderDevices(t *testing.T) {
 		},
 		{
 			hidDevice: hidDevice{
-				key:        deviceKey{vid: 0x1532, pid: 0x0285},
-				mfr:        "Razer",
-				product:    "DeathAdder V2",
+				key:        deviceKey{vid: 0x046d, pid: 0xb023},
+				mfr:        "Logitech",
+				product:    "MX Master 3",
 				interfaces: []ifaceUsage{{0x01, 0x02}, {0xFF00, 0x01}},
 			},
 			status: probeFailed,
@@ -119,10 +119,10 @@ func TestRenderDevices(t *testing.T) {
 	if !strings.Contains(out, "🔒 HID++ scan denied") {
 		t.Error("missing scan failure reason")
 	}
-	// The Razer mouse has no keyboard interface and no successful probe:
+	// The denied mouse has no keyboard interface and no successful probe:
 	// it is not a candidate, and a failed scan must not tag it HID++.
 	for line := range strings.Lines(out) {
-		if !strings.Contains(line, "1532:0285") {
+		if !strings.Contains(line, "046d:b023") {
 			continue
 		}
 		if strings.HasPrefix(line, triggerMark) {
@@ -189,7 +189,7 @@ func TestRenderSuggestions(t *testing.T) {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b,046d:c548 -- screen-switch DP1_HDMI_ETC\n") {
+	if !strings.Contains(out, "soft-kvm connect --trigger 046d:b35b,046d:c548 \\\n  --on-deactivation 'screen-switch DP1_HDMI_ETC'\n") {
 		t.Error("missing suggestion listing the keyboard-capable devices only, sorted")
 	}
 	if strings.Contains(out, "1532:0285") {
@@ -252,7 +252,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "--trigger 046d:b35b") || !strings.Contains(out, "-- hid-switch 046d:b034") {
+	if !strings.Contains(out, "--trigger 046d:b35b") || !strings.Contains(out, "--on-deactivation 'hid-switch 046d:b034'") {
 		t.Errorf("missing direct-mouse hid-switch suggestion:\n%s", out)
 	}
 	// No host index on the command itself: the winner publishes its channel
@@ -282,7 +282,7 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 	if err := renderSuggestions(&buf, []probedDevice{keyboard, withMouse}, "screen-switch DP1_HDMI_ETC"); err != nil {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
-	if out := buf.String(); !strings.Contains(out, "-- hid-switch 046d:c548") {
+	if out := buf.String(); !strings.Contains(out, "--on-deactivation 'hid-switch 046d:c548'") {
 		t.Errorf("missing receiver hid-switch suggestion:\n%s", out)
 	}
 
@@ -320,26 +320,38 @@ func TestRenderSuggestionsHIDSwitch(t *testing.T) {
 		t.Fatalf("renderSuggestions: %v", err)
 	}
 	out = buf.String()
-	action := "-- hid-switch 046d:b034 -- hid-switch 046d:b35b"
+	actions := []string{"--on-deactivation 'screen-switch DP1_HDMI_ETC'", "--on-deactivation 'hid-switch 046d:b034'", "--on-deactivation 'hid-switch 046d:b35b'"}
 	if !strings.Contains(out, "# FOLLOW THE KEYBOARD") || !strings.Contains(out, "--trigger 046d:b35b") {
 		t.Errorf("missing keyboard-led suggestion:\n%s", out)
 	}
 	if !strings.Contains(out, "# FOLLOW THE MOUSE") || !strings.Contains(out, "--trigger 046d:b034") {
 		t.Errorf("missing mouse-led suggestion:\n%s", out)
 	}
-	if strings.Count(out, action) != 2 {
-		t.Errorf("both gestures must carry the same action %q:\n%s", action, out)
+	for _, action := range actions {
+		if strings.Count(out, action) != 2 {
+			t.Errorf("both gestures must carry the same action %q:\n%s", action, out)
+		}
 	}
 }
 
-func TestHasHIDPP(t *testing.T) {
-	with := &hidDevice{interfaces: []ifaceUsage{{0x01, 0x06}, {0xFF43, 0x02}}}
-	without := &hidDevice{interfaces: []ifaceUsage{{0x01, 0x06}, {0x0C, 0x01}}}
-	if !with.hasHIDPP() {
-		t.Error("expected HID++")
+func TestShouldProbe(t *testing.T) {
+	vendor := []ifaceUsage{{0x01, 0x06}, {0xFF43, 0x02}}
+	cases := []struct {
+		name string
+		dev  hidDevice
+		want bool
+	}{
+		{"logitech", hidDevice{key: deviceKey{vid: logitechVID}, interfaces: vendor}, true},
+		{"logitech without vendor interface", hidDevice{key: deviceKey{vid: logitechVID}}, true},
+		{"logitech shadow", hidDevice{key: deviceKey{vid: logitechVID}, shadow: true}, false},
+		{"other vendor with vendor interface", hidDevice{key: deviceKey{vid: 0x1532}, interfaces: vendor}, false},
 	}
-	if without.hasHIDPP() {
-		t.Error("expected no HID++")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.dev.shouldProbe(); got != c.want {
+				t.Errorf("shouldProbe() = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 
@@ -365,11 +377,11 @@ func TestRenderSuggestionsNoCandidates(t *testing.T) {
 	}
 }
 
-func TestProbeAllSkipsNonHIDPP(t *testing.T) {
-	// No vendor interface and not Logitech: no goroutine, no hardware touched —
+func TestProbeAllSkipsNonLogitech(t *testing.T) {
+	// Not Logitech, vendor interface or not: no goroutine, no hardware touched —
 	// every device comes back probeSkipped, in order.
 	devices := []*hidDevice{
-		{key: deviceKey{vid: 0x1532, pid: 0x0285}, interfaces: []ifaceUsage{{0x01, 0x02}}},
+		{key: deviceKey{vid: 0x1532, pid: 0x0285}, interfaces: []ifaceUsage{{0x01, 0x02}, {0xFF00, 0x01}}},
 		{key: deviceKey{vid: 0x1050, pid: 0x0407}, interfaces: []ifaceUsage{{0x01, 0x06}}},
 	}
 	out := probeAll(t.Context(), devices)
@@ -393,8 +405,7 @@ func TestScanFailure(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"permission logitech", logitechVID, errPermission, permissionRemediation},
-		{"permission other", 0x0b05, errPermission, "no HID++ to find"},
+		{"permission", logitechVID, errPermission, permissionRemediation},
 		{"no answer", 0, errNoAnswer, "⏳ no answer"},
 		{"other", 0, errors.New("boom"), "⚠️ boom"},
 	}
@@ -518,7 +529,7 @@ func TestScreenCommand(t *testing.T) {
 		{"no display named", screen.Report{}, "screen-switch DP1_HDMI_ETC"},
 		{"standard monitor names no table", screen.Report{Displays: []screen.Display{dell}}, "screen-switch DP1_HDMI_ETC"},
 		{"two monitors need display=", screen.Report{Displays: []screen.Display{dell, asus}},
-			"screen-switch DP1_HDMI_ETC 'display=DELL U2720Q'"},
+			`screen-switch DP1_HDMI_ETC "display=DELL U2720Q"`},
 	}
 	for _, c := range cases {
 		if got := screenCommand(c.report); got != c.want {
@@ -536,9 +547,9 @@ func TestRenderScreen(t *testing.T) {
 		}
 		out := buf.String()
 		for _, want := range []string{
-			"#   ddcutil: exit status 1: No /dev/i2c devices exist.\n",
-			"#   ddcutil requires module i2c-dev.\n",
-			"\nsoft-kvm screen-switch DP1_HDMI_ETC\n",
+			"\nsoft-kvm screen-switch DP1_HDMI_ETC\n" +
+				"# ⚠️ ddcutil: exit status 1: No /dev/i2c devices exist.\n" +
+				"#    ddcutil requires module i2c-dev.\n",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("missing %q in:\n%s", want, out)
@@ -557,7 +568,7 @@ func TestRenderScreen(t *testing.T) {
 		out := buf.String()
 		for _, want := range []string{
 			"# Monitor: DELL U2720Q (DEL), mapping table standard, showing this host on dp1.\n",
-			"# dp2, hdmi1, hdmi2, usbc1 — or a raw value",
+			"port: dp2, hdmi1, hdmi2, usbc1, or a raw",
 			"\nsoft-kvm screen-switch DP1_HDMI_ETC\n",
 		} {
 			if !strings.Contains(out, want) {

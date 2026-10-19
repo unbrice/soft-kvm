@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// service_test.go: validation and rendering for the service subcommand (SPEC §5.6).
+// service_linux_test.go: validation and rendering for the service subcommand (SPEC §5.6).
 // These tests never touch /etc or ~/.config and never fork systemctl: they
 // exercise the pure validators and the renderers only.
 
@@ -185,21 +185,33 @@ func TestServeInstallRequiresToken(t *testing.T) {
 }
 
 func TestConnectInstallRefusesRoot(t *testing.T) {
-	err := validateConnectInstall(0, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"})
+	err := validateConnectInstall(0, testToken, []string{"--trigger", "046d:c52b", "-D", "screen-switch dp1"})
 	if err == nil || !strings.Contains(err.Error(), "regular user") {
 		t.Fatalf("euid 0: got %v, want a refusal naming the regular user", err)
 	}
-	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"}); err != nil {
+	if err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "-D", "screen-switch dp1"}); err != nil {
 		t.Fatalf("non-root with valid trigger: got %v, want nil", err)
 	}
 }
 
-// There is no default switch command: install refuses the same argv connect
-// would, and points at detect (SPEC §5.4).
-func TestConnectInstallRequiresSwitchCommand(t *testing.T) {
+// There is no default command: install refuses the same argv connect would,
+// and points at detect (SPEC §5.4).
+func TestConnectInstallRequiresCommand(t *testing.T) {
 	err := validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b"})
 	if err == nil || !strings.Contains(err.Error(), "soft-kvm detect") {
-		t.Fatalf("no switch command: got %v, want a refusal naming soft-kvm detect", err)
+		t.Fatalf("no command: got %v, want a refusal naming soft-kvm detect", err)
+	}
+	// Either side alone is enough.
+	for _, flag := range []string{"-A", "--on-activation", "-D", "--on-deactivation"} {
+		args := []string{"--trigger", "046d:c52b", flag, "screen-switch dp1"}
+		if err := validateConnectInstall(1000, testToken, args); err != nil {
+			t.Errorf("%s alone: got %v, want nil", flag, err)
+		}
+	}
+	// The old trailing form is refused with a pointer to the flags.
+	err = validateConnectInstall(1000, testToken, []string{"--trigger", "046d:c52b", "--", "screen-switch", "dp1"})
+	if err == nil || !strings.Contains(err.Error(), "--on-deactivation") {
+		t.Fatalf("trailing command: got %v, want a refusal naming --on-deactivation", err)
 	}
 	// A built-in command is parsed at install time, not on the first switch.
 	for _, argv := range [][]string{
@@ -207,13 +219,15 @@ func TestConnectInstallRequiresSwitchCommand(t *testing.T) {
 		{"screen-switch", "dp1", "dell"},
 		{"hid-switch", "nonsense"},
 	} {
-		args := append([]string{"--trigger", "046d:c52b", "--"}, argv...)
-		if err := validateConnectInstall(1000, testToken, args); err == nil {
-			t.Errorf("%v: got nil, want a refusal", argv)
+		for _, flag := range []string{"-A", "-D"} {
+			args := []string{"--trigger", "046d:c52b", flag, strings.Join(argv, " ")}
+			if err := validateConnectInstall(1000, testToken, args); err == nil {
+				t.Errorf("%s %v: got nil, want a refusal", flag, argv)
+			}
 		}
 	}
 	// Anything else is an external program, taken as is.
-	args := []string{"--trigger", "046d:c52b", "--", "ddcutil", "setvcp", "60", "0x11"}
+	args := []string{"--trigger", "046d:c52b", "-D", "ddcutil setvcp 60 0x11"}
 	if err := validateConnectInstall(1000, testToken, args); err != nil {
 		t.Errorf("external command: got %v, want nil", err)
 	}
@@ -224,11 +238,11 @@ func TestConnectInstallRequiresTrigger(t *testing.T) {
 		!strings.Contains(err.Error(), "--trigger") {
 		t.Fatalf("no trigger: got %v, want a refusal naming --trigger", err)
 	}
-	// A --trigger inside a switch-command argv must not satisfy the
-	// requirement: only the parsed flag counts.
-	err := validateConnectInstall(1000, testToken, []string{"--", "somecmd", "--trigger", "foo"})
+	// A --trigger inside a command must not satisfy the requirement: only
+	// the parsed flag counts.
+	err := validateConnectInstall(1000, testToken, []string{"-D", "somecmd --trigger foo"})
 	if err == nil || !strings.Contains(err.Error(), "--trigger") {
-		t.Fatalf("trigger inside switch-command argv: got %v, want a refusal naming --trigger", err)
+		t.Fatalf("trigger inside a command: got %v, want a refusal naming --trigger", err)
 	}
 }
 

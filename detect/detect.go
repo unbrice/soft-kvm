@@ -109,57 +109,70 @@ func Run(ctx context.Context, w io.Writer) error {
 // know: which monitor port the other host is plugged into.
 const inputPlaceholder = "DP1_HDMI_ETC"
 
-// screenCommand renders the screen-switch action for this host's monitor. The
-// table is spelled out only when the monitor's brand needs one — this is the
-// only place a table is ever guessed (SPEC §5.6) — and display= only when
-// there is more than one monitor to tell apart.
+// screenCommand renders the screen-switch action for this host's monitor, as
+// the command string connect's --on-deactivation splits (SPEC §5.4). The table is spelled out
+// only when the monitor's brand needs one — this is the only place a table is
+// ever guessed (SPEC §5.6) — and display= only when there is more than one
+// monitor to tell apart.
 func screenCommand(r screen.Report) string {
 	cmd := "screen-switch " + inputPlaceholder
-	if len(r.Displays) == 0 {
+	d, ok := suggestedDisplay(r)
+	if !ok {
 		return cmd
 	}
-	d := r.Displays[0]
 	if t := screen.TableFor(d.Mfg); t.Name != screen.StandardName {
 		cmd += " " + t.Name
 	}
 	if len(r.Displays) > 1 {
-		cmd += " 'display=" + strings.ReplaceAll(d.Model, "'", `'\''`) + "'"
+		cmd += ` "display=` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(d.Model) + `"`
 	}
 	return cmd
 }
 
-// renderScreen explains the screen-switch action: whether its backend works
-// here, which monitor and table were found, and which ports the placeholder can be.
-func renderScreen(w io.Writer, r screen.Report) error {
-	var b strings.Builder
-	b.WriteString("\n# screen-switch is built in as well: it points the monitor at the other\n")
-	fmt.Fprintf(&b, "# host through %s and reports whether the monitor moved.\n", r.Backend)
+// suggestedDisplay picks the monitor the suggestion is written for: the
+// first that answers DDC, else one known by EDID alone — its brand still
+// names the table. Among those a vendor-table monitor wins: a laptop panel
+// never answers DDC and maps to no table.
+func suggestedDisplay(r screen.Report) (screen.Display, bool) {
+	if len(r.Displays) > 0 {
+		return r.Displays[0], true
+	}
+	for _, d := range r.Unreachable {
+		if screen.TableFor(d.Mfg).Name != screen.StandardName {
+			return d, true
+		}
+	}
+	if len(r.Unreachable) > 0 {
+		return r.Unreachable[0], true
+	}
+	return screen.Display{}, false
+}
 
+// renderScreen explains the screen-switch action: which ports the placeholder
+// can be, which monitor and table were found and, after the command, why the
+// backend cannot reach a monitor when it cannot.
+func renderScreen(w io.Writer, r screen.Report) error {
 	table := screen.TableFor("") // no monitor named: the standard table
+	var monitors []string
 	var own string
 	ownOK := false
-	switch {
-	case r.Err != nil:
-		fmt.Fprintf(&b, "# It cannot reach a monitor from this host yet:\n")
-		for line := range strings.Lines(r.Err.Error()) {
-			fmt.Fprintf(&b, "#   %s\n", strings.TrimRight(line, "\n"))
-		}
-		b.WriteString("# Fix that and re-run detect: it also tells whether the monitor needs\n")
-		b.WriteString("# a mapping table.\n")
-	case len(r.Displays) > 0:
+	if len(r.Displays) > 0 {
 		d := r.Displays[0]
 		table = screen.TableFor(d.Mfg)
-		for _, d := range r.Displays {
-			t := screen.TableFor(d.Mfg)
-			fmt.Fprintf(&b, "# Monitor: %s (%s), mapping table %s", d.Model, d.Mfg, t.Name)
-			if a, ok := t.AliasFor(d.Input); ok && d.InputOK {
-				fmt.Fprintf(&b, ", showing this host on %s", a)
-			}
-			b.WriteString(".\n")
-		}
 		if d.InputOK {
 			own, ownOK = table.AliasFor(d.Input)
 		}
+		for _, d := range r.Displays {
+			t := screen.TableFor(d.Mfg)
+			line := fmt.Sprintf("# Monitor: %s (%s), mapping table %s", d.Model, d.Mfg, t.Name)
+			if a, ok := t.AliasFor(d.Input); ok && d.InputOK {
+				line += ", showing this host on " + a
+			}
+			monitors = append(monitors, line+".\n")
+		}
+	} else if d, ok := suggestedDisplay(r); ok {
+		table = screen.TableFor(d.Mfg)
+		monitors = append(monitors, fmt.Sprintf("# Monitor: %s (%s), mapping table %s.\n", d.Model, d.Mfg, table.Name))
 	}
 
 	var ports []string
@@ -168,13 +181,32 @@ func renderScreen(w io.Writer, r screen.Report) error {
 			ports = append(ports, a)
 		}
 	}
-	fmt.Fprintf(&b, "# Replace %s with the port the OTHER host is plugged into —\n", inputPlaceholder)
-	fmt.Fprintf(&b, "# %s — or a raw value such as 0x1B. Try it by\n", strings.Join(ports, ", "))
-	b.WriteString("# hand first: one press of the monitor's Input button undoes it.\n")
+	var b strings.Builder
+	b.WriteString("\n")
+	intro := fmt.Sprintf("screen-switch is built in as well, through %s. Replace %s with the OTHER host's port: %s, or a raw value such as 0x1B.",
+		r.Backend, inputPlaceholder, strings.Join(ports, ", "))
+	for _, line := range wrapAt(intro, 72) {
+		fmt.Fprintf(&b, "# %s\n", line)
+	}
+	for _, line := range monitors {
+		b.WriteString(line)
+	}
 	if _, err := io.WriteString(w, Dim(w, b.String())); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "soft-kvm "+screenCommand(r))
+	if _, err := fmt.Fprintln(w, "soft-kvm "+screenCommand(r)); err != nil {
+		return err
+	}
+	if r.Err == nil {
+		return nil
+	}
+	b.Reset()
+	prefix := "# ⚠️ "
+	for line := range strings.Lines(r.Err.Error()) {
+		fmt.Fprintf(&b, "%s%s\n", prefix, strings.TrimRight(line, "\n"))
+		prefix = "#    "
+	}
+	_, err := io.WriteString(w, Dim(w, b.String()))
 	return err
 }
 
@@ -222,7 +254,7 @@ func enumerateHIDDevices(ctx context.Context) ([]*hidDevice, error) {
 }
 
 // probeStatus is how one device's HID++ scan ended; the zero value is
-// probeSkipped, for devices with no vendor interface that were never
+// probeSkipped, for devices that are not Logitech's and were never
 // attempted.
 type probeStatus int
 
@@ -250,15 +282,11 @@ type probedDevice struct {
 	err    error
 }
 
-// scanFailure renders a failed scan for display. A permission fix is only
-// worth spelling out for Logitech devices: HID++ is their protocol, so a
-// denied scan anywhere else found nothing and needs no action.
+// scanFailure renders a failed scan for display.
 func (d probedDevice) scanFailure() string {
 	switch {
-	case errors.Is(d.err, errPermission) && d.key.vid == logitechVID:
-		return "🔒 HID++ scan denied — " + permissionRemediation
 	case errors.Is(d.err, errPermission):
-		return "🔒 HID++ scan denied; not a Logitech device, no HID++ to find"
+		return "🔒 HID++ scan denied — " + permissionRemediation
 	case errors.Is(d.err, errNoAnswer):
 		return "⏳ no answer — the device did not speak HID++"
 	default:
@@ -282,7 +310,7 @@ func classifyProbeErr(err error) error {
 	}
 }
 
-// probeAll scans HID++-capable devices in parallel and returns every device,
+// probeAll scans Logitech devices in parallel and returns every device,
 // scanned or not, as a probedDevice. One context bounds the whole batch; each
 // probe joins the context's cause into its error, so a scan killed by the
 // budget is reported as failed rather than silently skipped, and the drain
@@ -507,16 +535,24 @@ func deviceDetail(dev probedDevice) []string {
 const cmdWidth = 76
 
 // wrapCommand keeps a suggestion inside the budget: the one-line form when
-// it fits, else a continuation before the -- that introduces the switch
-// command.
+// it fits, else one continuation line per --on-deactivation.
 func wrapCommand(cmd string) string {
 	if utf8.RuneCountInString(cmd) <= cmdWidth {
 		return cmd
 	}
-	if head, tail, ok := strings.Cut(cmd, " -- "); ok {
-		return head + " \\\n  -- " + tail
+	return strings.ReplaceAll(cmd, " --on-deactivation ", " \\\n  --on-deactivation ")
+}
+
+// deactivationFlags renders commands as the --on-deactivation flags that make
+// connect run them: each is one string connect splits itself, so the user's
+// shell only has to keep it whole — single quotes, with any ' inside closed and
+// escaped.
+func deactivationFlags(cmds []string) string {
+	var b strings.Builder
+	for _, c := range cmds {
+		b.WriteString(" --on-deactivation '" + strings.ReplaceAll(c, "'", `'\''`) + "'")
 	}
-	return cmd
+	return b.String()
 }
 
 // renderSuggestions prints the invocations as a shell transcript — prose as
@@ -568,7 +604,7 @@ func renderSuggestions(w io.Writer, devices []probedDevice, screenCmd string) er
 	// host, then move whatever is still linked here — so the two suggestions
 	// differ only in what leads the gesture.
 	hidCmds := switchCommands(devices)
-	action := " -- " + strings.Join(append([]string{screenCmd}, hidCmds...), " -- ")
+	action := deactivationFlags(append([]string{screenCmd}, hidCmds...))
 	type suggestion struct{ comment, cmd string }
 	var suggestions []suggestion
 	if len(kbdTriggers) > 0 && len(hidCmds) > 0 {
@@ -612,12 +648,8 @@ func renderSuggestions(w io.Writer, devices []probedDevice, screenCmd string) er
 		return nil
 	}
 	_, err := io.WriteString(w, dim(`
-# hid-switch is built in, not a program. Named without a slot it moves
-# every peripheral still linked to that device — the one that carried
-# the gesture has already left, so it is skipped. The target channel
-# comes from the winning host, which publishes its own with its claim.
-# Append host=N (1-3, as printed on the key) to pin it, or address one
-# peripheral as VID:PID:SLOT.
+# hid-switch is built in: it moves the peripherals still on this host to
+# the other one. Run soft-kvm hid-switch -h for the details.
 `))
 	return err
 }
@@ -670,28 +702,15 @@ func (d *hidDevice) hasKeyboard() bool {
 	return false
 }
 
-// hasHIDPP reports whether the device carries a vendor-defined interface
-// (usage page ≥0xFF00), where Logitech typically hides HID++.
-func (d *hidDevice) hasHIDPP() bool {
-	for _, u := range d.interfaces {
-		if u.usagePage >= 0xFF00 {
-			return true
-		}
-	}
-	return false
-}
-
-// shouldProbe reports whether the device is worth probing for HID++: it either
-// exposes a vendor-defined interface or is a Logitech device (Bluetooth HID++
-// peripherals often flatten the vendor collection into the primary HID node).
-// Kernel shadows of receiver-paired peripherals are never probed: they accept
-// HID++ writes but never relay the replies — the device answers through the
+// shouldProbe reports whether the device is worth probing for HID++: only
+// Logitech devices are, HID++ being their protocol. The vendor ID decides, not
+// a vendor-defined interface: other vendors have those too, and Bluetooth
+// HID++ peripherals often flatten theirs into the primary HID node. Kernel
+// shadows of receiver-paired peripherals are never probed: they accept HID++
+// writes but never relay the replies — the device answers through the
 // receiver's pairing slots.
 func (d *hidDevice) shouldProbe() bool {
-	if d.key.vid == 0 || d.shadow {
-		return false
-	}
-	return d.hasHIDPP() || d.key.vid == logitechVID
+	return d.key.vid == logitechVID && !d.shadow
 }
 
 func usageName(usagePage, usage uint16) string {

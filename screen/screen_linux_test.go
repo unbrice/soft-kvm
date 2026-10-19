@@ -148,6 +148,29 @@ func TestProbe(t *testing.T) {
 		}
 	})
 
+	// ddcutil exits 0 when it may not open the bus: the monitor shows up by
+	// EDID only, and the denial is on its output.
+	t.Run("bus denied", func(t *testing.T) {
+		out := "Device /dev/i2c-13 is not readable and writable.  Error = EACCES(13): Permission denied\n" +
+			"Invalid display\n   I2C bus:          /dev/i2c-13\n   Monitor:          GSM:LG ULTRAWIDE:1\n"
+		r := Probe(t.Context(), func(context.Context, []string) ([]byte, error) { return []byte(out), nil })
+		want := Display{Mfg: "GSM", Model: "LG ULTRAWIDE"}
+		if len(r.Displays) != 0 || len(r.Unreachable) != 1 || r.Unreachable[0] != want {
+			t.Fatalf("Probe = %+v, want %+v unreachable", r, want)
+		}
+		if r.Err == nil || !strings.Contains(r.Err.Error(), "i2c group") {
+			t.Errorf("Probe error = %v, want the i2c group fix", r.Err)
+		}
+	})
+
+	t.Run("no answer", func(t *testing.T) {
+		out := "Invalid display\n   Monitor:          GSM:LG ULTRAWIDE:1\n"
+		r := Probe(t.Context(), func(context.Context, []string) ([]byte, error) { return []byte(out), nil })
+		if r.Err == nil || !strings.Contains(r.Err.Error(), "LG ULTRAWIDE does not answer DDC/CI") {
+			t.Errorf("Probe error = %v, want the monitor named", r.Err)
+		}
+	})
+
 	t.Run("one display and its input", func(t *testing.T) {
 		run := func(_ context.Context, argv []string) ([]byte, error) {
 			if slices.Contains(argv, "detect") {

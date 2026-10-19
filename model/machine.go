@@ -20,19 +20,20 @@ type Event struct {
 	Now        time.Time
 	Attach     bool               // receiver attach edge from the Detector
 	State      *state.ServerState // from /state or a /wait wake
-	SwitchExit *error             // result of the switch commands (nil = all exit 0 = the switch landed)
+	SwitchExit *error             // result of the activation or deactivation commands (nil = all exit 0)
 }
 
 // Action is the machine's only output. Glue executes it and feeds results back
 // as the next Event (SPEC §11.3).
 type Action struct {
-	Claim     string    // non-empty: POST /claim/<id>
-	Switch    bool      // run the switch commands
-	Retry     bool      // with Switch: a re-run within one sequence, so commands that already succeeded are skipped
-	Notify    bool      // run --notify-cmd
-	WakeAt    time.Time // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it; a batch with no WakeAt action means no pending deadline
-	SaveOwner *string   // non-nil: persist this as last_owner (agent.json)
-	Log       string    // non-empty: glue logs at Info
+	Claim      string    // non-empty: POST /claim/<id>
+	Activate   bool      // run the --on-activation commands: this host just became the owner
+	Deactivate bool      // run the --on-deactivation commands: this host just stopped being the owner
+	Retry      bool      // with Activate or Deactivate: a re-run within one sequence, so commands that already succeeded are skipped
+	Notify     bool      // run --notify-cmd
+	WakeAt     time.Time // emitted at most once per Step batch, as its own final action: the glue rearms its timer from it; a batch with no WakeAt action means no pending deadline
+	SaveOwner  *string   // non-nil: persist this as last_owner (agent.json)
+	Log        string    // non-empty: glue logs at Info
 }
 
 // MachineConfig is the policy knobs from the connect flags (SPEC §5.4).
@@ -83,6 +84,7 @@ type Machine struct {
 	gateWake time.Time
 
 	reconState        *state.ServerState
+	activating        bool // the sequence in progress is an activation, not a deactivation
 	latestState       *state.ServerState
 	switchSentAt      time.Time
 	attemptCount      int
@@ -182,7 +184,7 @@ func (m *Machine) handleSwitchExit(err error, now time.Time) []Action {
 	m.switchOutstanding = false
 	if err != nil {
 		var actions []Action
-		m.retryOrFail(now, &actions, fmt.Sprintf("switch to %q attempt %d exit: %s", m.reconState.Owner, m.attemptCount, err))
+		m.retryOrFail(now, &actions, fmt.Sprintf("%s attempt %d exit: %s", m.what(), m.attemptCount, err))
 		return actions
 	}
 	return m.sequenceSuccess(now)
@@ -194,9 +196,15 @@ func (m *Machine) reconcile(s *state.ServerState, now time.Time) []Action {
 
 	if s.Owner == me {
 		if m.lastOwner != me {
-			owner := me
-			m.lastOwner = me
-			return []Action{{SaveOwner: &owner, Log: fmt.Sprintf("resynced last_owner to me (%s)", me)}}
+			// Ownership came to this host: run the activation commands. Not a
+			// one-way door, so neither the cooldown nor the breaker gates it,
+			// and last_owner is saved once the commands are done — a restart
+			// mid-run runs them again.
+			m.startSequence(s, now, true)
+			return []Action{{
+				Activate: true,
+				Log:      fmt.Sprintf("activating %q attempt 1: ownership came to me", me),
+			}}
 		}
 		return []Action{{Log: fmt.Sprintf("no switch: owner is still me (%s)", me)}}
 	}
@@ -217,20 +225,40 @@ func (m *Machine) reconcile(s *state.ServerState, now time.Time) []Action {
 		}}
 	}
 
+	// A pending settle survives: attach→claim is an independent trigger
+	// (SPEC §5.4) and the claim is what rescues a stale bit pointing at the
+	// other host while the receiver is attached here. It fires once the
+	// machine is idle again.
+	m.startSequence(s, now, false)
+	return []Action{{
+		Deactivate: true,
+		Log:        fmt.Sprintf("switching to %q attempt 1: ownership transition, winner live, gates clear", s.Owner),
+	}}
+}
+
+// startSequence enters modeSwitching for the first attempt of an activation or
+// deactivation sequence against s.
+func (m *Machine) startSequence(s *state.ServerState, now time.Time, activating bool) {
 	m.mode = modeSwitching
+	m.activating = activating
 	m.reconState = s
 	m.latestState = s
 	m.switchSentAt = now
 	m.attemptCount = 1
 	m.switchOutstanding = true
-	// A pending settle survives: attach→claim is an independent trigger
-	// (SPEC §5.4) and the claim is what rescues a stale bit pointing at the
-	// other host while the receiver is attached here. It fires once the
-	// machine is idle again.
-	return []Action{{
-		Switch: true,
-		Log:    fmt.Sprintf("switching to %q attempt 1: ownership transition, winner live, gates clear", s.Owner),
-	}}
+}
+
+// run is the Action that starts the current sequence's next attempt.
+func (m *Machine) run(log string) Action {
+	return Action{Activate: m.activating, Deactivate: !m.activating, Retry: true, Log: log}
+}
+
+// what names the current sequence in logs.
+func (m *Machine) what() string {
+	if m.activating {
+		return fmt.Sprintf("activation of %q", m.cfg.ID)
+	}
+	return fmt.Sprintf("switch to %q", m.reconState.Owner)
 }
 
 // gated reports whether the cooldown or circuit breaker forbids a new switch
@@ -282,11 +310,7 @@ func (m *Machine) processDeadlines(now time.Time, actions *[]Action) {
 			m.attemptCount++
 			m.retryWaitDeadline = time.Time{}
 			m.switchOutstanding = true
-			*actions = append(*actions, Action{
-				Switch: true,
-				Retry:  true,
-				Log:    fmt.Sprintf("retry switch to %q attempt %d", m.reconState.Owner, m.attemptCount),
-			})
+			*actions = append(*actions, m.run(fmt.Sprintf("retry %s attempt %d", m.what(), m.attemptCount)))
 			continue
 
 		case m.mode == modeSwitching && m.switchOutstanding && !now.Before(m.switchSentAt.Add(SwitchDeadline)):
@@ -314,11 +338,7 @@ func (m *Machine) retryOrFail(now time.Time, actions *[]Action, reason string) {
 			m.switchSentAt = now
 			m.attemptCount++
 			m.switchOutstanding = true
-			*actions = append(*actions, Action{
-				Switch: true,
-				Retry:  true,
-				Log:    fmt.Sprintf("%s; retry switch to %q attempt %d", reason, m.reconState.Owner, m.attemptCount),
-			})
+			*actions = append(*actions, m.run(fmt.Sprintf("%s; retry %s attempt %d", reason, m.what(), m.attemptCount)))
 			return
 		}
 		m.mode = modeRetryWait
@@ -331,10 +351,12 @@ func (m *Machine) retryOrFail(now time.Time, actions *[]Action, reason string) {
 	*actions = append(*actions, m.sequenceFailure(now, reason)...)
 }
 
-// sequenceSuccess completes a switch sequence because the switch commands all
-// exited 0.
+// sequenceSuccess completes a sequence because its commands all exited 0.
 func (m *Machine) sequenceSuccess(now time.Time) []Action {
 	owner := m.reconState.Owner
+	if m.activating {
+		return m.activationDone(now, fmt.Sprintf("activation of %q confirmed", owner))
+	}
 	actions := []Action{{SaveOwner: &owner, Log: fmt.Sprintf("switch to %q confirmed", owner)}}
 	m.hasRecord = true
 	m.cooldownUntil = now.Add(m.cfg.Cooldown)
@@ -355,6 +377,11 @@ func (m *Machine) sequenceSuccess(now time.Time) []Action {
 // watchdog-fired attempt is greppable alongside ordinary non-zero exits.
 func (m *Machine) sequenceFailure(now time.Time, reason string) []Action {
 	owner := m.reconState.Owner
+	if m.activating {
+		// No notification: the user's fallback is the monitor's Input button,
+		// which an activation command does not stand in for.
+		return m.activationDone(now, fmt.Sprintf("activation of %q failed after %d attempts (%s)", owner, m.attemptCount, reason))
+	}
 	actions := []Action{{
 		Notify:    true,
 		SaveOwner: &owner,
@@ -369,6 +396,21 @@ func (m *Machine) sequenceFailure(now time.Time, reason string) []Action {
 		m.lastOwner = owner
 	}
 	return actions
+}
+
+// activationDone ends an activation sequence, successful or not: last_owner
+// becomes this host so the commands do not run again for the same transition.
+// It leaves the cooldown and the breaker alone — they guard the one-way door,
+// and a quick flip away must not wait behind a hook. last_owner is set before
+// the chained reconcile of a stashed state, which must see this host as the
+// previous owner to switch away from it.
+func (m *Machine) activationDone(now time.Time, log string) []Action {
+	owner := m.cfg.ID
+	m.hasRecord = true
+	m.lastOwner = owner
+	m.clearSequence()
+	actions := []Action{{SaveOwner: &owner, Log: log}}
+	return append(actions, m.postSequence(now, owner)...)
 }
 
 // recordBreaker counts a completed switch sequence for the circuit breaker.
@@ -388,6 +430,7 @@ func (m *Machine) recordBreaker(now time.Time) {
 // clearSequence resets the in-progress switch fields.
 func (m *Machine) clearSequence() {
 	m.mode = modeIdle
+	m.activating = false
 	m.reconState = nil
 	m.attemptCount = 0
 	m.switchSentAt = time.Time{}
@@ -402,6 +445,13 @@ func (m *Machine) postSequence(now time.Time, target string) []Action {
 	if m.latestState != nil && m.latestState.Owner != target {
 		s := m.latestState
 		m.latestState = nil
+		// Ownership came back to this host while a deactivation ran. lastOwner
+		// still says "me" — which a stashed state for a third host relies on to
+		// switch again — so judge the flip back against the owner this host
+		// just left, or reconcile reads it as "still me" and never activates.
+		if s.Owner == m.cfg.ID && target != m.cfg.ID {
+			m.lastOwner = target
+		}
 		actions = append(actions, m.reconcile(s, now)...)
 	} else {
 		m.latestState = nil

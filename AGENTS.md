@@ -27,18 +27,21 @@ every host, seven subcommands:
   the shared secret. Port defaults to 8700; `--state` defaults to
   `$STATE_DIRECTORY/state.json` under systemd, else `StateDir/state.json`. It
   advertises itself over mDNS unless `--no-advertise` (SPEC §6.4, §7).
-- `connect [flags] -- CMD ARGS... [-- CMD ARGS...]` — the per-host agent. An HID
-  attach detector feeds the pure state machine that decides when to claim
-  ownership; a run-level action worker runs the switch commands on the losing
-  host, in order, and exit 0 from all of them is the only receipt: a failure is
-  retried, then notified (SPEC §4.3). Two command names are not exec'd but run
-  in-process: `screen-switch` drives the monitor (SPEC §5.6) and `hid-switch`
-  speaks Logitech HID++ `changeHost` (SPEC §5.5). At least one switch command is
-  required — there is no default, `detect` prints it — and so is
-  `--trigger VID:PID[:SLOT][,…]` — a bare `VID:PID` watches a HID node that
-  comes and goes, `VID:PID:SLOT` watches one pairing slot of a receiver that
-  stays plugged in; macOS also gets `--no-guards` and `--display-match` (SPEC
-  §5.4, §6).
+- `connect --trigger LIST [-A COMMAND]... [-D COMMAND]... [flags]` — the
+  per-host agent. An HID attach detector feeds the pure state machine that
+  decides when to claim ownership; a run-level action worker runs
+  `-D/--on-deactivation` on the losing host when it stops being the owner, in
+  order, and exit 0 from all of them is the only receipt: a failure is retried,
+  then notified (SPEC §4.3). `-A/--on-activation` runs the same way when the
+  host becomes the owner, without the cooldown, breaker or notification. Each
+  `COMMAND` is one quoted string that `connect` splits into an argv itself. Two
+  command names are not exec'd but run in-process: `screen-switch` drives the
+  monitor (SPEC §5.6) and `hid-switch` speaks Logitech HID++ `changeHost` (SPEC
+  §5.5). At least one of `-A` and `-D` is required — there is no default,
+  `detect` prints it — and so is `--trigger VID:PID[:SLOT][,…]` — a bare
+  `VID:PID` watches a HID node that comes and goes, `VID:PID:SLOT` watches one
+  pairing slot of a receiver that stays plugged in; macOS also gets
+  `--no-guards` and `--display-match` (SPEC §5.4, §6).
 - `activate ID` — claims an identity by hand, for scripts and recovery. Fails
   with a pointer to `--force` when the target has no live agent.
 - `detect` — prints attached HID devices, suggested `--trigger` values
@@ -115,8 +118,8 @@ Go ≥ 1.25 (`go.mod` is the language floor), `CGO_ENABLED=0`, stdlib +
 FFI: HID attach events on both OSes, SPEC §6.1-6.2) +
 `github.com/ebitengine/purego` (macOS `IOAVService` DDC/CI, SPEC §5.6). No CLI
 framework: stdlib `flag`, one `FlagSet` per subcommand, because pflag's
-interspersed parsing eats the trailing `-- SWITCH-CMD ARGS...` (SPEC §11).
-Logging is `log/slog` to stderr; `SOFTKVM_LOG=debug` lowers the level. The
+interspersed parsing would read a `-vcp=…` inside a command as a flag (SPEC
+§11). Logging is `log/slog` to stderr; `SOFTKVM_LOG=debug` lowers the level. The
 handler depends on who is reading: a clock, a level and dimmed attributes when
 stderr is a terminal, the stdlib logfmt `TextHandler` everywhere else, so
 journald and pipes keep the machine-readable form.
@@ -173,8 +176,9 @@ Three of those surprise people:
 - An interface needs two real implementations to exist. `Detector` and `Guard`
   have them; the display does not, so the seam is the `Runner` func type and the
   fake is a func (SPEC §11.2).
-- Not unit-tested: the switch commands themselves and the detector's event path
-  — both need the hardware and live in the §10 integration checklist.
+- Not unit-tested: the activation and deactivation commands themselves and the
+  detector's event path — both need the hardware and live in the §10 integration
+  checklist.
 
 ## Version control
 
@@ -246,9 +250,10 @@ jj sharp edges:
   `/etc/soft-kvm/env` (root-only, read by PID 1 for the coordinator unit) and
   `~/.config/soft-kvm/env` (per-user, read by the user manager for the agent
   unit). `service install` re-renders them from the embedded templates.
-- The switch commands are argv slices taken after `--`, never shell strings
-  (SPEC §9). `--notify-cmd` is the exception: its per-OS defaults carry shell
-  quoting, so it runs as `sh -c <string>`.
+- The `-A`/`-D` commands are argv slices — `connect` splits each flag's string
+  with no expansion — never shell strings (SPEC §9). `--notify-cmd` is the
+  exception: its per-OS defaults carry shell quoting, so it runs as
+  `sh -c <string>`.
 - `cmd.Cancel` sends SIGTERM (SIGKILL only after `WaitDelay`) so cancellation
   cannot cut `ddcutil` mid-I2C transaction (SPEC §11.1).
 - Pure Go dependencies only, `CGO_ENABLED=0`.

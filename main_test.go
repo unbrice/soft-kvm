@@ -87,40 +87,76 @@ func TestRejectExtraArgs(t *testing.T) {
 	}
 }
 
-func TestSplitSwitchCommands(t *testing.T) {
+func TestSplitCommand(t *testing.T) {
 	cases := []struct {
 		name    string
-		args    []string
-		want    [][]string
+		in      string
+		want    []string
 		wantErr bool
 	}{
-		{name: "empty", args: nil, want: nil},
-		{name: "one", args: []string{"ddcutil", "setvcp", "0xF4"}, want: [][]string{{"ddcutil", "setvcp", "0xF4"}}},
-		{
-			name: "two",
-			args: []string{"ddcutil", "setvcp", "0xF4", "--", "usb-switch", "2"},
-			want: [][]string{{"ddcutil", "setvcp", "0xF4"}, {"usb-switch", "2"}},
-		},
-		{name: "lone separator", args: []string{"--", "cmd"}, wantErr: true},
-		{name: "trailing separator", args: []string{"cmd", "--"}, wantErr: true},
-		{name: "empty middle", args: []string{"a", "--", "--", "b"}, wantErr: true},
+		{name: "one word", in: "screen-switch", want: []string{"screen-switch"}},
+		{name: "words", in: "ddcutil setvcp 0xF4  0xD0", want: []string{"ddcutil", "setvcp", "0xF4", "0xD0"}},
+		{name: "surrounding space", in: "  a b\t", want: []string{"a", "b"}},
+		{name: "single quotes", in: `notify-send 'two words' x`, want: []string{"notify-send", "two words", "x"}},
+		{name: "double quotes", in: `notify-send "two words"`, want: []string{"notify-send", "two words"}},
+		{name: "quotes join a word", in: `a"b c"'d e'f`, want: []string{"ab cd ef"}},
+		{name: "empty quoted argument", in: `a '' b`, want: []string{"a", "", "b"}},
+		{name: "backslash space", in: `/opt/my\ dir/run x`, want: []string{"/opt/my dir/run", "x"}},
+		{name: "escapes inside double quotes", in: `say "a \"b\" \\ \n"`, want: []string{"say", `a "b" \ \n`}},
+		{name: "no expansion", in: `echo $HOME *.go $(id) a|b; c`, want: []string{"echo", "$HOME", "*.go", "$(id)", "a|b;", "c"}},
+		{name: "single quotes are literal", in: `'a\b'`, want: []string{`a\b`}},
+		{name: "empty", in: "", wantErr: true},
+		{name: "empty quoted program", in: `''`, wantErr: true},
+		{name: "empty quoted program with args", in: `"" arg`, wantErr: true},
+		{name: "only space", in: "  \t", wantErr: true},
+		{name: "unterminated single", in: `a 'b`, wantErr: true},
+		{name: "unterminated double", in: `a "b`, wantErr: true},
+		{name: "trailing backslash", in: `a\`, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := splitSwitchCommands(tc.args)
+			got, err := splitCommand(tc.in)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("got %v, nil; want error", got)
+					t.Fatalf("got %q, nil; want error", got)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("got error %v", err)
 			}
-			if !slices.EqualFunc(got, tc.want, slices.Equal) {
-				t.Fatalf("got %v, want %v", got, tc.want)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// -A and -D are spellings of the long flags, repeat, and keep their order.
+func TestConnectCommandFlags(t *testing.T) {
+	fs, v := newConnectFlagSet()
+	fs.SetOutput(io.Discard)
+	args := []string{"-D", "screen-switch dp1", "--on-deactivation", "hid-switch 046d:c548 host=1", "-A", "notify-send 'hi there'", "--trigger", "046d:c52b"}
+	if err := parseArgs(fs, args); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCommands(fs, v); err != nil {
+		t.Fatal(err)
+	}
+	wantD := [][]string{{"screen-switch", "dp1"}, {"hid-switch", "046d:c548", "host=1"}}
+	if !slices.EqualFunc(v.onDeactivation.argv, wantD, slices.Equal) {
+		t.Errorf("on-deactivation = %q, want %q", v.onDeactivation.argv, wantD)
+	}
+	wantA := [][]string{{"notify-send", "hi there"}}
+	if !slices.EqualFunc(v.onActivation.argv, wantA, slices.Equal) {
+		t.Errorf("on-activation = %q, want %q", v.onActivation.argv, wantA)
+	}
+
+	// A command that does not split is a parse error, not a runtime surprise.
+	fs, _ = newConnectFlagSet()
+	fs.SetOutput(io.Discard)
+	if err := parseArgs(fs, []string{"-D", "unterminated 'quote"}); !errors.Is(err, errUsage) {
+		t.Errorf("unterminated quote: got %v, want errUsage", err)
 	}
 }
 
