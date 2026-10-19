@@ -550,19 +550,19 @@ func TestServerRetakeNeedsLiveAgent(t *testing.T) {
 	}
 }
 
-func TestServerTakeRecordsHolds(t *testing.T) {
+func TestServerTakeRecordsAssignments(t *testing.T) {
 	s, srv := testServer(t)
 	defer srv.Close()
 	c, base := realClient(t), baseOf(t, srv)
 
-	if st := s.CurrentState(); st.Holds == nil {
-		t.Fatal("holds is nil on a fresh server")
+	if st := s.CurrentState(); st.Assignments == nil {
+		t.Fatal("assignments is nil on a fresh server")
 	}
 	resp := doReq(t, http.MethodGet, srv.URL+"/state", nil)
 	var raw map[string]json.RawMessage
 	readJSON(t, resp, &raw)
-	if string(raw["holds"]) != "[]" {
-		t.Fatalf("holds on the wire = %s, want []", raw["holds"])
+	if string(raw["assignments"]) != "[]" {
+		t.Fatalf("assignments on the wire = %s, want []", raw["assignments"])
 	}
 
 	claimAs(t, c, base, "linux") // epoch 1, activation 1
@@ -578,13 +578,13 @@ func TestServerTakeRecordsHolds(t *testing.T) {
 	if st.Epoch != 2 {
 		t.Fatalf("epoch = %d, want one step for the whole request", st.Epoch)
 	}
-	want := []state.Hold{
-		{Kind: "hid", Name: "keyboard", Holder: "linux", Seq: 2, Channel: 1, Arrived: true},
-		{Kind: "hid", Name: "mouse", Holder: "linux", Seq: 2, Channel: 2},
-		{Kind: "screen", Name: "LG HDR WQHD", Holder: "linux", Seq: 2, Input: "F4:50=D1"},
+	want := []state.Assignment{
+		{Kind: "hid", Name: "keyboard", Assignee: "linux", Seq: 2, Channel: 1, Arrived: true},
+		{Kind: "hid", Name: "mouse", Assignee: "linux", Seq: 2, Channel: 2},
+		{Kind: "screen", Name: "LG HDR WQHD", Assignee: "linux", Seq: 2, Input: "F4:50=D1"},
 	}
-	if !reflect.DeepEqual(st.Holds, want) {
-		t.Fatalf("holds = %+v\nwant    %+v", st.Holds, want)
+	if !reflect.DeepEqual(st.Assignments, want) {
+		t.Fatalf("assignments = %+v\nwant    %+v", st.Assignments, want)
 	}
 
 	// The same take again, same activation: nothing changes, nothing wakes.
@@ -592,38 +592,38 @@ func TestServerTakeRecordsHolds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-take: %v", err)
 	}
-	if got := s.CurrentState(); got.Epoch != 2 || !reflect.DeepEqual(got.Holds, want) {
+	if got := s.CurrentState(); got.Epoch != 2 || !reflect.DeepEqual(got.Assignments, want) {
 		t.Fatalf("an identical take moved the state: %+v", got)
 	}
 
-	// Another input from the same holder replaces the hold; prev stays.
+	// Another input from the same assignee replaces the assignment; prev stays.
 	if err := c.Take(t.Context(), base, "linux", 1, []state.Take{screenTake("LG HDR WQHD", "F4:50=D0")}); err != nil {
 		t.Fatalf("take: %v", err)
 	}
 	got := s.CurrentState()
-	if h := got.Holds[2]; h.Input != "F4:50=D0" || h.Seq != 3 || h.Prev != "" || got.Epoch != 3 {
-		t.Fatalf("replaced hold = %+v, epoch %d", h, got.Epoch)
+	if h := got.Assignments[2]; h.Input != "F4:50=D0" || h.Seq != 3 || h.Prev != "" || got.Epoch != 3 {
+		t.Fatalf("replaced assignment = %+v, epoch %d", h, got.Epoch)
 	}
 
-	// A new holder: prev becomes the old one, seq the new epoch, and the
+	// A new assignee: prev becomes the old one, seq the new epoch, and the
 	// arrival the take reported.
 	claimAs(t, c, base, "mac") // epoch 4, activation 2
 	if err := c.Take(t.Context(), base, "mac", 2, []state.Take{hidTake("mouse", 3, false), screenTake("LG HDR WQHD", "F4:50=D1")}); err != nil {
 		t.Fatalf("take: %v", err)
 	}
 	got = s.CurrentState()
-	byName := map[string]state.Hold{}
-	for _, h := range got.Holds {
+	byName := map[string]state.Assignment{}
+	for _, h := range got.Assignments {
 		byName[h.Kind+"/"+h.Name] = h
 	}
-	if h := byName["hid/mouse"]; h.Holder != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Channel != 3 || h.Arrived {
+	if h := byName["hid/mouse"]; h.Assignee != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Channel != 3 || h.Arrived {
 		t.Fatalf("mouse = %+v", h)
 	}
-	if h := byName["screen/LG HDR WQHD"]; h.Holder != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Input != "F4:50=D1" {
+	if h := byName["screen/LG HDR WQHD"]; h.Assignee != "mac" || h.Prev != "linux" || h.Seq != 5 || h.Input != "F4:50=D1" {
 		t.Fatalf("screen = %+v", h)
 	}
-	if h := byName["hid/keyboard"]; h.Holder != "linux" || h.Seq != 2 {
-		t.Fatalf("an untouched hold changed: %+v", h)
+	if h := byName["hid/keyboard"]; h.Assignee != "linux" || h.Seq != 2 {
+		t.Fatalf("an untouched assignment changed: %+v", h)
 	}
 }
 
@@ -639,16 +639,16 @@ func TestServerTakeNewActivationRecordsAgain(t *testing.T) {
 	if err := c.Take(t.Context(), base, "linux", 1, takes); err != nil {
 		t.Fatal(err)
 	}
-	first := s.CurrentState().Holds[0]
+	first := s.CurrentState().Assignments[0]
 	if _, err := c.Claim(t.Context(), base, "linux", true, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Take(t.Context(), base, "linux", 2, takes); err != nil {
 		t.Fatal(err)
 	}
-	again := s.CurrentState().Holds[0]
-	if again.Seq == first.Seq || again.Prev != "" || again.Holder != "linux" {
-		t.Fatalf("hold after re-activation = %+v, was %+v", again, first)
+	again := s.CurrentState().Assignments[0]
+	if again.Seq == first.Seq || again.Prev != "" || again.Assignee != "linux" {
+		t.Fatalf("assignment after re-activation = %+v, was %+v", again, first)
 	}
 }
 
@@ -673,7 +673,7 @@ func TestServerTakeRefusals(t *testing.T) {
 	if err := c.Take(t.Context(), base, "linux", 1, takes); !errors.Is(err, client.ErrNotOwner) {
 		t.Fatalf("take under a stale activation: %v, want ErrNotOwner", err)
 	}
-	if st := s.CurrentState(); len(st.Holds) != 0 || st.Epoch != 3 {
+	if st := s.CurrentState(); len(st.Assignments) != 0 || st.Epoch != 3 {
 		t.Fatalf("a refused take changed the state: %+v", st)
 	}
 	if err := c.Take(t.Context(), base, "linux", 3, takes); err != nil {
@@ -717,8 +717,8 @@ func TestServerTakeValidation(t *testing.T) {
 			_ = resp.Body.Close()
 		})
 	}
-	if st := s.CurrentState(); len(st.Holds) != 0 {
-		t.Fatalf("a malformed take left holds: %+v", st.Holds)
+	if st := s.CurrentState(); len(st.Assignments) != 0 {
+		t.Fatalf("a malformed take left assignments: %+v", st.Assignments)
 	}
 
 	// Sixteen takes and a 64-character name are the limits, and fit.
@@ -744,9 +744,9 @@ func TestServerArrived(t *testing.T) {
 		t.Fatal(err)
 	}
 	epoch := s.CurrentState().Epoch
-	seq := s.CurrentState().Holds[0].Seq
+	seq := s.CurrentState().Assignments[0].Seq
 
-	// None of these matches a current hold of the sender: ignored, 200.
+	// None of these matches a current assignment of the sender: ignored, 200.
 	for name, a := range map[string]struct {
 		id string
 		a  state.Arrival
@@ -759,7 +759,7 @@ func TestServerArrived(t *testing.T) {
 		if err := c.Arrived(t.Context(), base, a.id, a.a); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if got := s.CurrentState(); got.Epoch != epoch || got.Holds[0].Arrived {
+		if got := s.CurrentState(); got.Epoch != epoch || got.Assignments[0].Arrived {
 			t.Fatalf("%s moved the state: %+v", name, got)
 		}
 	}
@@ -774,7 +774,7 @@ func TestServerArrived(t *testing.T) {
 	}
 	mustStatus(t, <-woke, http.StatusOK)
 	got := s.CurrentState()
-	if h := got.Holds[0]; !h.Arrived || h.Seq != seq || got.Epoch != epoch+1 {
+	if h := got.Assignments[0]; !h.Arrived || h.Seq != seq || got.Epoch != epoch+1 {
 		t.Fatalf("after arrival: %+v, epoch %d", h, got.Epoch)
 	}
 
@@ -787,7 +787,7 @@ func TestServerArrived(t *testing.T) {
 	}
 }
 
-func TestServerHoldsPersist(t *testing.T) {
+func TestServerAssignmentsPersist(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	s := server.NewServer(statePath, testToken)
 	srv := httptest.NewUnstartedServer(s.Handler())
@@ -809,12 +809,12 @@ func TestServerHoldsPersist(t *testing.T) {
 
 	s2 := server.NewServer(statePath, testToken)
 	after := s2.CurrentState()
-	if after.Owner != "mac" || after.Activation != 1 || after.Epoch != before.Epoch || !reflect.DeepEqual(after.Holds, before.Holds) {
+	if after.Owner != "mac" || after.Activation != 1 || after.Epoch != before.Epoch || !reflect.DeepEqual(after.Assignments, before.Assignments) {
 		t.Fatalf("reloaded %+v, want %+v", after, before)
 	}
 
-	// The reloaded server remembers the activation each hold was taken under:
-	// an identical re-take from a restarted agent changes nothing.
+	// The reloaded server remembers the activation each assignment was taken
+	// under: an identical re-take from a restarted agent changes nothing.
 	srv2 := httptest.NewUnstartedServer(s2.Handler())
 	srv2.TLS = tlsCfg
 	srv2.StartTLS()

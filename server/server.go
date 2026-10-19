@@ -48,14 +48,14 @@ const MaxTakes = 16
 // maxBody bounds a request body: sixteen takes are a few KB at most.
 const maxBody = 64 << 10
 
-// maxNameRunes bounds a hold's name (SPEC §7).
+// maxNameRunes bounds an assignment's name (SPEC §7).
 const maxNameRunes = 64
 
 // validInput is a screen take's VCP:SRC=VAL: three hex bytes (SPEC §5.6).
 var validInput = regexp.MustCompile(`^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}=[0-9A-Fa-f]{2}$`)
 
-// Server carries the display bit and the holds, and serves the /claim /take
-// /arrived /state /wait API.
+// Server carries the display bit and the assignments, and serves the /claim
+// /take /arrived /state /wait API.
 type Server struct {
 	mu         sync.Mutex
 	token      string
@@ -64,9 +64,9 @@ type Server struct {
 	epoch      int64
 	since      time.Time
 	activation int64
-	// holds is the last take per (kind, name), with the activation it was
+	// assignments is the last take per (kind, name), with the activation it was
 	// taken under.
-	holds       map[state.HoldKey]state.StoredHold
+	assignments map[state.AssignmentKey]state.StoredAssignment
 	serverID    string
 	waiters     map[string]int
 	lastWait    map[string]time.Time // when each host's last /wait closed
@@ -91,15 +91,15 @@ func NewServer(statePath, token string) *Server {
 		epoch:       persisted.Epoch,
 		since:       persisted.Since,
 		activation:  persisted.Activation,
-		holds:       make(map[state.HoldKey]state.StoredHold, len(persisted.Holds)),
+		assignments: make(map[state.AssignmentKey]state.StoredAssignment, len(persisted.Assignments)),
 		serverID:    newUUID(),
 		waiters:     make(map[string]int),
 		lastWait:    make(map[string]time.Time),
 		broadcast:   make(chan struct{}),
 		waitTimeout: DefaultWaitTimeout,
 	}
-	for _, h := range persisted.Holds {
-		s.holds[h.Key()] = h
+	for _, h := range persisted.Assignments {
+		s.assignments[h.Key()] = h
 	}
 	return s
 }
@@ -283,25 +283,25 @@ func (s *Server) handleTake(w http.ResponseWriter, r *http.Request) {
 	next := s.epoch + 1
 	changed := false
 	for _, t := range req.Takes {
-		old, held := s.holds[t.Key()]
+		old, held := s.assignments[t.Key()]
 		input := strings.ToUpper(t.Input)
-		if held && old.Holder == id && old.Input == input && old.Channel == t.Channel &&
+		if held && old.Assignee == id && old.Input == input && old.Channel == t.Channel &&
 			old.Activation == req.Activation {
 			continue
 		}
-		h := state.Hold{
-			Kind: t.Kind, Name: t.Name, Holder: id, Seq: state.Seq(next),
+		h := state.Assignment{
+			Kind: t.Kind, Name: t.Name, Assignee: id, Seq: state.Seq(next),
 			Input: input, Channel: t.Channel, Arrived: t.Arrived && t.Kind == state.KindHID,
 		}
 		if held {
 			h.Prev = old.Prev
-			if old.Holder != id {
-				h.Prev = old.Holder
+			if old.Assignee != id {
+				h.Prev = old.Assignee
 			}
 		}
-		s.holds[t.Key()] = state.StoredHold{Hold: h, Activation: req.Activation}
+		s.assignments[t.Key()] = state.StoredAssignment{Assignment: h, Activation: req.Activation}
 		changed = true
-		slog.Info("take recorded", "kind", h.Kind, "name", h.Name, "holder", id,
+		slog.Info("take recorded", "kind", h.Kind, "name", h.Name, "assignee", id,
 			"prev", h.Prev, "seq", h.Seq, "input", h.Input, "channel", h.Channel, "arrived", h.Arrived)
 	}
 	s.bumpLocked(changed)
@@ -313,10 +313,10 @@ type arrivedRequest struct {
 	Arrivals []state.Arrival `json:"arrivals"`
 }
 
-// handleArrived implements POST /arrived/{id} (SPEC §7): the holder reports
+// handleArrived implements POST /arrived/{id} (SPEC §7): the assignee reports
 // that a device it took is linked to it. An arrival that does not match a
-// current hold of this holder is ignored: it answers a take that has since
-// been replaced.
+// current assignment of this assignee is ignored: it answers a take that has
+// since been replaced.
 func (s *Server) handleArrived(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validID.MatchString(id) {
@@ -334,15 +334,15 @@ func (s *Server) handleArrived(w http.ResponseWriter, r *http.Request) {
 
 	changed := false
 	for _, a := range req.Arrivals {
-		key := state.HoldKey{Kind: a.Kind, Name: a.Name}
-		h, ok := s.holds[key]
-		if !ok || h.Holder != id || h.Seq != a.Seq || h.Arrived {
+		key := state.AssignmentKey{Kind: a.Kind, Name: a.Name}
+		h, ok := s.assignments[key]
+		if !ok || h.Assignee != id || h.Seq != a.Seq || h.Arrived {
 			continue
 		}
 		h.Arrived = true
-		s.holds[key] = h
+		s.assignments[key] = h
 		changed = true
-		slog.Info("arrived", "kind", h.Kind, "name", h.Name, "holder", id, "seq", h.Seq)
+		slog.Info("arrived", "kind", h.Kind, "name", h.Name, "assignee", id, "seq", h.Seq)
 	}
 	s.bumpLocked(changed)
 	maybeWriteJSON(w, map[string]any{"epoch": s.epoch, "changed": changed})
@@ -365,7 +365,7 @@ func validateTakes(takes []state.Take) error {
 	if len(takes) > MaxTakes {
 		return fmt.Errorf("%d takes, at most %d", len(takes), MaxTakes)
 	}
-	seen := make(map[state.HoldKey]bool, len(takes))
+	seen := make(map[state.AssignmentKey]bool, len(takes))
 	for _, t := range takes {
 		if t.Kind != state.KindScreen && t.Kind != state.KindHID {
 			return fmt.Errorf("invalid kind %q", t.Kind)
@@ -487,32 +487,33 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 }
 
 // serverStateLocked returns the ServerState snapshot while s.mu is held. The
-// holds are sorted by kind, then name, and never nil.
+// assignments are sorted by kind, then name, and never nil.
 func (s *Server) serverStateLocked() state.ServerState {
 	return state.ServerState{
-		Owner:      s.owner,
-		Epoch:      s.epoch,
-		Since:      s.since,
-		Activation: s.activation,
-		Live:       s.liveLocked(),
-		ServerID:   s.serverID,
-		Holds:      s.holdsLocked(),
+		Owner:       s.owner,
+		Epoch:       s.epoch,
+		Since:       s.since,
+		Activation:  s.activation,
+		Live:        s.liveLocked(),
+		ServerID:    s.serverID,
+		Assignments: s.assignmentsLocked(),
 	}
 }
 
-// holdsLocked lists the holds sorted by kind, then name. Caller must hold s.mu.
-func (s *Server) holdsLocked() []state.Hold {
-	holds := make([]state.Hold, 0, len(s.holds))
-	for _, h := range s.holds {
-		holds = append(holds, h.Hold)
+// assignmentsLocked lists the assignments sorted by kind, then name. Caller
+// must hold s.mu.
+func (s *Server) assignmentsLocked() []state.Assignment {
+	assignments := make([]state.Assignment, 0, len(s.assignments))
+	for _, h := range s.assignments {
+		assignments = append(assignments, h.Assignment)
 	}
-	slices.SortFunc(holds, func(a, b state.Hold) int {
+	slices.SortFunc(assignments, func(a, b state.Assignment) int {
 		return cmpKeys(a.Key(), b.Key())
 	})
-	return holds
+	return assignments
 }
 
-func cmpKeys(a, b state.HoldKey) int {
+func cmpKeys(a, b state.AssignmentKey) int {
 	if c := strings.Compare(a.Kind, b.Kind); c != 0 {
 		return c
 	}
@@ -579,20 +580,20 @@ func maybeWriteJSON(w http.ResponseWriter, v any) {
 	_, _ = w.Write(data)
 }
 
-// persist writes the owner bit and the holds. A failure is logged but does
-// not block the in-memory state (SPEC §6.4).
+// persist writes the owner bit and the assignments. A failure is logged but
+// does not block the in-memory state (SPEC §6.4).
 func (s *Server) persist() {
-	stored := make([]state.StoredHold, 0, len(s.holds))
-	for _, h := range s.holds {
+	stored := make([]state.StoredAssignment, 0, len(s.assignments))
+	for _, h := range s.assignments {
 		stored = append(stored, h)
 	}
-	slices.SortFunc(stored, func(a, b state.StoredHold) int { return cmpKeys(a.Key(), b.Key()) })
+	slices.SortFunc(stored, func(a, b state.StoredAssignment) int { return cmpKeys(a.Key(), b.Key()) })
 	err := state.Save(s.statePath, state.OwnerState{
-		Owner:      s.owner,
-		Epoch:      s.epoch,
-		Since:      s.since,
-		Activation: s.activation,
-		Holds:      stored,
+		Owner:       s.owner,
+		Epoch:       s.epoch,
+		Since:       s.since,
+		Activation:  s.activation,
+		Assignments: stored,
 	})
 	if err != nil {
 		slog.Error("failed to persist state", "path", s.statePath, "error", err)

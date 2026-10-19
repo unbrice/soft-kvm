@@ -26,7 +26,7 @@ const (
 )
 
 // errSleepDetected signals that the wall clock jumped far enough during a
-// long-poll that the machine probably slept. The caller re-resolves
+// long-poll that the host probably slept. The caller re-resolves
 // immediately without advancing the connection backoff.
 var errSleepDetected = errors.New("sleep detected")
 

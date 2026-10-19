@@ -283,14 +283,14 @@ func TestClientTakeAndArrived(t *testing.T) {
 	}
 
 	st, err := c.State(ctx, base)
-	if err != nil || len(st.Holds) != 1 {
+	if err != nil || len(st.Assignments) != 1 {
 		t.Fatalf("state: %+v, %v", st, err)
 	}
-	h := st.Holds[0]
+	h := st.Assignments[0]
 	if err := c.Arrived(ctx, base, "mac", state.Arrival{Kind: h.Kind, Name: h.Name, Seq: h.Seq}); err != nil {
 		t.Fatalf("arrived: %v", err)
 	}
-	if st, _ = c.State(ctx, base); !st.Holds[0].Arrived {
-		t.Fatalf("hold not arrived: %+v", st.Holds[0])
+	if st, _ = c.State(ctx, base); !st.Assignments[0].Arrived {
+		t.Fatalf("assignment not arrived: %+v", st.Assignments[0])
 	}
 }

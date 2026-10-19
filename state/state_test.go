@@ -22,8 +22,8 @@ func TestStateRoundTrip(t *testing.T) {
 		Epoch:      7,
 		Since:      time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC),
 		Activation: 4,
-		Holds: []StoredHold{{
-			Hold:       Hold{Kind: KindScreen, Name: "LG", Holder: "mac", Prev: "linux", Seq: 7, Input: "F4:50=D1"},
+		Assignments: []StoredAssignment{{
+			Assignment: Assignment{Kind: KindScreen, Name: "LG", Assignee: "mac", Prev: "linux", Seq: 7, Input: "F4:50=D1"},
 			Activation: 4,
 		}},
 	}
@@ -40,7 +40,7 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Errorf("owner round-trip mismatch: got %+v, want %+v", loadedOwner, owner)
 	}
 
-	agent := AgentState{LastOwner: "linux", LastActivation: 3, Seen: map[string]Seq{"hid/mouse": 5}}
+	agent := AgentState{HandledOwner: "linux", HandledActivation: 3, HandledSeqs: map[string]Seq{"hid/mouse": 5}}
 	agentPath := filepath.Join(dir, "agent.json")
 	if err := Save(agentPath, agent); err != nil {
 		t.Fatalf("Save agent: %v", err)
@@ -109,36 +109,36 @@ func TestStateFileComplete(t *testing.T) {
 	}
 }
 
-// Hold encodes every field, so a client decoding into a reused struct never
-// keeps a stale one (SPEC §7).
-func TestHoldEncodesEveryField(t *testing.T) {
-	data, err := json.Marshal(Hold{Kind: KindHID, Name: "mouse"})
+// Assignment encodes every field, so a client decoding into a reused struct
+// never keeps a stale one (SPEC §7).
+func TestAssignmentEncodesEveryField(t *testing.T) {
+	data, err := json.Marshal(Assignment{Kind: KindHID, Name: "mouse"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"kind", "name", "holder", "prev", "seq", "input", "channel", "arrived"} {
+	for _, f := range []string{"kind", "name", "assignee", "prev", "seq", "input", "channel", "arrived"} {
 		if !strings.Contains(string(data), `"`+f+`":`) {
-			t.Errorf("hold JSON %s lacks %q", data, f)
+			t.Errorf("assignment JSON %s lacks %q", data, f)
 		}
 	}
 }
 
-func TestHoldKey(t *testing.T) {
-	h := Hold{Kind: KindScreen, Name: "LG"}
-	if h.Key() != (HoldKey{KindScreen, "LG"}) || h.Key().String() != "screen/LG" {
+func TestAssignmentKey(t *testing.T) {
+	h := Assignment{Kind: KindScreen, Name: "LG"}
+	if h.Key() != (AssignmentKey{KindScreen, "LG"}) || h.Key().String() != "screen/LG" {
 		t.Errorf("Key() = %+v / %q", h.Key(), h.Key().String())
 	}
 }
 
-func TestParseHoldKey(t *testing.T) {
-	for _, k := range []HoldKey{{KindScreen, "LG HDR WQHD"}, {KindHID, "mouse"}, {KindHID, "a/b"}} {
-		if got, ok := ParseHoldKey(k.String()); !ok || got != k {
-			t.Errorf("ParseHoldKey(%q) = %+v, %v; want %+v", k.String(), got, ok, k)
+func TestParseAssignmentKey(t *testing.T) {
+	for _, k := range []AssignmentKey{{KindScreen, "LG HDR WQHD"}, {KindHID, "mouse"}, {KindHID, "a/b"}} {
+		if got, ok := ParseAssignmentKey(k.String()); !ok || got != k {
+			t.Errorf("ParseAssignmentKey(%q) = %+v, %v; want %+v", k.String(), got, ok, k)
 		}
 	}
 	for _, s := range []string{"", "mouse", "led/x", "hid/", "/x"} {
-		if got, ok := ParseHoldKey(s); ok {
-			t.Errorf("ParseHoldKey(%q) = %+v, want no key", s, got)
+		if got, ok := ParseAssignmentKey(s); ok {
+			t.Errorf("ParseAssignmentKey(%q) = %+v, want no key", s, got)
 		}
 	}
 }

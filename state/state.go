@@ -16,53 +16,55 @@ import (
 	"time"
 )
 
-// Hold kinds: what a take names (SPEC §4.3, §7).
+// Assignment kinds: what a take names (SPEC §4.3, §7).
 const (
 	KindScreen = "screen"
 	KindHID    = "hid"
 )
 
-// HoldKey identifies a hold: a monitor and a device may share a name.
-type HoldKey struct{ Kind, Name string }
+// AssignmentKey identifies an assignment: a monitor and a device may share a
+// name.
+type AssignmentKey struct{ Kind, Name string }
 
 // String renders the key as "kind/name", the form agent.json stores it in.
-func (k HoldKey) String() string { return k.Kind + "/" + k.Name }
+func (k AssignmentKey) String() string { return k.Kind + "/" + k.Name }
 
-// ParseHoldKey reads the "kind/name" form back; ok is false for any other
+// ParseAssignmentKey reads the "kind/name" form back; ok is false for any other
 // string. A name may contain "/", a kind never does.
-func ParseHoldKey(s string) (HoldKey, bool) {
+func ParseAssignmentKey(s string) (AssignmentKey, bool) {
 	kind, name, ok := strings.Cut(s, "/")
 	if !ok || name == "" || (kind != KindScreen && kind != KindHID) {
-		return HoldKey{}, false
+		return AssignmentKey{}, false
 	}
-	return HoldKey{kind, name}, true
+	return AssignmentKey{kind, name}, true
 }
 
-// Seq identifies one recording of a hold: the server sets it to the epoch at
-// which it recorded the take. Clients compare it for equality only (SPEC §7).
+// Seq identifies one recording of an assignment: the server sets it to the
+// epoch at which it recorded the take. Clients compare it for equality only
+// (SPEC §7).
 type Seq int64
 
-// Hold is the server's record of the last take of one name (SPEC §7). No field
-// is omitted when empty: a client decoding into a reused struct must not keep
-// a stale value.
-type Hold struct {
-	Kind   string `json:"kind"`
-	Name   string `json:"name"`
-	Holder string `json:"holder"`
-	// Prev is the holder before this one, empty on a first take.
+// Assignment is the server's record of the last take of one name (SPEC §7). No
+// field is omitted when empty: a client decoding into a reused struct must not
+// keep a stale value.
+type Assignment struct {
+	Kind     string `json:"kind"`
+	Name     string `json:"name"`
+	Assignee string `json:"assignee"`
+	// Prev is the assignee before this one, empty on a first take.
 	Prev string `json:"prev"`
-	// Seq changes every time the hold is recorded anew.
+	// Seq changes every time the assignment is recorded anew.
 	Seq Seq `json:"seq"`
 	// Input is a screen's VCP:SRC=VAL write, empty for a device.
 	Input string `json:"input"`
 	// Channel is a device's Easy-Switch channel, 0 for a screen.
 	Channel uint8 `json:"channel"`
-	// Arrived is set once the holder holds the device's link.
+	// Arrived is set once the assignee holds the device's link.
 	Arrived bool `json:"arrived"`
 }
 
-// Key returns the hold's identity.
-func (h Hold) Key() HoldKey { return HoldKey{h.Kind, h.Name} }
+// Key returns the assignment's identity.
+func (h Assignment) Key() AssignmentKey { return AssignmentKey{h.Kind, h.Name} }
 
 // Take is one item of a POST /take request: what the owner asks to come to it.
 type Take struct {
@@ -73,10 +75,10 @@ type Take struct {
 	Arrived bool   `json:"arrived"`
 }
 
-// Key returns the identity of the hold the take addresses.
-func (t Take) Key() HoldKey { return HoldKey{t.Kind, t.Name} }
+// Key returns the identity of the assignment the take addresses.
+func (t Take) Key() AssignmentKey { return AssignmentKey{t.Kind, t.Name} }
 
-// Arrival is one item of a POST /arrived request: the holder reports the link
+// Arrival is one item of a POST /arrived request: the assignee reports the link
 // of the device held at Seq.
 type Arrival struct {
 	Kind string `json:"kind"`
@@ -94,33 +96,36 @@ type ServerState struct {
 	Activation int64           `json:"activation"`
 	Live       map[string]bool `json:"live"`
 	ServerID   string          `json:"server_id"`
-	// Holds is sorted by kind, then name, and never nil in JSON.
-	Holds []Hold `json:"holds"`
+	// Assignments is sorted by kind, then name, and never nil in JSON.
+	Assignments []Assignment `json:"assignments"`
 }
 
 // OwnerState is the server's persisted state (SPEC §5.2 --state, §7). Each
-// hold carries the activation it was taken under: the server needs it for the
-// idempotence rule and clients never see it.
+// assignment carries the activation it was taken under: the server needs it for
+// the idempotence rule and clients never see it.
 type OwnerState struct {
-	Owner      string       `json:"owner"`
-	Epoch      int64        `json:"epoch"`
-	Since      time.Time    `json:"since"`
-	Activation int64        `json:"activation"`
-	Holds      []StoredHold `json:"holds"`
+	Owner       string             `json:"owner"`
+	Epoch       int64              `json:"epoch"`
+	Since       time.Time          `json:"since"`
+	Activation  int64              `json:"activation"`
+	Assignments []StoredAssignment `json:"assignments"`
 }
 
-// StoredHold is a Hold as persisted, with the activation it was taken under.
-type StoredHold struct {
-	Hold
+// StoredAssignment is a Assignment as persisted, with the activation it was
+// taken under.
+type StoredAssignment struct {
+	Assignment
 	Activation int64 `json:"activation"`
 }
 
-// AgentState is the agent's persisted record (SPEC §4.3 agent.json).
+// AgentState is the agent's persisted record of what it handled (SPEC §4.3
+// agent.json): the ownership whose commands last ran, and the seq of each
+// assignment last handled.
 type AgentState struct {
-	LastOwner      string `json:"last_owner"`
-	LastActivation int64  `json:"last_activation"`
-	// Seen maps "kind/name" to the seq of the last take handled.
-	Seen map[string]Seq `json:"seen"`
+	HandledOwner      string `json:"handled_owner"`
+	HandledActivation int64  `json:"handled_activation"`
+	// HandledSeqs maps "kind/name" to the seq of the last assignment handled.
+	HandledSeqs map[string]Seq `json:"handled_seqs"`
 }
 
 // Load reads path into v. A missing file is not an error: v is left
