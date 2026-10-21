@@ -25,7 +25,7 @@ every host, five subcommands:
   per taken screen or device, serves `GET /state`, `POST /claim/{id}`,
   `POST /take/{id}`, `POST /arrived/{id}` and `GET /wait?epoch=N&id=ME`
   (long-poll) over mutual TLS: the server identity and the required client
-  certificate are both derived from the shared secret. Port defaults to 8700;
+  certificate are both derived from the shared secret. Port defaults to 14873;
   `--state` defaults to `$STATE_DIRECTORY/state.json` under systemd, else
   `StateDir/state.json`. It advertises itself over mDNS unless `--no-advertise`
   (SPEC §6.4, §7).
@@ -42,16 +42,17 @@ every host, five subcommands:
   **assignments** (SPEC §5.5, §5.6). Every other host then gives away what each
   assignment names: it writes the `VCP:SRC=VAL` the wire carries to the monitor,
   or sends its end of the device to the assignee's channel with HID++
-  `changeHost`. A screen write has no receipt; a device's receipt is its arrival
-  on the assignee, and an assignment that still fails to be given away after the
-  retries is notified by the previous assignee (SPEC §4.3).
-  `-D/--on-deactivation` runs when the host stops being the owner. Each `DECL`
-  and `COMMAND` is one quoted string that `connect` splits into words itself.
-  `--trigger NAME[,…]` is required and takes only names `--declare-hid` declares
-  — a device declared by a bare `VID:PID` is watched as a HID node that comes
-  and goes, one declared by `VID:PID:SLOT` as one pairing slot of a receiver
-  that stays plugged in; macOS also gets `--no-guards` and `--display-match`
-  (SPEC §5.4, §6).
+  `changeHost`. A screen write has no receipt, but on Linux the host being left
+  reads whether the monitor left its input and retries a write it ignored; a
+  device's receipt is its arrival on the assignee, and an assignment that still
+  fails to be given away after the retries is notified by the previous assignee
+  (SPEC §4.3). `-D/--on-deactivation` runs when the host stops being the owner.
+  Each `DECL` and `COMMAND` is one quoted string that `connect` splits into
+  words itself. `--trigger NAME[,…]` is required and takes only names
+  `--declare-hid` declares — a device declared by a bare `VID:PID` is watched as
+  a HID node that comes and goes, one declared by `VID:PID:SLOT` as one pairing
+  slot of a receiver that stays plugged in; macOS also gets `--no-guards` and
+  `--display-match` (SPEC §5.4, §6).
 - `activate ID` — makes an identity the owner by hand and has it take, for
   scripts and recovery: against the current owner it re-posts the takes, and
   every other host gives the assignments away again. Fails with a pointer to

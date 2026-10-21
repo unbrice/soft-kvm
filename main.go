@@ -249,7 +249,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags, error) {
 func serveListenAddr(arg string) (addr string, port int, err error) {
 	addr = arg
 	if addr == "" {
-		addr = "8700"
+		addr = "14873"
 	}
 	if _, err := strconv.Atoi(addr); err == nil {
 		addr = ":" + addr

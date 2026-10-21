@@ -75,7 +75,7 @@ func TestUnitContent(t *testing.T) {
 // TestNoUnresolvedTokens renders every template with placeholder
 // substitutions and pins that no placeholder survives.
 func TestNoUnresolvedTokens(t *testing.T) {
-	serveUnit := renderForTest(t, "units/soft-kvm-serve.service", serveBinPath, []string{"8700"})
+	serveUnit := renderForTest(t, "units/soft-kvm-serve.service", serveBinPath, []string{"14873"})
 	agentUnit := renderForTest(t, "units/soft-kvm.service", "/home/u/soft-kvm", []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b"})
 	serveEnv := renderEnv(mustReadServiceFile(t, "deploy/env.serve.example"), testToken)
 	connectEnv := renderEnv(mustReadServiceFile(t, "deploy/env.connect.example"), testToken)
@@ -167,18 +167,18 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 }
 
 func TestServeInstallRequiresRoot(t *testing.T) {
-	err := validateServeInstall(1000, testToken, []string{"8700"})
+	err := validateServeInstall(1000, testToken, []string{"14873"})
 	if err == nil || !strings.Contains(err.Error(), "root") {
 		t.Fatalf("non-zero euid: got %v, want a refusal naming root", err)
 	}
-	if err := validateServeInstall(0, testToken, []string{"8700"}); err != nil {
+	if err := validateServeInstall(0, testToken, []string{"14873"}); err != nil {
 		t.Fatalf("euid 0 with valid token and address: got %v, want nil", err)
 	}
 }
 
 func TestServeInstallRequiresToken(t *testing.T) {
 	for _, token := range []string{"", "short"} {
-		if err := validateServeInstall(0, token, []string{"8700"}); !errors.Is(err, errToken) {
+		if err := validateServeInstall(0, token, []string{"14873"}); !errors.Is(err, errToken) {
 			t.Fatalf("token %q: got %v, want errToken", token, err)
 		}
 	}
@@ -264,7 +264,7 @@ func TestQuoteSystemdArg(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "plain token unchanged", arg: "ddcutil", want: "ddcutil"},
-		{name: "digits", arg: "8700", want: "8700"},
+		{name: "digits", arg: "14873", want: "14873"},
 		{name: "spaces wrapped", arg: "hello world", want: `"hello world"`},
 		{name: "double quote escaped", arg: `say "hi"`, want: `"say \"hi\""`},
 		{name: "backslash escaped when wrapped", arg: `a\b c`, want: `"a\\b c"`},
@@ -307,7 +307,7 @@ func TestRenderEnv(t *testing.T) {
 	if !strings.Contains(connect, "SOFTKVM_TOKEN="+testToken) {
 		t.Errorf("connect env lacks the substituted token line")
 	}
-	if !strings.Contains(connect, "# SOFTKVM_SERVER=desktop.lan:8700") {
+	if !strings.Contains(connect, "# SOFTKVM_SERVER=desktop.lan:14873") {
 		t.Errorf("connect env lost the commented SOFTKVM_SERVER knob")
 	}
 }
@@ -317,7 +317,7 @@ func TestRenderEnv(t *testing.T) {
 // installer's environment must not leak into the unit, and token order is
 // preserved.
 func TestBakesRawArgs(t *testing.T) {
-	rawArgs := []string{"--no-advertise", "8700"}
+	rawArgs := []string{"--no-advertise", "14873"}
 	if err := validateServeArgs(rawArgs); err != nil {
 		t.Fatalf("validateServeArgs(%v): %v", rawArgs, err)
 	}
@@ -334,7 +334,7 @@ func TestBakesRawArgs(t *testing.T) {
 	if strings.Contains(execLine, "--state") {
 		t.Errorf("ExecStart bakes a --state the user never passed: %s", execLine)
 	}
-	want := "ExecStart=" + serveBinPath + " serve --no-advertise 8700"
+	want := "ExecStart=" + serveBinPath + " serve --no-advertise 14873"
 	if execLine != want {
 		t.Errorf("got %s, want %s (raw token order preserved)", execLine, want)
 	}

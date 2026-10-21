@@ -18,15 +18,49 @@ import (
 	"testing"
 )
 
-// recorder is a Runner that records its calls and returns err.
+// recorder is a Runner that records its calls. A setvcp returns err; each
+// getvcp 60 answers the next of inputs, the last one repeating, where ""
+// stands for a monitor that does not answer.
 type recorder struct {
-	calls [][]string
-	err   error
+	calls  [][]string
+	err    error
+	inputs []string
 }
 
 func (r *recorder) run(_ context.Context, argv []string) ([]byte, error) {
 	r.calls = append(r.calls, argv)
-	return nil, r.err
+	if slices.Contains(argv, "setvcp") {
+		return nil, r.err
+	}
+	input := ""
+	if len(r.inputs) > 0 {
+		input = r.inputs[0]
+	}
+	if len(r.inputs) > 1 {
+		r.inputs = r.inputs[1:]
+	}
+	if input == "" {
+		return nil, errors.New("ddcutil: exit status 1: DDCRC_NULL_RESPONSE")
+	}
+	return []byte("VCP 60 SNC x" + input + "\n"), nil
+}
+
+// writes is the setvcp calls r received.
+func (r *recorder) writes() [][]string {
+	var ws [][]string
+	for _, c := range r.calls {
+		if slices.Contains(c, "setvcp") {
+			ws = append(ws, c)
+		}
+	}
+	return ws
+}
+
+// quickSettle shortens how long a monitor is given to settle after a write.
+func quickSettle(t *testing.T) {
+	old := settle
+	settle = 0
+	t.Cleanup(func() { settle = old })
 }
 
 // attach points the EDID glob at a temp dir holding one EDID per name, as
@@ -57,29 +91,75 @@ func attach(t *testing.T, names ...string) {
 }
 
 func TestWriteDo(t *testing.T) {
+	quickSettle(t)
 	t.Run("standard, from the default source", func(t *testing.T) {
 		attach(t, "DELL U2720Q")
-		r := &recorder{}
+		r := &recorder{inputs: []string{"0f", ""}}
 		if err := (Write{0x60, 0x51, 0x11}).Do(t.Context(), r.run, "DELL U2720Q"); err != nil {
 			t.Fatalf("Do: %v", err)
 		}
 		want := []string{"ddcutil", "setvcp", "0x60", "0x11", "--noverify", "--model", "DELL U2720Q"}
-		if len(r.calls) != 1 || !slices.Equal(r.calls[0], want) {
-			t.Errorf("calls = %v, want one write %v", r.calls, want)
+		if ws := r.writes(); len(ws) != 1 || !slices.Equal(ws[0], want) {
+			t.Errorf("writes = %v, want one write %v", ws, want)
 		}
 	})
 
 	t.Run("lg, from its own source, name matched ignoring case", func(t *testing.T) {
 		attach(t, "LG HDR WQHD")
-		r := &recorder{}
-		if err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "lg hdr wqhd"); err != nil {
+		r := &recorder{inputs: []string{"0f", ""}}
+		if err := (Write{0xF4, 0x50, 0xD1}).Do(t.Context(), r.run, "lg hdr wqhd"); err != nil {
 			t.Fatalf("Do: %v", err)
 		}
-		// One write and nothing else: the monitor is never read back.
-		want := []string{"ddcutil", "setvcp", "0xF4", "0xD0", "--noverify",
+		want := []string{"ddcutil", "setvcp", "0xF4", "0xD1", "--noverify",
 			"--i2c-source-addr=0x50", "--model", "LG HDR WQHD"}
-		if len(r.calls) != 1 || !slices.Equal(r.calls[0], want) {
-			t.Errorf("calls = %v, want one write %v", r.calls, want)
+		if ws := r.writes(); len(ws) != 1 || !slices.Equal(ws[0], want) {
+			t.Errorf("writes = %v, want one write %v", ws, want)
+		}
+	})
+
+	t.Run("a write the monitor ignores fails, and the next lands", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{inputs: []string{"0f"}}
+		w := Write{0xF4, 0x50, 0xD1}
+		if err := w.Do(t.Context(), r.run, "LG HDR WQHD"); err == nil || !strings.Contains(err.Error(), "ignored the write") {
+			t.Fatalf("Do = %v, want the write reported ignored", err)
+		}
+		r.inputs = []string{"0f", ""}
+		if err := w.Do(t.Context(), r.run, "LG HDR WQHD"); err != nil {
+			t.Fatalf("Do again: %v", err)
+		}
+		if ws := r.writes(); len(ws) != 2 {
+			t.Errorf("writes = %v, want two", ws)
+		}
+	})
+
+	t.Run("a monitor that answers on its new input has left", func(t *testing.T) {
+		attach(t, "DELL U2720Q")
+		r := &recorder{inputs: []string{"0f", "11"}}
+		if err := (Write{0x60, 0x51, 0x11}).Do(t.Context(), r.run, "DELL U2720Q"); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+	})
+
+	t.Run("a monitor already on the input is not written", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{inputs: []string{"0f"}}
+		if err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "LG HDR WQHD"); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if ws := r.writes(); len(ws) != 0 {
+			t.Errorf("writes = %v, want none", ws)
+		}
+	})
+
+	t.Run("a silent monitor gets one write, unchecked", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{}
+		if err := (Write{0xF4, 0x50, 0xD1}).Do(t.Context(), r.run, "LG HDR WQHD"); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if len(r.calls) != 2 || len(r.writes()) != 1 {
+			t.Errorf("calls = %v, want one read and one write", r.calls)
 		}
 	})
 
@@ -111,12 +191,12 @@ func TestWriteDo(t *testing.T) {
 	t.Run("a failed write is reported once, not retried", func(t *testing.T) {
 		attach(t, "LG HDR WQHD")
 		boom := errors.New("ddcutil requires module i2c-dev")
-		r := &recorder{err: boom}
-		if err := (Write{0xF4, 0x50, 0xD0}).Do(t.Context(), r.run, "LG HDR WQHD"); !errors.Is(err, boom) {
+		r := &recorder{inputs: []string{"0f"}, err: boom}
+		if err := (Write{0xF4, 0x50, 0xD1}).Do(t.Context(), r.run, "LG HDR WQHD"); !errors.Is(err, boom) {
 			t.Fatalf("Do = %v, want the write error", err)
 		}
-		if len(r.calls) != 1 {
-			t.Errorf("calls = %v, want one", r.calls)
+		if ws := r.writes(); len(ws) != 1 {
+			t.Errorf("writes = %v, want one", ws)
 		}
 	})
 }

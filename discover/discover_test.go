@@ -21,7 +21,7 @@ import (
 
 func TestCacheRoundTrip(t *testing.T) {
 	r := NewResolver(filepath.Join(t.TempDir(), "server"))
-	const addr = "127.0.0.1:8700"
+	const addr = "127.0.0.1:14873"
 	r.Save(addr)
 	if got := r.load(); got != addr {
 		t.Fatalf("load returned %q, want %q", got, addr)
