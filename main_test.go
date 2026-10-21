@@ -60,13 +60,13 @@ func TestRejectExtraArgs(t *testing.T) {
 		wantErr string
 	}{
 		{name: "none expected, none given", args: nil, want: 0},
-		{name: "within limit", args: []string{"8700"}, want: 1},
+		{name: "within limit", args: []string{"14873"}, want: 1},
 		{name: "at limit", args: []string{"linux"}, want: 1},
-		{name: "extra positional", args: []string{"8700", "8800"}, want: 1, wantErr: `unexpected extra argument "8800"`},
-		{name: "extra when none expected", args: []string{"8700"}, want: 0, wantErr: `unexpected extra argument "8700"`},
+		{name: "extra positional", args: []string{"14873", "8800"}, want: 1, wantErr: `unexpected extra argument "8800"`},
+		{name: "extra when none expected", args: []string{"14873"}, want: 0, wantErr: `unexpected extra argument "14873"`},
 		{
 			name:    "flag after positional",
-			args:    []string{"8700", "--state", "/tmp/x"},
+			args:    []string{"14873", "--state", "/tmp/x"},
 			want:    1,
 			wantErr: `"--state" follows a positional argument and would be ignored; flags must come first`,
 		},
@@ -314,9 +314,9 @@ func TestConsoleHandler(t *testing.T) {
 	var buf bytes.Buffer
 	var level slog.LevelVar
 	log := slog.New(newConsoleHandler(&buf, &level, false))
-	log.Info("serving", "addr", ":8700", "instance", "desk top")
+	log.Info("serving", "addr", ":14873", "instance", "desk top")
 	out := buf.String()
-	if !strings.HasSuffix(out, `INFO  serving addr=:8700 instance="desk top"`+"\n") {
+	if !strings.HasSuffix(out, `INFO  serving addr=:14873 instance="desk top"`+"\n") {
 		t.Errorf("unexpected console line: %q", out)
 	}
 	if strings.Contains(out, "\x1b") {

@@ -78,9 +78,12 @@ work; §10 is the integration pass, run at the end.
    helper, even on firmware that ignores standard `0x60` writes.[^4^]
 10. **A DDC write that returns success may still not take effect.** The bus is
     unacknowledged in practice: the monitor can NAK, arrive busy, or be waking
-    from standby. Nothing tells: the read-back from the host being left is not a
-    usable receipt in practice, so a screen write has none, and one that does
-    not land costs an OSD press (§4.3).
+    from standby, and this LG drops the first write after it has sat idle on an
+    input while `ddcutil` exits 0. The read-back is no receipt that the assignee
+    has the screen, but it tells the host being left whether the monitor left
+    it: the LG answers Input Source while it shows that host and falls silent
+    once it shows another. A write that does not land is retried on that
+    evidence, and costs an OSD press only where no read is possible (§4.3).
 11. **Switching inputs drops the video link on the input being left**, unless
     the LG's *Deep Sleep* setting is off. A dropped link means the losing host
     sees a monitor hot-unplug: Hyprland collapses workspaces, macOS rearranges
@@ -106,11 +109,11 @@ work; §10 is the integration pass, run at the end.
    │    detector ─┐             │          │          │ connect        │
    │    switch  ◄─┤             │          │          │  detector ─┐   │
    │              │ loopback    │          │          │  switch  ◄─┤   │
-   │  ┌───────────▼──────────┐  │          │          └──────┬─────┘   │
-   │  │ soft-kvm serve :8700 │◄─┼──────────┴─────────────────┘         │
-   │  │ owner bit + epoch    │  │   POST /claim/mac · GET /wait        │
-   │  │ liveness, mDNS SRV   │  │   found by mDNS, outbound only       │
-   │  └──────────────────────┘  │                                      │
+   │  ┌───────────▼───────────┐ │          │          └──────┬─────┘   │
+   │  │ soft-kvm serve :14873 │◄┼──────────┴─────────────────┘         │
+   │  │ owner bit + epoch     │ │   POST /claim/mac · GET /wait        │
+   │  │ liveness, mDNS SRV    │ │   found by mDNS, outbound only       │
+   │  └───────────────────────┘ │                                      │
    └────────────────────────────┘──────────────────────────────────────┘
               ▲
     soft-kvm activate ID     (manual override, any LAN host)
@@ -187,11 +190,13 @@ host. So each host tries, and a host with nothing to move does nothing: no
 monitor of that name attached, no declaration for that device, or the device not
 linked here.
 
-Nothing probes the monitor before the write. A read that says "my input is
+A read before the write never stands in for it. A read that says "my input is
 already inactive" cannot be told from a read that failed because DDC is not
 wired up, and treating the second as the first makes a broken setup look like a
-finished handover. A write aimed at an input the monitor already shows costs a
-write the monitor ignores.
+finished handover: a host that gets no answer writes anyway. Only an answer
+counts. A monitor that answers with the input the write selects is not written,
+since a monitor may blank for a moment even on a write to the input it shows;
+one that answers with another input is written, then read again.
 
 **Rate limit, per name.** Two things hold an assignment back, never a command: a
 5 s cooldown after an assignment of that name was given away, and a circuit
@@ -201,12 +206,17 @@ The assignments of one handover carry different names, so the mouse does not
 wait behind the screen, and an assignment with nothing to move here counts for
 neither: the keyboard that carried the gesture is absent on every handover.
 
-**Screens have no receipt.** The read-back from the host being left misreports
-in practice, and on the display that just became active the read races the link
-coming up. A screen assignment is written once; only a write that fails locally
-— `ddcutil` missing, no `i2c-dev`, no permission, a hung I²C transaction — is
-retried. A write the monitor ignores is silent and costs one press of the OSD
-Input button (§2).
+**Screens have no receipt.** Nothing tells that the assignee has the screen: on
+the display that just became active the read races the link coming up. What the
+host being left can tell is that the monitor left it, and on Linux it checks: a
+monitor that answered with this host's input before the write and does again 5 s
+after ignored it. Silence sooner proves nothing: the LG falls silent while it
+switches, even on a switch it then undoes. That write fails and is retried like
+one that fails locally — `ddcutil` missing, no `i2c-dev`, no permission, a hung
+I²C transaction. A monitor that did not answer before the write gets it
+unchecked, and so does every write on macOS, where none has been seen dropped. A
+write the monitor ignores on every attempt, or unchecked, costs one press of the
+OSD Input button (§2).
 
 **A device's receipt is its arrival on the assignee.** The assignee polls each
 device it took — every 1 s, for 60 s after the take — and posts `/arrived` once
@@ -366,7 +376,7 @@ Sharp edges, in the order they will bite:
 ### 5.2 `soft-kvm serve [IP:]PORT`
 
 The bit, the assignments (§7), and nothing else. `IP` optional — omitted binds
-all interfaces (`soft-kvm serve 8700` ≡ `:8700`).
+all interfaces (`soft-kvm serve 14873` ≡ `:14873`).
 
 | Flag / env        | Default   | Meaning                                                        |
 | ----------------- | --------- | -------------------------------------------------------------- |
@@ -381,12 +391,12 @@ runs as, root or dedicated), `StateDir/state.json` otherwise —
 `$XDG_STATE_HOME/soft-kvm` on Linux, `~/Library/Application Support/soft-kvm` on
 macOS, where launchd sets no equivalent (§6.4).
 
-The advertised port is the listening port. Bind a fixed 8700 rather than port 0
+The advertised port is the listening port. Bind a fixed 14873 rather than port 0
 — a changing port turns every stale cache entry into a failed connection.
 
 The host carrying the bit runs this next to its own `connect`, as a second unit.
 `connect` reaches it over loopback with no special case: it browses, or finds
-`127.0.0.1:8700` in its cache, and long-polls `/wait` like any other client,
+`127.0.0.1:14873` in its cache, and long-polls `/wait` like any other client,
 which is also how its liveness gets registered (§4.3).
 
 ### 5.3 `soft-kvm activate ID [--server HOST:PORT] [--force]`
@@ -598,13 +608,15 @@ and the token must not reach them (§9).
 **Writing.** A host looks for a monitor named `NAME` among its attached displays
 — the EDIDs under `/sys/class/drm/*/edid` on Linux, the IORegistry on macOS,
 both in milliseconds and without DDC traffic. None ⇒ nothing to move here. One ⇒
-one write, never read back (§4.3):
+it is written, and on Linux checked for having left this host's input (§4.3):
 
 - **Linux — `ddcutil`.** The write is `ddcutil setvcp <vcp> <value> --noverify`
   with `--model NAME`, plus `--i2c-source-addr` when the source is not `0x51`.
   `--noverify` is load-bearing: ddcutil's own verification fails on firmware
   that goes silent on the input it just left, so a verifying write reports
-  failure after succeeding.
+  failure after succeeding. The check is `ddcutil --terse getvcp 60`, once
+  before the write and once 5 s after it, then with `--maxtries 1,1,1` so that a
+  silent monitor costs one exchange, not ten.
 - **macOS — `IOAVService`.** `screen` loads `CoreFoundation` and `IOKit` via
   `purego`, matches each external display from the IORegistry
   (`DCPAVServiceProxy` → EDID + `IOAVServiceCreateWithService`) and writes the
@@ -830,7 +842,7 @@ nothing.
 
 ## 7. Service API spec
 
-**Base:** `https://<coordinator>:8700` · **Auth:** mutual TLS proves both peers
+**Base:** `https://<coordinator>:14873` · **Auth:** mutual TLS proves both peers
 hold `SOFTKVM_TOKEN`: the server identity and the client certificate are both
 derived from it (§9). The secret is scoped by construction: it can read and flip
 one ownership bit, and ask the other hosts for one of two bounded writes (§9).
@@ -895,12 +907,12 @@ one ownership bit, and ask the other hosts for one of two bounded writes (§9).
 | Coordinator unreachable                                           | Claims and takes logged-and-lost; agents back off exponentially (full jitter, 1 s base, 30 s cap — jitter keeps the agents from retrying in lockstep after a shared outage); OSD fallback                                                                                                                                            |
 | Mac away / on battery / undocked                                  | Guards suppress everything; the bit may change without the Mac, and nothing is taken towards it — a take needs its agent                                                                                                                                                                                                             |
 | Receiver flapping                                                 | 2 s settle + change-only notification + idempotent claims + circuit breaker                                                                                                                                                                                                                                                          |
-| Monitor already on the taker's input                              | Every host writes anyway: nothing probes first (§4.3). The monitor ignores a write from an inactive input; where the backend errors on it instead, the retries run and the previous assignee notifies once                                                                                                                           |
+| Monitor already on the taker's input                              | Every host writes anyway: one not on screen gets no answer to its read (§4.3). The monitor ignores a write from an inactive input; where the backend errors on it instead, the retries run and the previous assignee notifies once                                                                                                   |
 | Token mismatch after rotation                                     | Connections fail TLS verification (the certificate derives from the token); nothing switches until the env files and the running units agree again (§9)                                                                                                                                                                              |
 | Server restarted                                                  | Long-polls reset; agents reconcile on error; `server_id` change is not by itself a state change. Assignments are persisted, so no assignment is given away twice                                                                                                                                                                     |
 | Server state lost                                                 | `owner=""`, no assignments. Agents keep their records; the next assignment of each name is new to them and is given away — unless its `seq` lands on the one on record, since epochs restart at 0                                                                                                                                    |
 | **Mis-flip: monitor points at a host that cannot switch it back** | Unrecoverable over the network: the host on screen is the one that would have to write. With Auto Input Switch off, the OSD button is the only recovery, and no agent is left able to notify. A take only ever comes from a running agent (§4.3), which is what keeps this state out of reach                                        |
-| Screen write succeeds but the monitor does not move               | Silent: a screen has no receipt (§4.3). The bit and the assignments stay correct and the user presses OSD                                                                                                                                                                                                                            |
+| Screen write succeeds but the monitor does not move               | On Linux, the monitor still answers with the input of the host being left: the write fails, is retried, and the previous assignee notifies once (§4.3). Unchecked — macOS, or a monitor that did not answer before the write — it is silent: the bit and the assignments stay correct and the user presses OSD                       |
 | Write hangs / its result is lost                                  | `--switch-timeout` SIGTERMs the child and the write counts as failed: retried, then notified on the previous assignee and logged (§4.3)                                                                                                                                                                                              |
 | Result arrives after its issue ended                              | Ignored and logged; the decider only accepts a result while its issue is outstanding (§4.3)                                                                                                                                                                                                                                          |
 | Deep Sleep left on                                                | Every switch hot-unplugs the monitor on the host being left: Hyprland collapses workspaces onto nothing, macOS rearranges windows. Set it Off                                                                                                                                                                                        |
@@ -988,6 +1000,9 @@ that does not exist yet.
       out: its EDID manufacturer is `APP`
 - [ ] The monitor is already on the other input when a host writes: note whether
       `ddcutil setvcp --noverify` errors or is silently ignored (§8)
+- [ ] 5 s after a Linux screen write, the LG is silent (`DDCRC_NULL_RESPONSE`)
+      when it landed and answers `x0f` when it was dropped or flickered back:
+      what the check after the write relies on (§4.3, §5.6)
 - [ ] Fifty switches back and forth: count the screen writes that did not land
       and the device give-aways that needed a retry. If devices commonly arrive
       later than 10 s, the arrival window and the assignee's 60 s poll need

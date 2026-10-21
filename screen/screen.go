@@ -200,6 +200,25 @@ func (w Write) IsValid() bool {
 	return false
 }
 
+// reads is the Input Source value the monitor reports once w has landed. ok
+// is false when no table knows it: a raw value outside the standard table.
+func (w Write) reads() (value uint8, ok bool) {
+	for _, t := range tables {
+		if t.VCP != w.VCP || t.source() != w.Source {
+			continue
+		}
+		for alias, v := range t.Inputs {
+			if v == w.Value {
+				return t.reads(alias)
+			}
+		}
+		if t.VCP == inputSourceVCP {
+			return w.Value, true
+		}
+	}
+	return 0, false
+}
+
 // mustBeValid panics on a write that is not IsValid. ParseWrite already
 // refused it, so reaching a backend with one is a bug: the backends call this
 // last, right before the bytes leave.

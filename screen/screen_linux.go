@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const backend = "ddcutil"
@@ -58,8 +59,12 @@ func attachedNames() ([]string, error) {
 	return names, nil
 }
 
-// Do writes w once to the attached monitor named name, ignoring case, and
-// never reads it back: the monitor's answer is not a receipt (SPEC §4.3).
+// Do writes w to the attached monitor named name, ignoring case, and fails
+// when the monitor ignored it, which ddcutil does not report. It reads the
+// input on screen first: one that is the input w selects is not written, and
+// one still answered after the write means the write did not land. A monitor
+// that does not answer before is not on this host's input and gets the write
+// unchecked (SPEC §4.3).
 // ErrNoDisplay means no attached monitor has the name. --noverify is
 // load-bearing: ddcutil's own verification fails on firmware that goes silent
 // on the input it just left, so a verifying write reports failure after
@@ -74,14 +79,58 @@ func (w Write) Do(ctx context.Context, run Runner, name string) error {
 	if err != nil {
 		return err
 	}
+	model := names[i]
+	before, shown := readInput(ctx, run, model, false)
+	if target, ok := w.reads(); shown && ok && before == target {
+		slog.Info("monitor already shows the input; not writing", "monitor", model, "input", fmt.Sprintf("%#02x", before))
+		return nil
+	}
 	argv := []string{backend, "setvcp",
 		fmt.Sprintf("0x%02X", w.VCP), fmt.Sprintf("0x%02X", w.Value), "--noverify"}
 	if w.Source != ddcHost {
 		argv = append(argv, fmt.Sprintf("--i2c-source-addr=0x%02X", w.Source))
 	}
 	w.mustBeValid()
-	_, err = run(ctx, append(argv, "--model", names[i]))
-	return err
+	if _, err := run(ctx, append(argv, "--model", model)); err != nil || !shown {
+		return err
+	}
+	return checkLeft(ctx, run, model, before)
+}
+
+// settle is how long a monitor is given to settle after a write before it is
+// read: it falls silent while it switches, even on a switch it then undoes, so
+// an earlier read cannot tell a landed write from a flicker. A variable so the
+// tests need not wait.
+var settle = 5 * time.Second
+
+// checkLeft reads the monitor once it settled after a write: an error when it
+// still answers with the input before.
+func checkLeft(ctx context.Context, run Runner, model string, before uint8) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(settle):
+	}
+	if v, ok := readInput(ctx, run, model, true); ok && v == before {
+		return fmt.Errorf("%s ignored the write: back on input %#02x after %v", model, before, settle)
+	}
+	return nil
+}
+
+// readInput reads the monitor's Input Source. ok is false when it does not
+// answer, as a monitor may not on an input it does not show. once makes
+// ddcutil try a single time, so that silence costs one exchange, not its
+// retries.
+func readInput(ctx context.Context, run Runner, model string, once bool) (uint8, bool) {
+	argv := []string{backend, "--terse"}
+	if once {
+		argv = append(argv, "--maxtries", "1,1,1")
+	}
+	out, err := run(ctx, append(argv, "getvcp", "60", "--model", model))
+	if err != nil {
+		return 0, false
+	}
+	return parseInputSource(out)
 }
 
 // unreachableErr says why no monitor answers DDC although ddcutil exited 0
