@@ -667,9 +667,12 @@ the table from its EDID.
 
 Systemd install/print/uninstall for both roles, Linux only; on macOS the
 subcommand refuses with a pointer to launchd (§6.2). Bare `service install`
-prints the walkthrough as a shell transcript: the shared secret, a by-hand trial
-of `detect`/`serve`/`connect`, then the two install commands. Each step runs
-independently, reading `SOFTKVM_TOKEN` from the environment (never a flag, §9):
+prints the trial walkthrough as a shell transcript — the shared secret,
+`detect`, a by-hand trial of `serve`/`connect`, and how to re-run
+`service install -- [connect args]` once it works — and `service install --`
+validates those flags and prints the two install commands with them filled in.
+Each step runs independently, reading `SOFTKVM_TOKEN` from the environment
+(never a flag, §9):
 
 - `service install serve [PORT] [--state PATH] [--instance NAME]
   [--no-advertise]`

@@ -11,6 +11,6 @@ import (
 	"errors"
 )
 
-func serviceCmd(_ context.Context) error {
+func serviceCmd(_ context.Context, _ []string) error {
 	return errors.New("service management is only supported on Linux (systemd); on macOS, run connect from a LaunchAgent in ~/Library/LaunchAgents")
 }

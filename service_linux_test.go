@@ -11,7 +11,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -345,24 +344,29 @@ func TestBakesRawArgs(t *testing.T) {
 // continuation of a \-terminated command, or blank — and none of them
 // wraps in an 80-column terminal.
 func TestInstallGuidanceIsShellShaped(t *testing.T) {
-	body := fmt.Sprintf(installGuidance, "/usr/local/bin/soft-kvm")
-	if strings.Contains(body, "%!") {
-		t.Errorf("installGuidance has a stray format verb: %s", body)
-	}
-	prev := ""
-	for line := range strings.Lines(body) {
-		line = strings.TrimRight(line, "\n")
-		if n := utf8.RuneCountInString(line); n > 76 {
-			t.Errorf("line is %d columns, it wraps in an 80-column terminal: %q", n, line)
+	for _, args := range [][]string{nil, {"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b"}} {
+		body, err := renderInstallGuidance("/usr/local/bin/soft-kvm", args)
+		if err != nil {
+			t.Fatal(err)
 		}
-		switch {
-		case line == "", strings.HasPrefix(line, "#"):
-		case !strings.HasPrefix(line, " "):
-		case strings.HasSuffix(prev, `\`):
-		default:
-			t.Errorf("line is neither comment, command nor continuation: %q", line)
+		if strings.Contains(body, "%!") {
+			t.Errorf("installGuidance has a stray format verb: %s", body)
 		}
-		prev = line
+		prev := ""
+		for line := range strings.Lines(body) {
+			line = strings.TrimRight(line, "\n")
+			if n := utf8.RuneCountInString(line); n > 76 {
+				t.Errorf("line is %d columns, it wraps in an 80-column terminal: %q", n, line)
+			}
+			switch {
+			case line == "", strings.HasPrefix(line, "#"):
+			case !strings.HasPrefix(line, " "):
+			case strings.HasSuffix(prev, `\`):
+			default:
+				t.Errorf("line is neither comment, command nor continuation: %q", line)
+			}
+			prev = line
+		}
 	}
 }
 
