@@ -98,7 +98,7 @@ func main() {
 	var level slog.LevelVar // Info by default
 	if s := os.Getenv("SOFTKVM_LOG"); s != "" {
 		if err := level.UnmarshalText([]byte(s)); err != nil {
-			fmt.Fprintf(os.Stderr, "soft-kvm: unknown SOFTKVM_LOG level %q (debug, info, warn, error)\n", s)
+			fmt.Fprintf(os.Stderr, "%s: unknown SOFTKVM_LOG level %q (debug, info, warn, error)\n", platform.ProgName, s)
 		}
 	}
 	slog.SetDefault(slog.New(newLogHandler(os.Stderr, &level)))
@@ -148,7 +148,7 @@ func main() {
 func usage() { usageTo(os.Stderr) }
 
 func usageTo(w io.Writer) {
-	_, _ = fmt.Fprintln(w, `usage: soft-kvm <command> [args]
+	_, _ = fmt.Fprintf(w, `usage: %s <command> [args]
 
   serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]
   activate ID [--server HOST:PORT] [--force]
@@ -167,7 +167,8 @@ commands of the -A list, run at their place in the order; connect runs them
 itself instead of exec'ing them. They post this host's --declare-screen and
 --declare-hid declarations so the other hosts move the monitor and the
 peripherals here (SPEC §5.5, §5.6). -D refuses them: only the owner takes.
-detect prints the connect line that fits this host.`)
+detect prints the connect line that fits this host.
+`, platform.ProgName)
 }
 
 // checkToken applies the shared-secret length rules. The TLS identity and
@@ -237,7 +238,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags, error) {
 		noAdvertise: fs.Bool("no-advertise", false, "skip mDNS advertisement"),
 	}
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]")
+		_, _ = fmt.Fprintf(fs.Output(), "usage: %s serve [IP:]PORT [--state PATH] [--instance NAME] [--no-advertise]\n", platform.ProgName)
 		printFlags(fs, fs.Output())
 	}
 	return fs, v, nil
@@ -317,7 +318,7 @@ func activateCmd(ctx context.Context) error {
 	serverFlag := fs.String("server", "", "server address HOST:PORT")
 	force := fs.Bool("force", false, "claim even if the target has no live agent")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm activate ID [--server HOST:PORT] [--force]")
+		fmt.Fprintf(os.Stderr, "usage: %s activate ID [--server HOST:PORT] [--force]\n", platform.ProgName)
 		fs.PrintDefaults()
 	}
 	if err := parseArgs(fs, os.Args[2:]); err != nil {
@@ -410,7 +411,7 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 	v := &connectFlags{
 		id:            fs.String("id", platform.DefaultID, "claimed identity"),
 		serverFlag:    fs.String("server", "", "server address HOST:PORT"),
-		trigger:       fs.String("trigger", "", "required: comma-separated `NAME`s of --declare-hid devices to watch — run soft-kvm detect to list them"),
+		trigger:       fs.String("trigger", "", fmt.Sprintf("required: comma-separated `NAME`s of --declare-hid devices to watch — run %s detect to list them", platform.ProgName)),
 		settle:        fs.Duration("settle", 2*time.Second, "attach must persist this long before claiming"),
 		switchRetries: fs.Int("switch-retries", 3, "re-runs of the commands, and new attempts at giving assignments away, that failed before giving up"),
 		switchTimeout: fs.Duration("switch-timeout", agent.DefaultSwitchTimeout, "bound on one --on-activation or --on-deactivation command, and on one write giving an assignment away, so a hung I²C write cannot freeze the agent"),
@@ -432,7 +433,7 @@ func newConnectFlagSet() (*flag.FlagSet, *connectFlags) {
 		fs.StringVar(&v.displayMatch, "display-match", "", "display name substring for the macOS guard (default: any external)")
 	}
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(fs.Output(), "usage: soft-kvm connect --trigger NAME[,...] [--declare-screen DECL]... [--declare-hid DECL]... [-A COMMAND]... [-D COMMAND]... [flags]")
+		_, _ = fmt.Fprintf(fs.Output(), "usage: %s connect --trigger NAME[,...] [--declare-screen DECL]... [--declare-hid DECL]... [-A COMMAND]... [-D COMMAND]... [flags]\n", platform.ProgName)
 		printFlags(fs, fs.Output())
 	}
 	return fs, v
@@ -541,7 +542,7 @@ func validateConnect(fs *flag.FlagSet, v *connectFlags) (wiring, error) {
 		return w, fmt.Errorf("connect: unexpected argument %q: commands are given with -A/--on-activation and -D/--on-deactivation, one quoted string each (e.g. -A take-screen)", args[0])
 	}
 	if *v.trigger == "" {
-		return w, errors.New("connect: --trigger is required (run `soft-kvm detect` to list candidates)")
+		return w, fmt.Errorf("connect: --trigger is required (run `%s detect` to list candidates)", platform.ProgName)
 	}
 
 	seen := map[string]bool{}
@@ -596,11 +597,11 @@ func validateConnect(fs *flag.FlagSet, v *connectFlags) (wiring, error) {
 	}
 	switch {
 	case takeScreen && len(w.screens) == 0:
-		return w, errors.New("connect: take-screen needs at least one --declare-screen (run `soft-kvm detect` to print one)")
+		return w, fmt.Errorf("connect: take-screen needs at least one --declare-screen (run `%s detect` to print one)", platform.ProgName)
 	case !takeScreen && len(w.screens) > 0:
 		return w, errors.New("connect: --declare-screen does nothing without -A take-screen")
 	case takeHID && !slices.ContainsFunc(w.hids, func(d hidpp.Declaration) bool { return d.Channel != 0 }):
-		return w, errors.New("connect: take-hid needs at least one --declare-hid with its host=N (run `soft-kvm detect` to print one)")
+		return w, fmt.Errorf("connect: take-hid needs at least one --declare-hid with its host=N (run `%s detect` to print one)", platform.ProgName)
 	}
 	w.takes = takeScreen || takeHID
 	return w, nil
@@ -699,7 +700,7 @@ func splitCommand(s string) ([]string, error) {
 func detectCmd(ctx context.Context) error {
 	fs := flag.NewFlagSet("detect", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: soft-kvm detect")
+		fmt.Fprintf(os.Stderr, "usage: %s detect\n", platform.ProgName)
 	}
 	if err := parseArgs(fs, os.Args[2:]); err != nil {
 		return err

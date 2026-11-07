@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/unbrice/soft-kvm/detect"
+	"github.com/unbrice/soft-kvm/platform"
 )
 
 // Canonical unit templates and env-file templates, embedded so the
@@ -112,11 +113,12 @@ func serviceCmd(ctx context.Context) error {
 }
 
 func serviceUsage() {
-	fmt.Fprintln(os.Stderr, `usage: soft-kvm service <install|print|uninstall> [serve|connect] [args]
+	fmt.Fprintf(os.Stderr, `usage: %s service <install|print|uninstall> [serve|connect] [args]
 
   install [serve|connect] [args]   install and enable the service (no args: two-step guidance)
   print [serve|connect] [args]     render the unit to stdout for review (no euid/token checks)
-  uninstall [serve|connect]        disable and remove the unit (env files and the binary stay)`)
+  uninstall [serve|connect]        disable and remove the unit (env files and the binary stay)
+`, platform.ProgName)
 }
 
 // selfExecutable resolves the running binary's absolute path:

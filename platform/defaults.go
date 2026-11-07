@@ -9,8 +9,22 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 )
+
+// ProgName is how to name this binary in messages: "go run ." when an
+// unversioned build starts in the source directory, "soft-kvm" otherwise.
+var ProgName = progName()
+
+func progName() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path != "" && info.Main.Version == "(devel)" {
+		if b, err := os.ReadFile("go.mod"); err == nil && strings.Contains(string(b), "module "+info.Main.Path+"\n") {
+			return "go run ."
+		}
+	}
+	return "soft-kvm"
+}
 
 // DefaultServeStatePath is the serve --state default (SPEC §5.2):
 // $STATE_DIRECTORY/state.json when systemd hands the unit a StateDirectory
