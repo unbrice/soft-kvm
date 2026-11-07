@@ -914,7 +914,7 @@ func slotLines(paired []hidpp.PairedDevice, twin func(slot uint8) bool) []string
 // one is declared only to be watched, and left out of a command that does not
 // watch it.
 func connectLine(triggers []string, w hostWiring) string {
-	parts := []string{"soft-kvm connect --trigger " + strings.Join(triggers, ",")}
+	parts := []string{platform.ProgName + " connect --trigger " + strings.Join(triggers, ",")}
 	for _, d := range w.screens {
 		if d.complete() {
 			parts = append(parts, declFlag("declare-screen", d.words()))
