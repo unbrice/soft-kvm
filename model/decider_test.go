@@ -574,11 +574,12 @@ func TestHoldBackReasonsLogOnce(t *testing.T) {
 			t.Fatalf("logs %q repeat the reason", logs(ds))
 		}
 	}
-	// The assignee comes back: LG is given away, and the reason forgotten.
-	want(t, m.decide(at(4), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3)))), "give:screen/LG")
-	m.decide(at(5), Observation{GaveAway: okAll(lgKey)})
+	// The assignee comes back once the unfulfilled claim hold expires: LG is
+	// given away, and the reason forgotten.
+	want(t, m.decide(at(34), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3)))), "give:screen/LG")
+	m.decide(at(35), Observation{GaveAway: okAll(lgKey)})
 	// A newer take to a host that is not live is a new reason.
-	wantLog(t, m.decide(at(6), state_(notLive(mk("mac", 2, screenAssignment("LG", "mac", "linux", 4)), "mac"))), "is not live")
+	wantLog(t, m.decide(at(36), state_(notLive(mk("mac", 2, screenAssignment("LG", "mac", "linux", 4)), "mac"))), "is not live")
 }
 
 func TestGiveAway(t *testing.T) {
@@ -798,7 +799,7 @@ func TestArrival(t *testing.T) {
 	t.Run("a superseding take by another host is given away after the cooldown", func(t *testing.T) {
 		m := sent(t)
 		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
-		third := mk("mac", 2, hidAssignment("mouse", "third", "mac", 4, false))
+		third := mk("third", 3, hidAssignment("mouse", "third", "mac", 4, false))
 		third.Live["third"] = true
 		// The batch ends at 2 s; the mouse cooled down for 5 s since.
 		ds := m.decide(at(2), state_(third))
@@ -848,6 +849,74 @@ func TestArrival(t *testing.T) {
 		}
 		// Back, and past the cooldown its attempt started: given away again.
 		want(t, m.decide(at(6), state_(mk("mac", 2, lg))), "give:screen/LG")
+	})
+
+	t.Run("an assignee that is not the owner is held back and dropped from in-flight jobs without marking handled", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		lg := screenAssignment("LG", "mac", "linux", 3)
+		// Stale assignment to "mac" while "third" owns: held back, not recorded.
+		ds := m.decide(at(0), state_(mk("third", 3, lg)))
+		want(t, ds)
+		wantLog(t, ds, `assignee "mac" is not the owner ("third")`)
+		// Ownership returns to "mac": LG is given away.
+		want(t, m.decide(at(1), state_(mk("mac", 4, lg))), "give:screen/LG")
+		want(t, m.decide(at(1), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:2")
+		// Ownership moves away before retry: dropped and left out of HandledSeqs.
+		ds = m.decide(at(1), state_(mk("third", 5, lg)))
+		want(t, ds, "save")
+		wantLog(t, ds, `screen/LG dropped: assignee "mac" is not the owner ("third")`)
+		if _, ok := saved(t, ds).HandledSeqs["screen/LG"]; ok {
+			t.Fatalf("record = %+v, want LG left pending", saved(t, ds))
+		}
+		// Past cooldown, ownership returns to "mac": given away again.
+		want(t, m.decide(at(7), state_(mk("mac", 6, lg))), "give:screen/LG")
+	})
+
+	t.Run("a device awaiting arrival is dropped when ownership leaves its assignee", func(t *testing.T) {
+		m := sent(t)
+		want(t, m.decide(at(1), Observation{GaveAway: okAll(mouseKey)}), "wake:11")
+		// Ownership returns to "linux" while the mouse was awaiting arrival on "mac":
+		// dropped immediately without waiting out the 10s arrival window.
+		ds := m.decide(at(2), state_(mk("linux", 3, hidAssignment("mouse", "mac", "linux", 3, false))))
+		want(t, ds, "save", "run:take-screen@3")
+		wantLog(t, ds, `hid/mouse dropped: assignee "mac" is not the owner ("linux")`)
+		if _, ok := saved(t, ds).HandledSeqs["hid/mouse"]; ok {
+			t.Fatalf("record = %+v, want mouse left pending", saved(t, ds))
+		}
+	})
+
+	t.Run("giving away and retries are held back while a local claim is settling or in flight", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		lg := screenAssignment("LG", "mac", "linux", 3)
+		// Attach at 0 s: settle is at 2 s, claimHold extends to 32 s.
+		want(t, m.decide(at(0), Observation{Attach: true}), "wake:2")
+		ds := m.decide(at(1), state_(mk("mac", 2, lg)))
+		want(t, ds, "wake:2")
+		wantLog(t, ds, "claim pending until")
+		// At 2 s, claim fires; LG stays held until 32 s while "mac" still owns.
+		ds = m.decide(at(2), Observation{})
+		want(t, ds, "claim:linux", "wake:32")
+		if strings.Contains(logs(ds), "claim pending") {
+			t.Fatalf("logs %q repeat the claimPending reason across claim transition", logs(ds))
+		}
+		// Once "linux" becomes the owner, the claim is fulfilled; a later switch
+		// back to "mac" within the original 30s window is not blocked.
+		want(t, m.decide(at(3), state_(mk("linux", 3))), "run:take-screen@3")
+		want(t, m.decide(at(4), Observation{Ran: ran(nil)}), "save")
+		want(t, m.decide(at(5), state_(mk("mac", 4, lg))), "run:down")
+		want(t, m.decide(at(6), Observation{Ran: ran(nil)}), "save", "give:screen/LG")
+	})
+
+	t.Run("in-flight retry is held back while an attach settles and resumes on detach", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		lg := screenAssignment("LG", "mac", "linux", 3)
+		want(t, m.decide(at(0), state_(mk("mac", 2, lg))), "give:screen/LG")
+		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:1")
+		// Attach arrives before the retry at 1 s: retry is held back while settling.
+		want(t, m.decide(at(0), Observation{Attach: true}), "wake:2")
+		want(t, m.decide(at(1), Observation{}), "wake:2")
+		// Detach cancels the unsettled attach: the due retry issues immediately.
+		want(t, m.decide(at(1), Observation{Detach: true}), "give:screen/LG")
 	})
 
 	t.Run("a device already on the assignee is never sent", func(t *testing.T) {
@@ -1055,13 +1124,23 @@ func TestAttachSettle(t *testing.T) {
 		want(t, m.decide(at(3), Observation{}), "claim:linux")
 	})
 
-	t.Run("an attach during a deactivation settles from the attach and claims once it ends", func(t *testing.T) {
+	t.Run("a detach before the settle cancels the claim, and a detach after the claim is a no-op", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("linux", 1, nil))
+		want(t, m.decide(at(0), Observation{Attach: true}), "wake:2")
+		want(t, m.decide(at(1), Observation{Detach: true}))
+		want(t, m.decide(at(2), Observation{}))
+		// A new attach settles and claims normally; a later detach does not re-claim.
+		want(t, m.decide(at(3), Observation{Attach: true}), "wake:5")
+		want(t, m.decide(at(5), Observation{}), "claim:linux")
+		want(t, m.decide(at(6), Observation{Detach: true}))
+	})
+
+	t.Run("an attach during a deactivation settles from the attach and claims without waiting for the job", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
 		want(t, m.decide(at(1), Observation{Attach: true}), "wake:3")
-		// Settled at 3, but the job is in flight: the claim waits for it.
-		want(t, m.decide(at(3), Observation{}))
-		want(t, m.decide(at(5), Observation{Ran: ran(nil)}), "save", "claim:linux")
+		want(t, m.decide(at(3), Observation{}), "claim:linux")
+		want(t, m.decide(at(5), Observation{Ran: ran(nil)}), "save")
 	})
 
 	t.Run("an attach late in a deactivation still waits out its settle", func(t *testing.T) {
@@ -1072,14 +1151,13 @@ func TestAttachSettle(t *testing.T) {
 		want(t, m.decide(at(6), Observation{}), "claim:linux")
 	})
 
-	t.Run("a settle that elapsed during a deactivation fires once it ends", func(t *testing.T) {
+	t.Run("a settle that elapsed during a deactivation fires as soon as it is due", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), Observation{Attach: true})
-		m.decide(at(1), state_(mk("mac", 2)))
-		// The settle is due at 2 s but a deactivation runs.
-		want(t, m.decide(at(2), Observation{}))
+		want(t, m.decide(at(1), state_(mk("mac", 2))), "run:down", "wake:2")
+		want(t, m.decide(at(2), Observation{}), "claim:linux")
 		ds := m.decide(at(3), Observation{Ran: ran(nil)})
-		want(t, ds, "save", "claim:linux")
+		want(t, ds, "save")
 	})
 
 	t.Run("a claim is not blocked by the cooldown or the breaker", func(t *testing.T) {
@@ -1102,13 +1180,15 @@ func TestAttachSettle(t *testing.T) {
 
 func TestWakeAt(t *testing.T) {
 	m := newDecider(t, "linux", agentAt("mac", 2, nil))
-	m.decide(at(0), Observation{Attach: true})
-	m.decide(at(1), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
-	// The earliest deadline wins: the settle at 2 s, not the arrival window at
-	// 11 s.
-	if _, wake := m.Decide(at(1), Observation{GaveAway: okAll(mouseKey, lgKey)}); !wake.Equal(at(2)) {
-		t.Fatalf("wake = %v, want %v", wake, at(2))
+	m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
+	m.decide(at(0), Observation{GaveAway: okAll(mouseKey, lgKey)})
+	// The earliest deadline wins: the settle at 3 s, not the arrival window at
+	// 10 s; and when the settle expires at 3 s, the claim fires without waiting
+	// for the arrival window.
+	if _, wake := m.Decide(at(1), Observation{Attach: true}); !wake.Equal(at(3)) {
+		t.Fatalf("wake = %v, want %v", wake, at(3))
 	}
+	want(t, m.decide(at(3), Observation{}), "claim:linux", "wake:10")
 
 	// With nothing pending, nothing to do and no wake.
 	if ds, wake := newDecider(t, "linux", agentAt("mac", 2, nil)).Decide(at(0), Observation{}); len(ds) != 0 || !wake.IsZero() {

@@ -22,6 +22,7 @@ import (
 // time. At most one field is set: none when only time passed (SPEC §11.3).
 type Observation struct {
 	Attach   bool                  // receiver attach edge from the Detector
+	Detach   bool                  // all watched receivers/slots are absent
 	State    *state.ServerState    // from /state or a /wait wake
 	Ran      *CommandsRun          // the commands in flight finished
 	GaveAway *AssignmentsGivenAway // the assignments in flight were given away
@@ -420,8 +421,9 @@ func (j *job) busy() bool {
 
 // issue marks the tasks due at now issued and returns the Decision that
 // carries them out; ok is false when none is due. The tasks due go together:
-// the worker runs them in parallel.
-func (j *job) issue(now time.Time, maxAttempts int, spacing time.Duration) (d Decision, ok bool) {
+// the worker runs them in parallel. When holdUntil is non-zero, assignment
+// give-aways are held back while this host's claim settles.
+func (j *job) issue(now time.Time, maxAttempts int, spacing time.Duration, holdUntil time.Time) (d Decision, ok bool) {
 	starting := false
 	var commands, assignments []string
 	for _, t := range j.commands {
@@ -432,12 +434,14 @@ func (j *job) issue(now time.Time, maxAttempts int, spacing time.Duration) (d De
 			d.Run = append(d.Run, t.cmd)
 		}
 	}
-	for _, t := range j.assignments {
-		if t.due(now, maxAttempts, spacing) {
-			starting = starting || t.status == pending
-			assignments = append(assignments, t.issueLog())
-			t.issue(now)
-			d.GiveAway = append(d.GiveAway, t.assignment)
+	if holdUntil.IsZero() {
+		for _, t := range j.assignments {
+			if t.due(now, maxAttempts, spacing) {
+				starting = starting || t.status == pending
+				assignments = append(assignments, t.issueLog())
+				t.issue(now)
+				d.GiveAway = append(d.GiveAway, t.assignment)
+			}
 		}
 	}
 	if len(commands) == 0 && len(assignments) == 0 {
@@ -470,7 +474,7 @@ func (j *job) expire(now time.Time, window time.Duration) {
 
 // deadlines lists when the job next needs attention: the arrival windows, and
 // — once no issue is outstanding — the retries.
-func (j *job) deadlines(maxAttempts int, spacing, window time.Duration) []time.Time {
+func (j *job) deadlines(maxAttempts int, spacing, window time.Duration, holdUntil time.Time) []time.Time {
 	var ds []time.Time
 	for _, t := range j.assignments {
 		if t.status == awaitingArrival {
@@ -478,9 +482,18 @@ func (j *job) deadlines(maxAttempts int, spacing, window time.Duration) []time.T
 		}
 	}
 	if !j.busy() {
-		for h := range j.headers() {
-			if h.retriable(maxAttempts) {
-				ds = append(ds, h.retryAt(spacing))
+		for _, t := range j.commands {
+			if t.retriable(maxAttempts) {
+				ds = append(ds, t.retryAt(spacing))
+			}
+		}
+		for _, t := range j.assignments {
+			if t.status == pending || t.retriable(maxAttempts) {
+				d := t.retryAt(spacing)
+				if holdUntil.After(d) {
+					d = holdUntil
+				}
+				ds = append(ds, d)
 			}
 		}
 	}
@@ -578,9 +591,10 @@ func (j *job) commandsExpired(s *state.ServerState, me string) string {
 // dropExpiredAssignments drops the assignment tasks s no longer calls for. An
 // assignment that is gone or has a new seq was replaced by a newer take, which
 // is pending on its own, not part of this job; the record keeps the old seq
-// as handled. An assignee no longer live stops the tasks not in flight, and
-// leaves the assignment out of the record, so it stays pending until a state
-// shows the assignee live again — the gate that held it back at reconcile.
+// as handled. An assignee that is not the owner or no longer live stops the
+// tasks not in flight, and leaves the assignment out of the record, so it
+// stays pending until a state shows the assignee owning and live again — the
+// gates that held it back at reconcile.
 func (j *job) dropExpiredAssignments(s *state.ServerState, current map[state.AssignmentKey]state.Assignment) {
 	for _, t := range j.assignments {
 		key := t.assignment.Key()
@@ -588,6 +602,9 @@ func (j *job) dropExpiredAssignments(s *state.ServerState, current map[state.Ass
 		switch {
 		case !ok || a.Seq != t.assignment.Seq:
 			t.drop("a newer take replaced its assignment")
+		case t.assignment.Assignee != s.Owner && t.status != issued && t.status != done && t.status != dropped:
+			t.drop(fmt.Sprintf("assignee %q is not the owner (%q); it stays pending", t.assignment.Assignee, s.Owner))
+			delete(j.record.seqs, key)
 		case !s.Live[t.assignment.Assignee] && t.status != issued && t.status != done && t.status != dropped:
 			t.drop(fmt.Sprintf("assignee %q is not live; it stays pending", t.assignment.Assignee))
 			delete(j.record.seqs, key)
@@ -659,6 +676,11 @@ func assignmentsByKey(s *state.ServerState) map[state.AssignmentKey]state.Assign
 	return m
 }
 
+// claimHold is how long after a claim this host holds back giving assignments
+// away while it is not yet the owner: sized to cover the agent's 4-attempt
+// claim retry budget (5s HTTP timeout + 2s spacing).
+const claimHold = 30 * time.Second
+
 // Decider is the decision state machine: no I/O, no goroutines, no clock. All
 // time arrives as Decide's now (SPEC §11.3).
 type Decider struct {
@@ -678,10 +700,15 @@ type Decider struct {
 	// given away: a reason is logged again only once it changed.
 	reasons map[state.AssignmentKey]string
 
-	// lastAttach is when the last attach edge arrived, and claimedAttach the
-	// attach the last claim answered: a claim waits while they differ.
+	// lastAttach is when the last attach edge arrived, lastDetach when all
+	// watched devices were last absent, and claimedAttach the attach the last
+	// claim answered: a claim waits while an attach is unanswered and newer
+	// than the last detach. lastClaim is when the last unfulfilled claim was
+	// emitted.
 	lastAttach    time.Time
+	lastDetach    time.Time
 	claimedAttach time.Time
+	lastClaim     time.Time
 }
 
 // NewDecider creates a decider from what agent.json says this host handled.
@@ -713,14 +740,16 @@ func NewDecider(cfg DeciderConfig, rec *state.AgentState) (*Decider, error) {
 
 // Decide records one observation made at now and returns what to do about it,
 // and when to call it again with nothing observed: the earliest deadline it
-// tracks, zero when there is none. After the observation, the job in flight
-// moves on; once idle, a due claim is made, then the latest state reconciled.
+// tracks, zero when there is none. After the observation, a due claim is made,
+// the job in flight moves on, and once idle the latest state is reconciled.
 func (m *Decider) Decide(now time.Time, o Observation) (ds []Decision, wake time.Time) {
 	switch {
 	case o.State != nil:
 		ds = append(ds, m.handleState(o.State)...)
 	case o.Attach:
 		m.handleAttach(now)
+	case o.Detach:
+		m.handleDetach(now)
 	case o.Ran != nil:
 		ds = append(ds, m.handleRan(o.Ran)...)
 	case o.GaveAway != nil:
@@ -733,6 +762,9 @@ func (m *Decider) Decide(now time.Time, o Observation) (ds []Decision, wake time
 
 // handleState processes a State observation.
 func (m *Decider) handleState(s *state.ServerState) []Decision {
+	if s.Owner == m.cfg.ID && (m.handled == nil || m.handled.ownership.owner != m.cfg.ID || s.Activation != m.handled.ownership.activation) {
+		m.lastClaim = time.Time{}
+	}
 	if m.handled == nil {
 		m.handled = &handled{
 			ownership: ownership{owner: s.Owner, activation: s.Activation},
@@ -757,13 +789,34 @@ func (m *Decider) handleAttach(now time.Time) {
 	m.lastAttach = now
 }
 
-// claimAt is when to claim the ownership, once no job is in flight: Settle
-// after an attach no claim answered yet; zero when every attach was answered.
+// handleDetach records that no watched trigger device is present, cancelling
+// any unsettled attach.
+func (m *Decider) handleDetach(now time.Time) {
+	m.lastDetach = now
+}
+
+// claimAt is when to claim the ownership: Settle after an attach no claim
+// answered yet and no detach has cancelled; zero when none is pending.
 func (m *Decider) claimAt() time.Time {
-	if m.lastAttach.Equal(m.claimedAttach) {
+	if m.lastAttach.Equal(m.claimedAttach) || !m.lastAttach.After(m.lastDetach) {
 		return time.Time{}
 	}
 	return m.lastAttach.Add(m.cfg.Settle)
+}
+
+// holdUntil reports until when giving assignments away is held back because this
+// host is claiming ownership: while an attach is settling, or for claimHold
+// after a claim until the server shows this host as the owner.
+func (m *Decider) holdUntil(now time.Time) time.Time {
+	if c := m.claimAt(); !c.IsZero() {
+		return c.Add(claimHold)
+	}
+	if !m.lastClaim.IsZero() && (m.latest == nil || m.latest.Owner != m.cfg.ID) {
+		if until := m.lastClaim.Add(claimHold); now.Before(until) {
+			return until
+		}
+	}
+	return time.Time{}
 }
 
 // handleRan records the results of the commands in flight. A result is
@@ -802,7 +855,7 @@ func (m *Decider) reconcile(now time.Time, s *state.ServerState) (*job, []Decisi
 		return ownershipChangeJob(s, m.cfg.OnDeactivation, false), []Decision{{
 			Log: fmt.Sprintf("deactivating: ownership went to %q", s.Owner)}}
 	}
-	ps := pendingAssignments(now, s, me, *m.handled, &m.limiter)
+	ps := pendingAssignments(now, s, me, *m.handled, &m.limiter, m.holdUntil(now))
 	return giveAwayJob(ps), m.explain(ps)
 }
 
@@ -827,10 +880,12 @@ func ownershipChangeJob(s *state.ServerState, argvs [][]string, activating bool)
 type verdict int
 
 const (
-	giveNow         verdict = iota
-	alreadyArrived          // on its assignee already: recorded, not given away
-	assigneeNotLive         // waits for its assignee to be live
-	rateLimited             // waits for the rate limiter to let it go
+	giveNow          verdict = iota
+	alreadyArrived           // on its assignee already: recorded, not given away
+	assigneeNotOwner         // waits for its assignee to be the owner
+	assigneeNotLive          // waits for its assignee to be live
+	claimPending             // waits for this host's pending claim to settle
+	rateLimited              // waits for the rate limiter to let it go
 )
 
 // pendingAssignment is an assignment host me has not handled, and what it does
@@ -839,13 +894,13 @@ type pendingAssignment struct {
 	assignment state.Assignment
 	verdict    verdict
 	reason     string    // not giveNow: why, as logged
-	until      time.Time // rateLimited: when the rate limiter lets it go
+	until      time.Time // rateLimited or claimPending: when the hold lets it go
 }
 
 // pendingAssignments assesses the assignments of s host me has not handled:
 // someone else's, at a seq it has not handled yet. It is the one place the
 // gates and the rate limiter are applied.
-func pendingAssignments(now time.Time, s *state.ServerState, me string, h handled, l *rateLimiter) []pendingAssignment {
+func pendingAssignments(now time.Time, s *state.ServerState, me string, h handled, l *rateLimiter, holdUntil time.Time) []pendingAssignment {
 	var ps []pendingAssignment
 	for _, a := range s.Assignments {
 		key := a.Key()
@@ -857,9 +912,15 @@ func pendingAssignments(now time.Time, s *state.ServerState, me string, h handle
 		case a.Arrived:
 			p.verdict = alreadyArrived
 			p.reason = fmt.Sprintf("not giving away %s: already arrived on %q", key, a.Assignee)
+		case a.Assignee != s.Owner:
+			p.verdict = assigneeNotOwner
+			p.reason = fmt.Sprintf("not giving away %s: assignee %q is not the owner (%q); it stays pending", key, a.Assignee, s.Owner)
 		case !s.Live[a.Assignee]:
 			p.verdict = assigneeNotLive
 			p.reason = fmt.Sprintf("not giving away %s: assignee %q is not live; it stays pending", key, a.Assignee)
+		case !holdUntil.IsZero():
+			p.verdict, p.until = claimPending, holdUntil
+			p.reason = fmt.Sprintf("deferring %s: claim pending until %v", key, holdUntil)
 		default:
 			if until, why := l.limitedUntil(now, key); !until.IsZero() {
 				p.verdict, p.until = rateLimited, until
@@ -892,12 +953,12 @@ func giveAwayJob(ps []pendingAssignment) *job {
 	return j
 }
 
-// limitLifts is when the rate limiter first lets one of the pending
-// assignments ps go; zero when it holds none back.
+// limitLifts is when the rate limiter or a pending claim first lets one of the
+// pending assignments ps go; zero when it holds none back.
 func limitLifts(ps []pendingAssignment) time.Time {
 	var first time.Time
 	for _, p := range ps {
-		if p.verdict == rateLimited && (first.IsZero() || p.until.Before(first)) {
+		if (p.verdict == rateLimited || p.verdict == claimPending) && (first.IsZero() || p.until.Before(first)) {
 			first = p.until
 		}
 	}
@@ -932,20 +993,21 @@ func (m *Decider) explain(ps []pendingAssignment) []Decision {
 // maxAttempts is how many times a task may be issued: once, then the retries.
 func (m *Decider) maxAttempts() int { return 1 + m.cfg.SwitchRetries }
 
-// advanceTime moves the decider on to now: the job in flight first; once idle,
-// a due claim, then the latest state reconciled. It loops because ending a job
-// lets a due claim through and calls for the next job.
+// advanceTime moves the decider on to now: a due claim first, then the job in
+// flight, then — once idle — the latest state reconciled. It loops because
+// ending a job calls for the next job.
 func (m *Decider) advanceTime(now time.Time, ds *[]Decision) {
 	for {
 		switch {
+		case !m.claimAt().IsZero() && !m.claimAt().After(now):
+			m.claimedAttach = m.lastAttach
+			m.lastClaim = now
+			*ds = append(*ds, Decision{Claim: m.cfg.ID, Log: fmt.Sprintf("claim %q", m.cfg.ID)})
 		case m.job != nil:
 			m.advanceJob(now, ds)
 			if m.job != nil {
 				return
 			}
-		case !m.claimAt().IsZero() && !m.claimAt().After(now):
-			m.claimedAttach = m.lastAttach
-			*ds = append(*ds, Decision{Claim: m.cfg.ID, Log: fmt.Sprintf("claim %q", m.cfg.ID)})
 		case m.latest != nil:
 			j, more := m.reconcile(now, m.latest)
 			*ds = append(*ds, more...)
@@ -972,7 +1034,7 @@ func (m *Decider) advanceJob(now time.Time, ds *[]Decision) {
 		return
 	}
 	if !m.job.settled(m.maxAttempts()) {
-		if d, ok := m.job.issue(now, m.maxAttempts(), m.cfg.RetrySpacing); ok {
+		if d, ok := m.job.issue(now, m.maxAttempts(), m.cfg.RetrySpacing, m.holdUntil(now)); ok {
 			*ds = append(*ds, d)
 		}
 		return
@@ -997,9 +1059,9 @@ func (m *Decider) wakeAt(now time.Time) time.Time {
 	candidates := []time.Time{m.claimAt()}
 	switch {
 	case m.job != nil:
-		candidates = append(candidates, m.job.deadlines(m.maxAttempts(), m.cfg.RetrySpacing, m.cfg.ArrivalWindow)...)
+		candidates = append(candidates, m.job.deadlines(m.maxAttempts(), m.cfg.RetrySpacing, m.cfg.ArrivalWindow, m.holdUntil(now))...)
 	case m.latest != nil:
-		candidates = append(candidates, limitLifts(pendingAssignments(now, m.latest, m.cfg.ID, *m.handled, &m.limiter)))
+		candidates = append(candidates, limitLifts(pendingAssignments(now, m.latest, m.cfg.ID, *m.handled, &m.limiter, m.holdUntil(now))))
 	}
 	var wake time.Time
 	for _, c := range candidates {

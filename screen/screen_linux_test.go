@@ -152,14 +152,34 @@ func TestWriteDo(t *testing.T) {
 		}
 	})
 
-	t.Run("a silent monitor gets one write, unchecked", func(t *testing.T) {
+	t.Run("a silent monitor gets one write and one check when target is known", func(t *testing.T) {
 		attach(t, "LG HDR WQHD")
 		r := &recorder{}
 		if err := (Write{0xF4, 0x50, 0xD1}).Do(t.Context(), r.run, "LG HDR WQHD"); err != nil {
 			t.Fatalf("Do: %v", err)
 		}
+		if len(r.calls) != 3 || len(r.writes()) != 1 {
+			t.Errorf("calls = %v, want two reads and one write", r.calls)
+		}
+	})
+
+	t.Run("a silent monitor with a raw target gets one write, unchecked", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{}
+		if err := (Write{0xF4, 0x50, 0xD2}).Do(t.Context(), r.run, "LG HDR WQHD"); err != nil {
+			t.Fatalf("Do: %v", err)
+		}
 		if len(r.calls) != 2 || len(r.writes()) != 1 {
 			t.Errorf("calls = %v, want one read and one write", r.calls)
+		}
+	})
+
+	t.Run("a monitor silent mid-switch that lands on our input fails", func(t *testing.T) {
+		attach(t, "LG HDR WQHD")
+		r := &recorder{inputs: []string{"", "0f"}}
+		w := Write{0xF4, 0x50, 0xD1}
+		if err := w.Do(t.Context(), r.run, "LG HDR WQHD"); err == nil || !strings.Contains(err.Error(), "ignored the write") {
+			t.Fatalf("Do = %v, want the write reported ignored", err)
 		}
 	})
 

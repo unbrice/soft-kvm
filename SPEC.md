@@ -52,7 +52,8 @@ work; §10 is the integration pass, run at the end.
    command where the keyboard arrives" design.
 2. **"Keyboard connected to me" is the only locally unambiguous "switched to me"
    signal.** Disconnect is ambiguous: switched, powered off, out of range, and
-   BT hiccup look identical.
+   BT hiccup look identical. Only an attach claims; all watched triggers
+   becoming absent only cancels an attach that has not yet settled.
 3. **No "connected but inactive" state exists over Bluetooth.** Paired device
    lists are binary connected/not-connected; no host can see *where* the
    keyboard is active.
@@ -159,14 +160,18 @@ The server keeps the last take per name as an **assignment**: the **assignee**
 that took it, the **previous assignee**, what to write, and — for a device —
 whether it `arrived`. Every other host **gives away** what the assignment names:
 it moves its screen or device to the assignee. Giving a screen away is a one-way
-door: after the write, the host that wrote can no longer reach the monitor.
-Three conditions gate an assignment, all required.
+door: after the write, the host that wrote can no longer reach the monitor. Four
+conditions gate an assignment, all required.
 
-- **The taker is the owner.** The server accepts `POST /take/{id}` only from the
-  current owner, and only under the `activation` its ownership dates from (§7).
-  A host that lost the ownership while its `-A` commands ran gets a 409. Without
-  this, a slow activation lands its take after the flip back and pulls the
-  monitor away from the keyboard.
+- **The taker is the owner, and remains the owner.** The server accepts
+  `POST /take/{id}` only from the current owner, and only under the `activation`
+  its ownership dates from (§7). A host that lost the ownership while its `-A`
+  commands ran gets a 409. Without this, a slow activation lands its take after
+  the flip back and pulls the monitor away from the keyboard. On the agent side,
+  no host gives away an assignment whose `assignee` is not the current `owner`:
+  it stays pending (and any in-flight retry or arrival wait for it is dropped
+  without recording its `seq`), so a fast bounce-back that flips `owner` before
+  its own takes land immediately fences the previous owner's assignments.
 - **The assignment is new to this host.** The agent persists the `seq` of the
   last assignment it handled per name (`$XDG_STATE_HOME/soft-kvm/agent.json`,
   `~/Library/Application Support/soft-kvm/agent.json` on macOS) and gives an
@@ -182,6 +187,13 @@ Three conditions gate an assignment, all required.
   so without the grace a host reads `/state` inside the assignee's gap. No host
   gives away an assignment whose assignee has no live agent. It stays pending
   and is judged again at the next state change: liveness alone wakes nobody.
+- **No local claim is pending.** While a local attach is settling (`--settle`),
+  or for 30 s after a claim was emitted before the server shows this host as the
+  owner, this host holds back giving assignments away (and retries of in-flight
+  give-aways). The agent waits for the detector's startup snapshot before
+  reconciling `/state`, so a host starting while the trigger is attached here
+  holds back giving away to a previous owner until its own claim settles and
+  lands.
 
 **Every host but the assignee gives an assignment away.** Only the host on the
 monitor's active input can move it (finding 1), the server's record of which
@@ -210,13 +222,16 @@ neither: the keyboard that carried the gesture is absent on every handover.
 the display that just became active the read races the link coming up. What the
 host being left can tell is that the monitor left it, and on Linux it checks: a
 monitor that answered with this host's input before the write and does again 5 s
-after ignored it. Silence sooner proves nothing: the LG falls silent while it
-switches, even on a switch it then undoes. That write fails and is retried like
-one that fails locally — `ddcutil` missing, no `i2c-dev`, no permission, a hung
-I²C transaction. A monitor that did not answer before the write gets it
-unchecked, and so does every write on macOS, where none has been seen dropped. A
-write the monitor ignores on every attempt, or unchecked, costs one press of the
-OSD Input button (§2).
+after ignored it, and a monitor that did not answer before the write (e.g.
+mid-switch) but answers 5 s after with an input other than the target's known
+VCP `0x60` value also failed to move. Silence sooner proves nothing: the LG
+falls silent while it switches, even on a switch it then undoes. That write
+fails and is retried like one that fails locally — `ddcutil` missing, no
+`i2c-dev`, no permission, a hung I²C transaction. A monitor that is silent both
+before and after the write (or written with a raw value outside the known tables
+while silent before) gets it unchecked, and so does every write on macOS, where
+none has been seen dropped. A write the monitor ignores on every attempt, or
+unchecked, costs one press of the OSD Input button (§2).
 
 **A device's receipt is its arrival on the assignee.** The assignee polls each
 device it took — every 1 s, for 60 s after the take — and posts `/arrived` once
@@ -247,9 +262,10 @@ while its issue is outstanding — a late one is ignored and logged.
 3. A write that failed, died or never reported, or a device that did not arrive
    within 10 s ⇒ retry **only those assignments**, up to `--switch-retries 3`,
    each at least 1 s after its last attempt. An assignment superseded by a newer
-   take of the same name is dropped. One whose assignee is no longer live stops
-   being retried and is not recorded: it stays pending, as the liveness gate
-   would have held it at reconcile.
+   take of the same name is dropped. One whose assignee is no longer the owner
+   or no longer live stops being retried (or waited on for arrival) and is not
+   recorded: it stays pending, as the ownership and liveness gates would have
+   held it at reconcile.
 4. Still failing after the last retry ⇒ the previous assignee runs
    `--notify-cmd`; every other host logs and stops.
 
@@ -273,9 +289,12 @@ path: commands run in parallel, each bounded by `--switch-timeout`, and only
 those that failed re-run, up to `--switch-retries`, so a take the server already
 accepted is not posted again. Commands that need an order go in one command that
 runs them in it, `-A "sh -c 'a; b'"`; `take-screen` and `take-hid` run
-in-process, so nothing can be ordered after them. A newer state that expires the
-edge — another owner or activation for an activation, the ownership back for a
-deactivation — drops every retry; the commands running finish. A failure after
+in-process, so nothing can be ordered after them, and when both are issued in
+the same batch the worker coalesces their takes into a single `POST /take/{id}`
+(bounding `take-hid`'s presence probe to 1.5 s so a slow RF check falls back to
+`arrived=false` and does not delay `take-screen`). A newer state that expires
+the edge — another owner or activation for an activation, the ownership back for
+a deactivation — drops every retry; the commands running finish. A failure after
 the last retry is logged. `take-screen` and `take-hid` exit 0 when the server
 accepted the take; a 409 is a failure like any other. Once the commands are
 over, success or not, the job records the ownership they ran for —
@@ -300,11 +319,11 @@ assignment the rate limit deferred is given away once the limit lifts.
 Reconciling a state again changes nothing once its job is over, since every job
 records what it handled. Why an assignment is held back is logged once, and
 again only when the reason changes. A claim waits out `--settle` from the last
-attach, then for the job in flight to end: the decider does one thing at a time.
-While a job runs, a newer state only updates it: the tasks it no longer calls
-for are dropped, never cut off mid-way, and the server's own checks — a take
-under a stale activation gets a 409 — cover the moment before the agent sees
-that state.
+attach and fires as soon as it is due, without waiting for an in-flight job to
+end (`claimLoop` is independent of `workerLoop`). While a job runs, a newer
+state only updates it: the tasks it no longer calls for are dropped, never cut
+off mid-way, and the server's own checks — a take under a stale activation gets
+a 409 — cover the moment before the agent sees that state.
 
 ## 5. CLI surface
 
@@ -796,8 +815,9 @@ For environments without the USB switch, a keyboard paired directly over
 Bluetooth works as a trigger on **both** OSes: BT HID surfaces like any HID
 device (a `hidraw` node on Linux, an `IOHIDDevice` on macOS), so the §6.1-6.2
 detector sees it — declare the keyboard by its own VID:PID and name it in
-`--trigger`. Only **connect** events trigger anything (finding 2); a disconnect
-never does, it only re-arms that target's attach edge. Two caveats:
+`--trigger`. Only **connect** events claim ownership (finding 2); a disconnect
+only re-arms that target's attach edge and, if no watched trigger remains
+present, cancels an attach that has not yet settled. Two caveats:
 
 - The identity is VID:PID, not a MAC address: two keyboards of the same model
   are indistinguishable.
@@ -1138,8 +1158,8 @@ An interface earns its place when two real implementations exist. Two do, both
 defined in `agent`, their only consumer:
 
 ```go
-type Detector interface {  // detect.HIDDetector and a fake
-    Run(ctx context.Context, attach chan<- struct{}) error
+type Detector interface {  // detect.Detector and a fake
+    Run(ctx context.Context, attach chan<- bool) error
 }
 type Guard interface {     // platform.Guard (no-op on Linux), and a fake
     OK(ctx context.Context) (ok bool, reason string)
@@ -1181,6 +1201,7 @@ back as the `Observation` field of the same name in the past tense.
 ```go
 type Observation struct {    // at most one field set: none when only time passed
     Attach   bool
+    Detach   bool
     State    *state.ServerState // from /state or a /wait wake
     Ran      *CommandsRun          // the commands in flight finished
     GaveAway *AssignmentsGivenAway // the assignments in flight were given away

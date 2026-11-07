@@ -84,30 +84,61 @@ func (a *agent) bounded(ctx context.Context, fn func(context.Context) error) err
 	return err
 }
 
-// runCommand runs one command: take-screen and take-hid in-process, anything
-// else as an external argv.
-func (a *agent) runCommand(ctx context.Context, c model.Command) error {
-	switch {
-	case c.TakeScreen != 0:
-		return a.take(ctx, c.TakeScreen, a.screenTakes())
-	case c.TakeHID != 0:
-		return a.take(ctx, c.TakeHID, a.hidTakes(ctx))
-	}
-	return a.cfg.Runner(ctx, c.Argv)
-}
+// hidTakeProbeTimeout bounds the presence check take-hid runs before posting
+// takes: if a device is slow to answer, take-hid posts arrived=false rather
+// than holding back take-screen, and the arrival watcher reports it once it
+// links.
+const hidTakeProbeTimeout = 1500 * time.Millisecond
 
 // runCommands runs commands in parallel, each with its own timeout, and
-// reports one result per command, in the order given, once all are over. One
-// failure does not stop the rest: the commands target independent things, and
-// a user who needs an order gives one command that runs them in it.
+// reports one result per command, in the order given, once all are over.
+// Built-in takes (take-screen and take-hid) issued in the same batch are
+// coalesced into a single POST /take/<id> so screen and device assignments
+// land in one server epoch. One failure does not stop the rest: the commands
+// target independent things, and a user who needs an order gives one command
+// that runs them in it.
 func (a *agent) runCommands(ctx context.Context, cmds []model.Command) {
 	results := make([]error, len(cmds))
+	var takeIndices []int
+	var activation int64
+	var wantScreen, wantHID bool
 	var wg sync.WaitGroup
 	for i, c := range cmds {
+		switch {
+		case c.TakeScreen != 0:
+			takeIndices = append(takeIndices, i)
+			activation = c.TakeScreen
+			wantScreen = true
+		case c.TakeHID != 0:
+			takeIndices = append(takeIndices, i)
+			activation = c.TakeHID
+			wantHID = true
+		default:
+			wg.Go(func() {
+				results[i] = a.bounded(ctx, func(ctx context.Context) error { return a.cfg.Runner(ctx, c.Argv) })
+				if results[i] != nil {
+					slog.Warn("command failed", "command", c.String(), "error", results[i])
+				}
+			})
+		}
+	}
+	if len(takeIndices) > 0 {
 		wg.Go(func() {
-			results[i] = a.bounded(ctx, func(ctx context.Context) error { return a.runCommand(ctx, c) })
-			if results[i] != nil {
-				slog.Warn("command failed", "command", c.String(), "error", results[i])
+			err := a.bounded(ctx, func(ctx context.Context) error {
+				var takes []state.Take
+				if wantScreen {
+					takes = append(takes, a.screenTakes()...)
+				}
+				if wantHID {
+					takes = append(takes, a.hidTakes(ctx)...)
+				}
+				return a.take(ctx, activation, takes)
+			})
+			for _, i := range takeIndices {
+				results[i] = err
+				if err != nil {
+					slog.Warn("command failed", "command", cmds[i].String(), "error", err)
+				}
 			}
 		})
 	}
@@ -127,8 +158,8 @@ func (a *agent) screenTakes() []state.Take {
 
 // hidTakes is what take-hid posts: for each declaration with a channel, the
 // channel this host occupies and whether the device is linked here already. A
-// presence check that fails reads as absent — the arrival watcher reports it
-// later (SPEC §4.3).
+// presence check that fails or times out reads as absent — the arrival watcher
+// reports it later (SPEC §4.3).
 func (a *agent) hidTakes(ctx context.Context) []state.Take {
 	var takes []state.Take
 	for _, d := range a.cfg.HIDs {
@@ -137,8 +168,11 @@ func (a *agent) hidTakes(ctx context.Context) []state.Take {
 		}
 		arrived := false
 		if a.cfg.HIDPresent != nil {
+			pctx, cancel := context.WithTimeout(ctx, hidTakeProbeTimeout)
 			var err error
-			if arrived, err = a.cfg.HIDPresent(ctx, d.Target); err != nil {
+			arrived, err = a.cfg.HIDPresent(pctx, d.Target)
+			cancel()
+			if err != nil {
 				slog.Warn("could not tell whether the device is here", "device", d.Name, "error", err)
 				arrived = false
 			}

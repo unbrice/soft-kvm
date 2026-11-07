@@ -71,30 +71,37 @@ func newTestClient(t *testing.T, token string) *client.Client {
 	return c
 }
 
-// fakeDetector lets tests inject attach edges. Run is not started until the
-// agent's guard allows it.
+// fakeDetector lets tests inject attach and detach edges, starting with
+// initialAttached on connect. Run is not started until the agent's guard
+// allows it.
 type fakeDetector struct {
-	ch        chan struct{}
-	runCalled atomic.Bool
+	ch              chan bool
+	initialAttached bool
+	runCalled       atomic.Bool
 }
 
 func newFakeDetector() *fakeDetector {
-	return &fakeDetector{ch: make(chan struct{}, 1)}
+	return &fakeDetector{ch: make(chan bool, 1)}
 }
 
 func (d *fakeDetector) attach() {
-	d.ch <- struct{}{}
+	d.ch <- true
 }
 
-func (d *fakeDetector) Run(ctx context.Context, attach chan<- struct{}) error {
+func (d *fakeDetector) Run(ctx context.Context, attach chan<- bool) error {
 	d.runCalled.Store(true)
+	select {
+	case attach <- d.initialAttached:
+	case <-ctx.Done():
+		return nil
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-d.ch:
+		case v := <-d.ch:
 			select {
-			case attach <- struct{}{}:
+			case attach <- v:
 			case <-ctx.Done():
 				return nil
 			}
@@ -424,8 +431,8 @@ func TestAgentTakeCommandsAreBuiltIn(t *testing.T) {
 	}
 	want := []state.Assignment{
 		{Kind: "hid", Name: "keyboard", Assignee: "linux", Seq: st.Assignments[0].Seq, Channel: 1, Arrived: true},
-		{Kind: "hid", Name: "mouse", Assignee: "linux", Seq: st.Assignments[1].Seq, Channel: 1},
-		{Kind: "screen", Name: "LG HDR WQHD", Assignee: "linux", Seq: st.Assignments[2].Seq, Input: "F4:50=D0"},
+		{Kind: "hid", Name: "mouse", Assignee: "linux", Seq: st.Assignments[0].Seq, Channel: 1},
+		{Kind: "screen", Name: "LG HDR WQHD", Assignee: "linux", Seq: st.Assignments[0].Seq, Input: "F4:50=D0"},
 	}
 	if !slices.Equal(st.Assignments, want) {
 		t.Fatalf("assignments = %+v\nwant    %+v", st.Assignments, want)
@@ -445,16 +452,88 @@ func TestAgentTakeUnderStaleActivationFails(t *testing.T) {
 
 	cfg := agentTestConfig(t, base, filepath.Join(t.TempDir(), "agent.json"), s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
 	cfg.Screens = []screen.Declaration{{Name: "LG", Write: screen.Write{VCP: 0x60, Source: 0x51, Value: 0x0F}}}
-	a := &agent{cfg: cfg}
+	a := &agent{cfg: cfg, results: make(chan model.Observation, 1)}
 
-	if err := a.runCommand(context.Background(), model.Command{TakeScreen: 99}); !errors.Is(err, client.ErrNotOwner) {
+	a.runCommands(context.Background(), []model.Command{{TakeScreen: 99}})
+	if err := (<-a.results).Ran.Results[0]; !errors.Is(err, client.ErrNotOwner) {
 		t.Fatalf("take under a stale activation: %v, want ErrNotOwner", err)
 	}
-	if err := a.runCommand(context.Background(), model.Command{TakeScreen: 1}); err != nil {
+	a.runCommands(context.Background(), []model.Command{{TakeScreen: 1}})
+	if err := (<-a.results).Ran.Results[0]; err != nil {
 		t.Fatalf("take under the current activation: %v", err)
 	}
 	if st := s.CurrentState(); len(st.Assignments) != 1 || st.Assignments[0].Input != "60:51=0F" {
 		t.Fatalf("assignments = %+v", st.Assignments)
+	}
+}
+
+// Starting an agent on the host that physically holds the trigger when another
+// live host had previously claimed and taken must claim ownership without
+// giving the screen or keyboard away to the previous owner first.
+func TestAgentStartupWithAttachedTriggerHoldsGiveAway(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	c := newTestClient(t, testToken)
+	dir := t.TempDir()
+	linuxState, macState := filepath.Join(dir, "linux.json"), filepath.Join(dir, "mac.json")
+
+	// Seed mac as the current owner (activation 1) with screen + keyboard takes,
+	// while linux's agent.json still has HandledOwner="linux", HandledSeqs={}.
+	if _, err := c.Claim(context.Background(), base, "mac", true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Take(context.Background(), base, "mac", 1, []state.Take{
+		{Kind: state.KindScreen, Name: "LG HDR WQHD", Input: "F4:50=D1"},
+		{Kind: state.KindHID, Name: "keyboard", Channel: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Save(macState, state.AgentState{HandledOwner: "mac", HandledActivation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Save(linuxState, state.AgentState{HandledOwner: "linux", HandledActivation: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start mac first so s.Live["mac"] is true when linux connects.
+	mac := agentTestConfig(t, base, macState, s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
+	mac.ID = "mac"
+	mac.Decider = agentDeciderConfig("mac")
+	mac.Decider.OnDeactivation = nil
+	mac.Resolver = discover.NewResolver(filepath.Join(t.TempDir(), "server"))
+	runAgent(ctx, t, mac)
+	waitForLive(t, s, "mac")
+
+	// Start linux with the trigger already attached at startup.
+	linuxDet := newFakeDetector()
+	linuxDet.initialAttached = true
+	linuxSeams := &fakeSeams{sendHere: true}
+	linuxRunner := &recordingRunner{}
+	linux := agentTestConfig(t, base, linuxState, s, linuxDet, &fakeGuard{ok: true}, linuxRunner.run)
+	linux.Decider.OnActivation = [][]string{{"take-screen"}, {"take-hid"}}
+	linux.Screens = []screen.Declaration{{Name: "LG HDR WQHD", Write: screen.Write{VCP: 0xF4, Source: 0x50, Value: 0xD0}}}
+	linux.HIDs = []hidpp.Declaration{{Name: "keyboard", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 1}, Channel: 1}}
+	linux.WriteScreen, linux.SendHID, linux.HIDPresent = linuxSeams.writeScreen, linuxSeams.sendHID, func(context.Context, hidpp.Target) (bool, error) {
+		return true, nil
+	}
+	runAgent(ctx, t, linux)
+
+	waitFor(t, "linux claims and takes screen and keyboard", func() bool {
+		st := s.CurrentState()
+		if st.Owner != "linux" || len(st.Assignments) != 2 {
+			return false
+		}
+		return st.Assignments[0].Assignee == "linux" && st.Assignments[1].Assignee == "linux"
+	})
+	if w := linuxSeams.Writes(); len(w) != 0 {
+		t.Fatalf("linux gave away the screen to mac on startup despite attached trigger: %v", w)
+	}
+	if sd := linuxSeams.Sends(); len(sd) != 0 {
+		t.Fatalf("linux gave away the keyboard to mac on startup despite attached trigger: %v", sd)
 	}
 }
 

@@ -67,6 +67,12 @@ func (p *presence) remove(info *hid.DeviceInfo) {
 	}
 }
 
+// any reports whether at least one watched target currently has an interface
+// attached.
+func (p *presence) any() bool {
+	return len(p.count) > 0
+}
+
 // HIDDetector watches HID device events for the configured targets. It is
 // built by NewDetector from the slotless --trigger entries.
 type HIDDetector struct {
@@ -85,10 +91,16 @@ func (d *HIDDetector) matches(info *hid.DeviceInfo) bool {
 	return false
 }
 
-// Run watches HID device events until ctx is cancelled, emitting one attach
-// edge per absent→present transition of the targets. Returns nil on ctx
-// cancellation.
-func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
+// run watches HID device events until ctx is cancelled, reporting the startup
+// snapshot, each absent→present target edge, and transitions to all-absent.
+func (d *HIDDetector) run(ctx context.Context, id int, reports chan<- sourceReport) error {
+	reported := false
+	defer func() {
+		if !reported {
+			reports <- sourceReport{source: id, initial: true}
+		}
+	}()
+
 	w, err := hid.Watch()
 	if err != nil {
 		return fmt.Errorf("hid watch: %w", err)
@@ -106,13 +118,6 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 	// tracked per target and one physical attach yields exactly one edge.
 	p := newPresence()
 
-	emit := func(info *hid.DeviceInfo) {
-		slog.Info("hid target attached",
-			"vid", fmt.Sprintf("%04x", info.VendorID),
-			"pid", fmt.Sprintf("%04x", info.ProductID))
-		emitAttach(attach)
-	}
-
 	// A target already attached at startup counts as one attach edge.
 	var first *hid.DeviceInfo
 	for _, dev := range w.Snapshot().Devices {
@@ -124,8 +129,12 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 		}
 	}
 	if first != nil {
-		emit(first)
+		slog.Info("hid target attached",
+			"vid", fmt.Sprintf("%04x", first.VendorID),
+			"pid", fmt.Sprintf("%04x", first.ProductID))
 	}
+	reported = true
+	reports <- sourceReport{source: id, initial: true, edge: first != nil, present: p.any()}
 
 	for {
 		select {
@@ -141,13 +150,20 @@ func (d *HIDDetector) Run(ctx context.Context, attach chan<- struct{}) error {
 			switch ev.Type {
 			case hid.DeviceEventConnected:
 				if d.matches(ev.DeviceInfo) && p.add(ev.DeviceInfo) {
-					emit(ev.DeviceInfo)
+					slog.Info("hid target attached",
+						"vid", fmt.Sprintf("%04x", ev.DeviceInfo.VendorID),
+						"pid", fmt.Sprintf("%04x", ev.DeviceInfo.ProductID))
+					reports <- sourceReport{source: id, edge: true, present: p.any()}
 				}
 			case hid.DeviceEventDisconnected:
 				// Not gated on matches: a disconnect can arrive without
 				// VID:PID once the node is gone from sysfs, and remove
 				// ignores paths it never tracked anyway.
+				wasPresent := p.any()
 				p.remove(ev.DeviceInfo)
+				if wasPresent && !p.any() {
+					reports <- sourceReport{source: id, present: false}
+				}
 			}
 		}
 	}
