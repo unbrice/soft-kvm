@@ -151,14 +151,38 @@ func TestNewDetectorRoutesAndGroups(t *testing.T) {
 	}
 }
 
-// emitAttach must never block the detector: an edge already queued makes the
-// next one redundant (agent invariant 3).
-func TestEmitAttachCoalesces(t *testing.T) {
-	ch := make(chan struct{}, 1)
-	for range 5 {
-		emitAttach(ch) // would deadlock if it blocked
-	}
-	if len(ch) != 1 {
-		t.Errorf("queued %d edges, want 1", len(ch))
-	}
+func TestFanIn(t *testing.T) {
+	t.Run("waits for all sources before emitting initial snapshot", func(t *testing.T) {
+		f := newFanIn(2)
+		if emit, _ := f.update(sourceReport{source: 0, initial: true, present: false}); emit {
+			t.Fatal("emitted before source 1 reported")
+		}
+		emit, attached := f.update(sourceReport{source: 1, initial: true, present: false})
+		if !emit || attached {
+			t.Fatalf("got (%v, %v), want (true, false)", emit, attached)
+		}
+	})
+
+	t.Run("emits true at startup when any source is present, and false only when all are gone", func(t *testing.T) {
+		f := newFanIn(2)
+		f.update(sourceReport{source: 0, initial: true, edge: true, present: true})
+		emit, attached := f.update(sourceReport{source: 1, initial: true, edge: false, present: false})
+		if !emit || !attached {
+			t.Fatalf("initial = (%v, %v), want (true, true)", emit, attached)
+		}
+		// Source 1 attaches while source 0 is already present: still emits an edge.
+		emit, attached = f.update(sourceReport{source: 1, edge: true, present: true})
+		if !emit || !attached {
+			t.Fatalf("second source edge = (%v, %v), want (true, true)", emit, attached)
+		}
+		// Source 0 detaches while source 1 remains present: must not emit detach.
+		if emit, _ := f.update(sourceReport{source: 0, present: false}); emit {
+			t.Fatal("emitted detach while source 1 was still present")
+		}
+		// Source 1 detaches: all sources absent -> emits detach.
+		emit, attached = f.update(sourceReport{source: 1, present: false})
+		if !emit || attached {
+			t.Fatalf("all absent = (%v, %v), want (true, false)", emit, attached)
+		}
+	})
 }

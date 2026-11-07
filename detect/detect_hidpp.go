@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/unbrice/soft-kvm/hidpp"
 	"golang.org/x/sync/errgroup"
@@ -94,41 +95,146 @@ func NewDetector(list string, named map[string]hidpp.Target) (*Detector, error) 
 	return d, nil
 }
 
-// emitAttach queues an attach edge. Non-blocking and coalescing: an edge
-// already queued makes this one redundant — attach edges are idempotent
-// triggers (agent invariant 3).
-func emitAttach(attach chan<- struct{}) {
-	select {
-	case attach <- struct{}{}:
-	default:
+// sourceReport is one update from a trigger source (the HID watcher or a
+// receiver watcher) to Detector's fan-in.
+type sourceReport struct {
+	source  int
+	initial bool
+	edge    bool
+	present bool
+}
+
+// fanIn merges startup snapshots and live presence/edge updates from n trigger
+// sources into the agent's attach channel:
+//   - Once every source has reported its initial snapshot, it emits one bool:
+//     true if any source had a target present at startup, false otherwise.
+//   - Thereafter, it emits true on any target attach edge, and false when the
+//     last present source becomes absent.
+type fanIn struct {
+	seen    []bool
+	present []bool
+	ready   bool
+	hadEdge bool
+}
+
+func newFanIn(n int) *fanIn {
+	return &fanIn{
+		seen:    make([]bool, n),
+		present: make([]bool, n),
 	}
+}
+
+func (f *fanIn) update(r sourceReport) (emit bool, attached bool) {
+	f.seen[r.source] = true
+	f.present[r.source] = r.present
+	if !f.ready {
+		if r.edge {
+			f.hadEdge = true
+		}
+		for _, s := range f.seen {
+			if !s {
+				return false, false
+			}
+		}
+		f.ready = true
+		return true, f.anyPresent() || f.hadEdge
+	}
+	if r.edge {
+		return true, true
+	}
+	if !f.anyPresent() {
+		return true, false
+	}
+	return false, false
+}
+
+func (f *fanIn) anyPresent() bool {
+	for _, p := range f.present {
+		if p {
+			return true
+		}
+	}
+	return false
 }
 
 // Run starts every configured source and blocks until ctx is cancelled or a
 // source fails. A failure returns: the agent's detectorLoop retries the whole
 // detector on backoff, which is also how an unplugged receiver is recovered.
-func (d *Detector) Run(ctx context.Context, attach chan<- struct{}) error {
-	g, gctx := errgroup.WithContext(ctx)
+func (d *Detector) Run(ctx context.Context, attach chan<- bool) error {
+	n := len(d.receivers)
 	if len(d.hidTargets) > 0 {
+		n++
+	}
+	if n == 0 {
+		select {
+		case attach <- false:
+		case <-ctx.Done():
+			return nil
+		}
+		<-ctx.Done()
+		return nil
+	}
+
+	reports := make(chan sourceReport, n*2)
+	var sourcesWG sync.WaitGroup
+	g, gctx := errgroup.WithContext(ctx)
+
+	nextID := 0
+	if len(d.hidTargets) > 0 {
+		id := nextID
+		nextID++
 		hd := &HIDDetector{targets: d.hidTargets}
-		g.Go(func() error { return hd.Run(gctx, attach) })
+		sourcesWG.Add(1)
+		g.Go(func() error {
+			defer sourcesWG.Done()
+			return hd.run(gctx, id, reports)
+		})
 	}
 	for _, r := range d.receivers {
-		g.Go(func() error { return watchReceiver(gctx, r, attach) })
+		id := nextID
+		nextID++
+		sourcesWG.Add(1)
+		g.Go(func() error {
+			defer sourcesWG.Done()
+			return watchReceiver(gctx, id, r, reports)
+		})
 	}
+	go func() {
+		sourcesWG.Wait()
+		close(reports)
+	}()
+
+	fi := newFanIn(n)
+	for r := range reports {
+		if emit, attached := fi.update(r); emit {
+			select {
+			case attach <- attached:
+			case <-gctx.Done():
+			}
+		}
+	}
+
 	if err := g.Wait(); err != nil && ctx.Err() == nil {
 		return err
 	}
 	return nil
 }
 
-// watchReceiver emits an attach edge whenever one of the watched slots takes
-// the radio link on this receiver.
-func watchReceiver(ctx context.Context, r receiverTarget, attach chan<- struct{}) error {
+// watchReceiver reports the startup link state of the watched slots on this
+// receiver, each subsequent link-established edge, and transitions where all
+// watched slots on the receiver have lost the link.
+func watchReceiver(ctx context.Context, id int, r receiverTarget, reports chan<- sourceReport) error {
+	reported := false
+	defer func() {
+		if !reported {
+			reports <- sourceReport{source: id, initial: true}
+		}
+	}()
+
 	// A slot already linked at startup counts as one attach edge, matching
-	// the HID detector's snapshot rule. The probe closes the interface before
-	// the watch opens it, so a link change in that gap is missed; the agent
-	// reconciles against the server on connect regardless (SPEC §5.4.3).
+	// the HID detector's snapshot rule. All watched slots are probed so linked
+	// tracks the full set before WatchLinks begins.
+	linked := make(map[uint8]bool, len(r.slots))
 	for _, slot := range r.slots {
 		online, err := hidpp.SlotOnline(ctx, r.vid, r.pid, slot)
 		if err != nil {
@@ -137,10 +243,11 @@ func watchReceiver(ctx context.Context, r receiverTarget, attach chan<- struct{}
 		if online {
 			slog.Info("receiver slot linked at startup",
 				"receiver", fmt.Sprintf("%04x:%04x", r.vid, r.pid), "slot", slot)
-			emitAttach(attach)
-			break
+			linked[slot] = true
 		}
 	}
+	reported = true
+	reports <- sourceReport{source: id, initial: true, edge: len(linked) > 0, present: len(linked) > 0}
 
 	events := make(chan hidpp.LinkEvent)
 	g, gctx := errgroup.WithContext(ctx)
@@ -151,15 +258,21 @@ func watchReceiver(ctx context.Context, r receiverTarget, attach chan<- struct{}
 			case <-gctx.Done():
 				return nil
 			case ev := <-events:
-				// Only the link coming up is a trigger. A drop is ambiguous
-				// — the device may have gone to the other host, or to sleep
-				// — and is never acted on (SPEC §6.3, finding 2).
-				if !ev.Established || !slices.Contains(r.slots, ev.Slot) {
+				if !slices.Contains(r.slots, ev.Slot) {
 					continue
 				}
-				slog.Info("receiver slot took the link",
-					"receiver", fmt.Sprintf("%04x:%04x", r.vid, r.pid), "slot", ev.Slot)
-				emitAttach(attach)
+				if ev.Established {
+					linked[ev.Slot] = true
+					slog.Info("receiver slot took the link",
+						"receiver", fmt.Sprintf("%04x:%04x", r.vid, r.pid), "slot", ev.Slot)
+					reports <- sourceReport{source: id, edge: true, present: true}
+					continue
+				}
+				wasPresent := len(linked) > 0
+				delete(linked, ev.Slot)
+				if wasPresent && len(linked) == 0 {
+					reports <- sourceReport{source: id, present: false}
+				}
 			}
 		}
 	})

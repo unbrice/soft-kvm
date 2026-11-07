@@ -15,8 +15,8 @@
 //     created per generation; results is run-level, capacity 1; decisions is
 //     run-level, capacity 4 (the worst case is a notification and the next
 //     issue in one batch while an earlier decision is still carried out);
-//     claims is run-level and unbuffered. State, result and decision sends are
-//     blocking (must not be lost); attach and claim sends are non-blocking and
+//     claims is run-level and unbuffered. Attach, state, result and decision
+//     sends are blocking (must not be lost); claim sends are non-blocking and
 //     coalescing (idempotent triggers); arrivalCh is capacity 1 and
 //     latest-wins, so the arrival watcher can never stall the loop.
 //  4. Every goroutine belongs to exactly one errgroup and exits only on its
@@ -110,12 +110,11 @@ func (b *backoff) wait(ctx context.Context) error {
 	}
 }
 
-// Detector emits one event per receiver attach edge (SPEC §11.2).
-// Implementations: HID device events via telesma-app/hid, and test fakes.
-// Only attach edges exist: disconnect is ambiguous (SPEC finding 2) and
-// never reported. Run returns nil on ctx cancellation.
+// Detector reports the startup trigger state and subsequent attach/detach
+// transitions (SPEC §11.2). Implementations: HID and receiver link events via
+// detect.Detector, and test fakes. Run returns nil on ctx cancellation.
 type Detector interface {
-	Run(ctx context.Context, attach chan<- struct{}) error
+	Run(ctx context.Context, attach chan<- bool) error
 }
 
 // Guard reports whether this host may participate in switching (SPEC §11.2).
@@ -325,7 +324,7 @@ func (a *agent) waitGuardsUp(ctx context.Context) bool {
 // goroutine may return are errGuardsDown and ctx.Err(); transient failures
 // (HTTP, HID) are retried in place.
 func (a *agent) generation(ctx context.Context, m *model.Decider) error {
-	attachCh := make(chan struct{}, 1)
+	attachCh := make(chan bool, 1)
 	stateCh := make(chan *state.ServerState, 1)
 	arrivalCh := make(chan *state.ServerState, 1)
 
@@ -359,7 +358,7 @@ func (a *agent) guardWatch(ctx context.Context) error {
 // detectorLoop runs the detector with backoff until ctx is cancelled. It only
 // ever returns nil or ctx.Err(): failures are retried, cancellation is the
 // only exit.
-func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) error {
+func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- bool) error {
 	b := a.newBackoff()
 	for {
 		err := a.cfg.Detector.Run(ctx, attachCh)
@@ -376,10 +375,17 @@ func (a *agent) detectorLoop(ctx context.Context, attachCh chan<- struct{}) erro
 	}
 }
 
+func attachObs(attached bool) model.Observation {
+	if attached {
+		return model.Observation{Attach: true}
+	}
+	return model.Observation{Detach: true}
+}
+
 // loop is the only goroutine that touches m. It reads the clock at processing
 // time, dispatches the Decisions the Decider returns, and rearms its timer for
 // the decider's next deadline.
-func (a *agent) loop(ctx context.Context, m *model.Decider, attachCh <-chan struct{}, stateCh <-chan *state.ServerState, arrivalCh chan *state.ServerState) error {
+func (a *agent) loop(ctx context.Context, m *model.Decider, attachCh <-chan bool, stateCh <-chan *state.ServerState, arrivalCh chan *state.ServerState) error {
 	timer := stoppedTimer()
 	send := func(d model.Decision) error {
 		select {
@@ -422,17 +428,25 @@ func (a *agent) loop(ctx context.Context, m *model.Decider, attachCh <-chan stru
 		timer.Reset(max(time.Until(wake), time.Nanosecond))
 		return nil
 	}
-	// Deadlines may have elapsed while dormant; let the decider catch up.
-	if err := decide(model.Observation{}); err != nil {
-		return err
+	// Wait for the detector's initial snapshot before reconciling any state,
+	// so a trigger already attached at startup (or on guard wake) holds back
+	// giving away to a previous owner while its claim settles; this also lets
+	// the decider catch up on deadlines that elapsed while dormant.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case attached := <-attachCh:
+		if err := decide(attachObs(attached)); err != nil {
+			return err
+		}
 	}
 	for {
 		var o model.Observation
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-attachCh:
-			o = model.Observation{Attach: true}
+		case attached := <-attachCh:
+			o = attachObs(attached)
 		case s := <-stateCh:
 			offerLatest(arrivalCh, s)
 			o = model.Observation{State: s}
