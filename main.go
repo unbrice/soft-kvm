@@ -124,7 +124,9 @@ func main() {
 	case "detect":
 		err = detectCmd(ctx)
 	case "service":
-		err = serviceCmd(ctx)
+		err = serviceCmd(ctx, os.Args[2:])
+	case "install":
+		err = serviceCmd(ctx, append([]string{"install"}, os.Args[2:]...))
 	default:
 		usage()
 		os.Exit(2)

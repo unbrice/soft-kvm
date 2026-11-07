@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -92,8 +93,7 @@ var journalTail = func(ctx context.Context, scope []string, unit string) string 
 	return strings.TrimRight(string(out), "\n")
 }
 
-func serviceCmd(ctx context.Context) error {
-	args := os.Args[2:]
+func serviceCmd(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		serviceUsage()
 		return errUsage
@@ -115,7 +115,7 @@ func serviceCmd(ctx context.Context) error {
 func serviceUsage() {
 	fmt.Fprintf(os.Stderr, `usage: %s service <install|print|uninstall> [serve|connect] [args]
 
-  install [serve|connect] [args]   install and enable the service (no args: two-step guidance)
+  install [serve|connect] [args]   install and enable the service (without serve|connect: guidance)
   print [serve|connect] [args]     render the unit to stdout for review (no euid/token checks)
   uninstall [serve|connect]        disable and remove the unit (env files and the binary stay)
 `, platform.ProgName)
@@ -243,11 +243,14 @@ func validateConnectInstall(euid int, token string, args []string) error {
 	return validateConnectArgs(args)
 }
 
-// serviceInstall runs `soft-kvm service install [serve|connect] [args]`.
-// All validation happens before any write or systemctl call.
+// serviceInstall runs `soft-kvm service install [serve|connect|--] [args]`.
+// Without serve or connect, it renders the install walkthrough — with
+// placeholders when given no arguments, or with the validated connect flags
+// filled in after `--`. All validation happens before any write or systemctl
+// call.
 func serviceInstall(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return printInstallGuidance()
+		return printInstallGuidance(nil)
 	}
 	kind, rawArgs := args[0], args[1:]
 	switch kind {
@@ -255,30 +258,52 @@ func serviceInstall(ctx context.Context, args []string) error {
 		return installServe(ctx, rawArgs)
 	case "connect":
 		return installConnect(ctx, rawArgs)
+	case "--":
+		return printInstallGuidance(rawArgs)
 	default:
 		serviceUsage()
 		return errUsage
 	}
 }
 
-// installGuidance is the two-step install walkthrough, shaped as a shell
-// transcript: the prose is #-comments and the commands sit at column 0,
-// so the output survives a pipe into a file and can be edited into a
-// setup script. %s is the resolved path of the running binary — sudo's
-// secure_path would not find a freshly built ./soft-kvm.
-const installGuidance = `# soft-kvm runs as two services: one coordinator, one agent per host.
+// bareInstallGuidance and filledInstallGuidance are the two steps of the
+// install walkthrough, shaped as shell transcripts: the prose is #-comments
+// and the commands sit at column 0, so the output survives a pipe into a
+// file and can be edited into a setup script. The trial commands use
+// platform.ProgName ("go run ." in a checkout, "soft-kvm" otherwise); the
+// install commands use absolute paths — the resolved running binary for sudo
+// (whose secure_path would not find a local build) and /usr/local/bin/soft-kvm
+// for the user unit.
+const bareInstallGuidance = `# soft-kvm runs as two services: one coordinator, one agent per host.
 # Both read the shared secret from SOFTKVM_TOKEN.
 
 # GENERATE A SHARED SECRET once, then copy this value to your other
 # hosts — re-running this line there would generate a different one.
 export SOFTKVM_TOKEN=$(openssl rand -hex 32)
 
-# CHOOSE YOUR SETTINGS AND TRY THEM before baking them into units;
-# soft-kvm serve --help and soft-kvm connect --help list the flags.
-soft-kvm detect   # prints the connect command that fits this host
-soft-kvm serve    # then, in one terminal; and in another:
-soft-kvm connect --trigger KEYBOARD --declare-hid 'KEYBOARD VID:PID' \
+# DETECT THIS HOST'S WIRING, choose a trigger and complete any ⚠️ notes.
+%[1]s detect
+
+# TRY YOUR SETTINGS before baking them into units: run the coordinator in
+# one terminal and the agent in another.
+%[1]s serve
+%[1]s connect --trigger KEYBOARD_FROM_DETECT \
+  --declare-hid 'KEYBOARD_FROM_DETECT VID:PID' \
   --declare-screen 'NAME INPUT' -A take-screen
+
+# ONCE IT WORKS, re-run with the chosen connect flags to print the
+# service installation commands.
+%[1]s service install -- --trigger KEYBOARD_FROM_DETECT \
+  --declare-hid 'KEYBOARD_FROM_DETECT VID:PID' \
+  --declare-screen 'NAME INPUT' -A take-screen
+`
+
+const filledInstallGuidance = `# soft-kvm runs as two services: one coordinator, one agent per host.
+# Both read the shared secret from SOFTKVM_TOKEN.
+
+# GENERATE A SHARED SECRET once, then copy this value to your other
+# hosts — re-running this line there would generate a different one.
+export SOFTKVM_TOKEN=$(openssl rand -hex 32)
 
 # INSTALL COORDINATOR on an always-on host of your LAN, as root; hosts
 # that only run an agent skip it. This command installs
@@ -290,8 +315,7 @@ sudo --preserve-env=SOFTKVM_TOKEN \
 # ~/.config/soft-kvm/env and a user unit that runs the binary you invoke
 # it with.
 /usr/local/bin/soft-kvm service install connect \
-  --trigger KEYBOARD --declare-hid 'KEYBOARD VID:PID' \
-  --declare-screen 'NAME INPUT' -A take-screen
+  %s
 
 # Optional, once the services are installed:
 
@@ -303,12 +327,34 @@ systemctl status soft-kvm-serve
 systemctl --user status soft-kvm
 `
 
-func printInstallGuidance() error {
+var plainShellArg = regexp.MustCompile(`^[A-Za-z0-9_.,:/=-]+$`)
+
+func renderInstallGuidance(bin string, connectArgs []string) (string, error) {
+	if connectArgs == nil {
+		return fmt.Sprintf(bareInstallGuidance, platform.ProgName), nil
+	}
+	if err := validateConnectArgs(connectArgs); err != nil {
+		return "", err
+	}
+	quoted := slices.Clone(connectArgs)
+	for i, a := range quoted {
+		if !plainShellArg.MatchString(a) {
+			quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+		}
+	}
+	return fmt.Sprintf(filledInstallGuidance, bin, strings.Join(quoted, " ")), nil
+}
+
+func printInstallGuidance(connectArgs []string) error {
 	self, err := selfExecutable()
 	if err != nil {
 		return err
 	}
-	fmt.Print(detect.Dim(os.Stdout, fmt.Sprintf(installGuidance, self)))
+	body, err := renderInstallGuidance(self, connectArgs)
+	if err != nil {
+		return err
+	}
+	fmt.Print(detect.Dim(os.Stdout, body))
 	return nil
 }
 
