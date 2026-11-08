@@ -291,6 +291,13 @@ export SOFTKVM_TOKEN=$(openssl rand -hex 32)
   --declare-hid 'KEYBOARD_FROM_DETECT VID:PID' \
   --declare-screen 'NAME INPUT' -A take-screen
 
+# INSTALL COORDINATOR once per group of hosts, on an always-on host of
+# your LAN, as root; hosts that only run an agent skip it. This command
+# installs /usr/local/bin/soft-kvm, /etc/soft-kvm/env and the system unit.
+sudo --preserve-env=SOFTKVM_TOKEN \
+  %[2]s service install serve
+sudo systemctl daemon-reload
+
 # ONCE IT WORKS, re-run with the chosen connect flags to print the
 # service installation commands.
 %[1]s service install -- --trigger KEYBOARD_FROM_DETECT \
@@ -305,17 +312,19 @@ const filledInstallGuidance = `# soft-kvm runs as two services: one coordinator,
 # hosts — re-running this line there would generate a different one.
 export SOFTKVM_TOKEN=$(openssl rand -hex 32)
 
-# INSTALL COORDINATOR on an always-on host of your LAN, as root; hosts
-# that only run an agent skip it. This command installs
-# /usr/local/bin/soft-kvm, /etc/soft-kvm/env and the system unit.
+# INSTALL COORDINATOR once per group of hosts, on an always-on host of
+# your LAN, as root; hosts that only run an agent skip it. This command
+# installs /usr/local/bin/soft-kvm, /etc/soft-kvm/env and the system unit.
 sudo --preserve-env=SOFTKVM_TOKEN \
   %s service install serve
+sudo systemctl daemon-reload
 
 # INSTALL AGENT on every host, as your regular user. This command writes
 # ~/.config/soft-kvm/env and a user unit that runs the binary you invoke
 # it with.
 /usr/local/bin/soft-kvm service install connect \
   %s
+systemctl --user daemon-reload
 
 # Optional, once the services are installed:
 
@@ -331,7 +340,7 @@ var plainShellArg = regexp.MustCompile(`^[A-Za-z0-9_.,:/=-]+$`)
 
 func renderInstallGuidance(bin string, connectArgs []string) (string, error) {
 	if connectArgs == nil {
-		return fmt.Sprintf(bareInstallGuidance, platform.ProgName), nil
+		return fmt.Sprintf(bareInstallGuidance, platform.ProgName, bin), nil
 	}
 	if err := validateConnectArgs(connectArgs); err != nil {
 		return "", err

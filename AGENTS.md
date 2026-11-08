@@ -111,7 +111,9 @@ The invariants header lives at the top of `agent/agent.go`.
 `Guard`: a no-op on Linux (the always-on desktop has no guards), AC-power and
 display checks on macOS. `platform` imports nothing internal, so `main` injects
 `screen.DisplayNames` as `displays`. The `Guard` satisfies `agent.Guard`
-structurally.
+structurally. `platform.ProgName` (`"go run ."` in a checkout, `"soft-kvm"`
+otherwise) is how user-facing messages and transcripts name the binary; only
+commands that cross `sudo` or bake into a unit use an absolute path.
 
 ## Stack
 
@@ -183,6 +185,8 @@ Three of those surprise people:
   are func types and the fakes are funcs (SPEC §11.2).
 - Not unit-tested: the screen write, the device send and the detector's event
   path — both need the hardware and live in the §10 integration checklist.
+- Test behavior and invariants, not wording or constants — better no test than a
+  change detector.
 
 ## Version control
 
@@ -246,7 +250,8 @@ Two workflows publish binaries:
   dual-licensed MIT OR Apache-2.0, DCO sign-off required, no GPG key needed).
 - **AI attribution:** `AI_POLICY.md` binds whoever triggers the ship — read the
   full diff, be able to explain it, flag a substantially AI-generated change in
-  the commit description. Naming the models is optional.
+  the commit description with `AI-generated.` (adding `, reviewed by committer.`
+  on review feedback) above `Signed-off-by:`. Do not name the model.
 - **Code style:** idiomatic Go, zero CGO, `go fmt`. Terse doc comments. Each
   file opens with a one-line `// file.go: <concern> (SPEC §x)` comment.
 - **Naming:** a name says what the thing is. Define it in one sentence, and grep
