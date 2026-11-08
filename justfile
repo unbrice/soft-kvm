@@ -16,8 +16,7 @@ lint:
     golangci-lint run ./... || true
     reuse lint --lines
 
-# Local CI parity gate: lints, formatting, unit tests.
-# `just ship` runs this before pushing.
+# Lint, check formatting, run unit tests. `just ship` and unstable.yml run it.
 check: lint fmt-check test-unit
 
 fmt:
@@ -32,8 +31,8 @@ fmt-check:
 setup-hooks:
     git config core.hooksPath .githooks
 
-# Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes.
-# Runs check (lint + fmt-check + unit tests) before pushing.
+# Push REV (default @-) as a PR on a <hostname>/<changeid> branch with rebase
+# auto-merge on. Runs check (lint + fmt-check + unit tests) first.
 ship rev="@-": check
     #!/usr/bin/env bash
     set -euo pipefail

@@ -139,7 +139,9 @@ direnv allow            # or: nix develop ./nix/dev
 It carries go 1.26, gopls, golangci-lint, just, dprint, reuse, and — on Linux —
 ddcutil. The `go 1.25` in `go.mod` is the language floor, not the toolchain.
 Non-Nix systems need Go ≥ 1.25, just, dprint and reuse installed by hand (see
-`CONTRIBUTING.md`).
+`CONTRIBUTING.md`). `unstable.yml` and `stable.yml` run in the `ci` shell
+(`nix develop ./nix/dev#ci`): the same `flake.lock`, without gopls, ddcutil or a
+C toolchain, with goreleaser.
 
 ## Commands
 
@@ -207,6 +209,25 @@ jj sharp edges:
 - The `.githooks/pre-commit` formatting check hangs off `git commit`, which this
   workflow never runs. `just check` is the only thing that actually guards a
   push.
+
+Two workflows publish binaries:
+
+- `unstable.yml` triggers on a commit to master that changes a non-Markdown
+  file: it runs `just check`, builds with goreleaser and replaces the rolling
+  `unstable` pre-release and tag with the result.
+- `stable.yml` triggers on a commit to master that changes `CHANGELOG.md`: it
+  reads the top `## vX.Y.Z` heading, tags that commit and builds the release
+  from the tag, so Go stamps the version into the binary (no `-X` ldflags). It
+  fails without tagging unless the commit differs from the `unstable` tag only
+  in Markdown files: the release binaries are rebuilt from the source of the
+  `unstable` build you tested, with the same `flake.lock`. Both workflows spell
+  out that Markdown set, `unstable.yml` as `paths-ignore` and `stable.yml` as
+  its diff guard; change them together.
+- The release skill (`.agents/skills/release/SKILL.md`) writes the changelog
+  section with you and ships it; nobody tags or edits a release by hand. Archive
+  names carry no version, so
+  `releases/latest/download/soft-kvm_<os>_<arch>.tar.gz` links survive each
+  release.
 
 ## Permissions
 

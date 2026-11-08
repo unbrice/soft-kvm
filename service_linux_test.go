@@ -158,6 +158,10 @@ func TestSystemdAnalyzeVerify(t *testing.T) {
 			t.Fatal(err)
 		}
 		cmd := exec.Command("systemd-analyze", "verify", "--user", path)
+		// --user fails without a runtime directory; any empty one will do.
+		if os.Getenv("XDG_RUNTIME_DIR") == "" {
+			cmd.Env = append(os.Environ(), "XDG_RUNTIME_DIR="+t.TempDir())
+		}
 		out, err := cmd.CombinedOutput()
 		if len(out) > 0 || err != nil {
 			t.Errorf("systemd-analyze verify --user: exit=%v output=%s", err, out)
