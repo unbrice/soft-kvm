@@ -54,10 +54,13 @@
           pkgs = pkgsFor system;
         in
         {
-          ci = pkgs.mkShell {
+          # The shell unstable.yml and stable.yml run in. NoCC: with CGO off,
+          # nothing uses the C toolchain mkShell adds.
+          ci = pkgs.mkShellNoCC {
             buildInputs = with pkgs; [
               go
               golangci-lint
+              goreleaser
               just
               reuse
               dprint

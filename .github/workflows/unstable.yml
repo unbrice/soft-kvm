@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Triggers on a commit to master that changes a non-Markdown file: runs the
+# gate, builds, and replaces the rolling `unstable` pre-release. stable.yml
+# builds a release only from a commit whose non-Markdown files match this
+# build's.
+
+name: Unstable
+
+on:
+  push:
+    branches: [master]
+    # No Markdown file is compiled into the binary. stable.yml's diff guard
+    # accepts the same set.
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: write
+
+# GitHub keeps one pending run per group: in its own group, this workflow
+# cannot cancel a pending stable.yml run. No run is cancelled in progress, so
+# an upload is never cut halfway; a newer pending run replaces an older one.
+concurrency:
+  group: unstable
+  cancel-in-progress: false
+
+jobs:
+  unstable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Same tools as `nix develop ./nix/dev`, versions from flake.lock.
+        shell: nix develop ./nix/dev#ci --command bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('nix/dev/flake.nix', 'nix/dev/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - run: just check
+      - run: goreleaser release --snapshot --clean
+
+      - name: Replace the rolling unstable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f unstable "$GITHUB_SHA"
+          git push -f origin refs/tags/unstable
+          notes="Rolling build of master at $GITHUB_SHA."
+          if gh release view unstable >/dev/null 2>&1; then
+            gh release upload unstable dist/*.tar.gz dist/checksums.txt --clobber
+            gh release edit unstable --target "$GITHUB_SHA" --prerelease --notes "$notes"
+          else
+            gh release create unstable dist/*.tar.gz dist/checksums.txt \
+              --target "$GITHUB_SHA" --title "Unstable (master)" --prerelease --notes "$notes"
+          fi

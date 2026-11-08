@@ -139,7 +139,9 @@ direnv allow            # or: nix develop ./nix/dev
 It carries go 1.26, gopls, golangci-lint, just, dprint, reuse, and — on Linux —
 ddcutil. The `go 1.25` in `go.mod` is the language floor, not the toolchain.
 Non-Nix systems need Go ≥ 1.25, just, dprint and reuse installed by hand (see
-`CONTRIBUTING.md`).
+`CONTRIBUTING.md`). `unstable.yml` and `stable.yml` run in the `ci` shell
+(`nix develop ./nix/dev#ci`): the same `flake.lock`, without gopls, ddcutil or a
+C toolchain, with goreleaser.
 
 ## Commands
 
@@ -188,18 +190,17 @@ Colocated **jj (Jujutsu) + git** repo — `.jj/` is the source of truth. Never r
 mutating git commands (`git commit/rebase/checkout/branch/reset/switch`); use
 jj. Read-only git (`log`, `diff`, `status`, `show`) and `gh` are fine.
 
-Workflow — one change = one PR:
+Workflow:
 
 - `jj new 'trunk()'`, hack, `jj describe -m "<type>: <summary>"`.
-- `just ship [rev]` — runs `check`, then pushes the change (default `@-`) as
-  bookmark `<hostname>/<changeid>`, opens a PR, enables rebase auto-merge.
-- `just sync` — after merges: fetch + rebase; merged changes and their bookmarks
-  evaporate.
+- `just ship [rev]` — runs `check`, fetches and rebases onto `trunk()`, advances
+  `master` to `rev` (default: `@` if non-empty, else `@-`), and pushes `master`.
+- `just sync` — fetches `origin` and rebases `@`'s stack onto `trunk()`.
 
 jj sharp edges:
 
-- A PR contains every commit in `trunk()..rev` — move unrelated work off the
-  stack before shipping (`jj rebase -r <rev> -d 'trunk()'`).
+- `just ship` pushes every commit in `trunk()..rev` — move unrelated work off
+  the stack before shipping (`jj rebase -r <rev> -d 'trunk()'`).
 - `just sync` only rebases the stack holding `@`; rebase other heads explicitly:
   `jj rebase -b <head> -d 'trunk()' --skip-emptied`.
 - Any jj operation is undoable: `jj op log`, then `jj undo` or
@@ -207,6 +208,25 @@ jj sharp edges:
 - The `.githooks/pre-commit` formatting check hangs off `git commit`, which this
   workflow never runs. `just check` is the only thing that actually guards a
   push.
+
+Two workflows publish binaries:
+
+- `unstable.yml` triggers on a commit to master that changes a non-Markdown
+  file: it runs `just check`, builds with goreleaser and replaces the rolling
+  `unstable` pre-release and tag with the result.
+- `stable.yml` triggers on a commit to master that changes `CHANGELOG.md`: it
+  reads the top `## vX.Y.Z` heading, tags that commit and builds the release
+  from the tag, so Go stamps the version into the binary (no `-X` ldflags). It
+  fails without tagging unless the commit differs from the `unstable` tag only
+  in Markdown files: the release binaries are rebuilt from the source of the
+  `unstable` build you tested, with the same `flake.lock`. Both workflows spell
+  out that Markdown set, `unstable.yml` as `paths-ignore` and `stable.yml` as
+  its diff guard; change them together.
+- The release skill (`.agents/skills/release/SKILL.md`) writes the changelog
+  section with you and ships it; nobody tags or edits a release by hand. Archive
+  names carry no version, so
+  `releases/latest/download/soft-kvm_<os>_<arch>.tar.gz` links survive each
+  release.
 
 ## Permissions
 

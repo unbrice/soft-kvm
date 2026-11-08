@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Triggers on a commit to master that changes CHANGELOG.md: tags it with the
+# version in the top `## vX.Y.Z` heading and builds the release from that tag,
+# so Go stamps the version into the binary. Fails without tagging unless the
+# commit's non-Markdown files match those of the `unstable` build, so the
+# release is rebuilt from the source that was tested.
+
+name: Stable
+
+on:
+  push:
+    branches: [master]
+    paths: [CHANGELOG.md]
+
+permissions:
+  contents: write # push the tag, create the release
+  actions: read # wait for unstable.yml runs
+
+# GitHub keeps one pending run per group: in its own group, a pending run here
+# cannot be cancelled by a newer unstable.yml run.
+concurrency:
+  group: stable
+  cancel-in-progress: false
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop ./nix/dev#ci --command bash -euo pipefail {0}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide what to release
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | cut -c4- || true)
+          if [ -z "$tag" ]; then
+            echo "No '## vX.Y.Z' heading in CHANGELOG.md: nothing to release."
+            exit 0
+          fi
+
+          if out=$(gh release view "$tag" --json tagName 2>&1); then
+            echo "$tag is already released."
+            exit 0
+          elif [[ $out != *"release not found"* ]]; then
+            echo "$out"
+            exit 1
+          fi
+
+          # A tag without a release means goreleaser failed after tagging: build
+          # from the tag again if it is on this commit.
+          tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)
+          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::$tag already tags $tagged, not $GITHUB_SHA."
+            exit 1
+          fi
+          if [ -z "$tagged" ]; then
+            newest=$(git tag -l 'v*' | sort -V | tail -n1)
+            if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$tag" | sort -V | tail -n1)" != "$tag" ]; then
+              echo "::error::$tag is not newer than $newest."
+              exit 1
+            fi
+          fi
+
+          # A push touching code and CHANGELOG.md starts both workflows: let
+          # the build move the unstable tag before comparing against it.
+          while [ "$(gh run list --workflow unstable.yml --json status \
+                       --jq '[.[] | select(.status != "completed")] | length')" != 0 ]; do
+            echo "Waiting for unstable.yml runs to finish."
+            sleep 20
+          done
+          git fetch --force --tags origin
+
+          # The guard: build only from a commit whose non-Markdown files match
+          # the unstable build's. Markdown is the set unstable.yml ignores;
+          # change the two together.
+          base=$(git rev-parse -q --verify 'refs/tags/unstable^{commit}') || {
+            echo "::error::No unstable tag to compare against."
+            exit 1
+          }
+          changed=$(git diff --name-only "$base" "$GITHUB_SHA" | grep -v '\.md$' || true)
+          if [ -n "$changed" ]; then
+            echo "::error::$GITHUB_SHA differs from the unstable build ($base) in:"
+            echo "$changed"
+            exit 1
+          fi
+
+          # The section's body, between its heading and the next one.
+          awk '/^## /{ if (found) exit; if ($2 ~ /^v[0-9]/) { found = 1; next } } found' \
+            CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tagged=${tagged:+true}" >> "$GITHUB_OUTPUT"
+
+      - if: steps.plan.outputs.tag
+        uses: cachix/install-nix-action@v31
+      - if: steps.plan.outputs.tag
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('nix/dev/flake.nix', 'nix/dev/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - if: steps.plan.outputs.tag
+        run: just check
+
+      # A tag pushed with GITHUB_TOKEN triggers no workflow, so this job builds.
+      - if: steps.plan.outputs.tag && !steps.plan.outputs.tagged
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
+      - if: steps.plan.outputs.tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GORELEASER_CURRENT_TAG: ${{ steps.plan.outputs.tag }}
+        run: goreleaser release --clean --release-notes "$RUNNER_TEMP/notes.md"

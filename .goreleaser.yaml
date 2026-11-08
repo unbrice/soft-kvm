@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Brice Arnould
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Builds the archives. unstable.yml runs it with --snapshot; stable.yml runs it
+# on the commit it tagged, and Go stamps the version from that tag (no -X
+# ldflags).
+
+version: 2
+
+project_name: soft-kvm
+
+builds:
+  - main: .
+    binary: soft-kvm
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - formats:
+      - tar.gz
+    # No version in the name, so releases/latest/download/... links stay stable.
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"

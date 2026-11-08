@@ -16,8 +16,7 @@ lint:
     golangci-lint run ./... || true
     reuse lint --lines
 
-# Local CI parity gate: lints, formatting, unit tests.
-# `just ship` runs this before pushing.
+# Lint, check formatting, run unit tests. `just ship` and unstable.yml run it.
 check: lint fmt-check test-unit
 
 fmt:
@@ -32,18 +31,23 @@ fmt-check:
 setup-hooks:
     git config core.hooksPath .githooks
 
-# Push REV (default @-) as a PR on a <hostname>/<changeid> branch; auto-merges when CI passes.
-# Runs check (lint + fmt-check + unit tests) before pushing.
-ship rev="@-": check
+# Check, rebase onto master, and push REV (default: @ if non-empty, else @-) to master.
+ship rev="heads(::@ & ~empty())": check
     #!/usr/bin/env bash
     set -euo pipefail
-    cid=$(jj log -r '{{rev}}' --no-graph -T 'change_id.short()')
-    bookmark="$(hostname)/${cid}"
-    jj bookmark set "$bookmark" -r '{{rev}}' --allow-backwards
-    jj git push --bookmark "$bookmark"
-    gh pr view "$bookmark" --json number >/dev/null 2>&1 \
-        || gh pr create --head "$bookmark" --fill
-    gh pr merge "$bookmark" --rebase --auto
+    target=$(jj log -r '{{rev}}' --no-graph -T 'change_id.short()')
+    jj git fetch
+    jj rebase -b "$target" -d 'trunk()' --skip-emptied
+    if [ -z "$(jj log -r "trunk()..$target" --no-graph -T 'change_id')" ]; then
+        echo "Nothing between trunk() and $target to ship." >&2
+        exit 1
+    fi
+    if [ -n "$(jj log -r "trunk()..$target & description(exact:'')" --no-graph -T 'change_id')" ]; then
+        echo "Refusing to ship commit with empty description in trunk()..$target." >&2
+        exit 1
+    fi
+    jj bookmark set master -r "$target"
+    jj git push --bookmark master
 
 # Fetch master and rebase the stack; merged changes and their bookmarks evaporate
 sync:
