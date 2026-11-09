@@ -94,7 +94,7 @@ func quoteValue(s string) string {
 	if s == "" {
 		return `""`
 	}
-	if strings.ContainsAny(s, " \t\"=") {
+	if strings.ContainsAny(s, " \t\n\r\"=") {
 		return fmt.Sprintf("%q", s)
 	}
 	return s

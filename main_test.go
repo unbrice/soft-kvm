@@ -49,6 +49,28 @@ func TestRequireToken(t *testing.T) {
 			t.Fatalf("got %q, %v; want %q, nil", got, err, want)
 		}
 	})
+
+	t.Run("character blacklist", func(t *testing.T) {
+		base := strings.Repeat("a", tokenGoodLen)
+		for _, bad := range []string{
+			base + "\nLD_PRELOAD=/tmp/x",
+			base + "\r",
+			base + " b",
+			base + "\tb",
+			base + `"`,
+			base + `'`,
+			base + `\`,
+			base + "\x1b",
+			base + "\x7f",
+			base + "é",
+			base + "\xff",
+		} {
+			t.Setenv("SOFTKVM_TOKEN", bad)
+			if _, err := requireToken(); !errors.Is(err, errToken) {
+				t.Errorf("token %q: got %v, want errToken", bad, err)
+			}
+		}
+	})
 }
 
 func TestRejectExtraArgs(t *testing.T) {

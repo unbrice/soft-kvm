@@ -191,6 +191,15 @@ func checkToken(token string) (string, error) {
 	if len(token) < tokenMinLen {
 		return "", fmt.Errorf("%w: %d chars is too short, need %d+ (generate one, e.g. `openssl rand -hex 32`)", errToken, len(token), tokenMinLen)
 	}
+	// Printable non-whitespace ASCII is '!' (0x21) through '~' (0x7E): <= ' '
+	// covers ASCII control characters and whitespace, and > '~' covers DEL and
+	// all non-ASCII bytes.
+	for i := range len(token) {
+		c := token[i]
+		if c <= ' ' || c > '~' || c == '"' || c == '\'' || c == '\\' {
+			return "", fmt.Errorf("%w: must be printable ASCII without whitespace, quotes or backslashes", errToken)
+		}
+	}
 	if len(token) < tokenGoodLen {
 		slog.Warn("SOFTKVM_TOKEN is short; prefer a generated token of 32+ chars (openssl rand -hex 32)", "length", len(token))
 	}

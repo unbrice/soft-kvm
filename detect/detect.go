@@ -455,27 +455,22 @@ func declaredMonitors(r screen.Report) []screen.Display {
 func renderNotes(w io.Writer, r screen.Report, wiring hostWiring) error {
 	var b strings.Builder
 	b.WriteString("\n")
-	note := func(text string) {
-		for _, line := range wrapAt(text, 72) {
-			fmt.Fprintf(&b, "# %s\n", line)
-		}
-	}
 	for _, d := range declaredMonitors(r) {
 		t := screen.TableFor(d.Mfg)
-		line := fmt.Sprintf("# Monitor: %s (%s), mapping table %s", d.Model, d.Mfg, t.Name)
+		line := fmt.Sprintf("Monitor: %s (%s), mapping table %s", d.Model, d.Mfg, t.Name)
 		if a, ok := t.AliasFor(d.Input); ok && d.InputOK {
 			line += ", showing this host on " + a
 		}
 		if d.InputErr != nil {
-			line += ", input unread: " + d.InputErr.Error()
+			line += ", input unread: " + strings.TrimRight(d.InputErr.Error(), "\r\n")
 		}
-		b.WriteString(line + ".\n")
+		comment(&b, "# ", "#   ", line+".")
 	}
 	// pending lists declarations the command left out, with the take they
 	// need when the command has none of that kind.
 	pending := func(title string, flags []string, take string) {
 		b.WriteString("\n")
-		note(warnSign + title)
+		note(&b, warnSign+title)
 		for _, f := range flags {
 			fmt.Fprintf(&b, "#   %s\n", f)
 		}
@@ -497,7 +492,7 @@ func renderNotes(w io.Writer, r screen.Report, wiring hostWiring) error {
 		if ms := declaredMonitors(r); len(ms) > 0 {
 			table = screen.TableFor(ms[0].Mfg)
 		}
-		note(fmt.Sprintf("Replace %s with this computer's port on the monitor (%s, or a raw value such as 0x1B), or switch the monitor to this host and run detect again.",
+		note(&b, fmt.Sprintf("Replace %s with this computer's port on the monitor (%s, or a raw value such as 0x1B), or switch the monitor to this host and run detect again.",
 			inputPlaceholder, strings.Join(table.Aliases(), ", ")))
 	}
 	if hids := wiring.pendingHIDs(); len(hids) > 0 {
@@ -510,46 +505,48 @@ func renderNotes(w io.Writer, r screen.Report, wiring hostWiring) error {
 			take = "take-hid"
 		}
 		pending("Add flags for the following devices if you want them to move as well:", flags, take)
-		note(fmt.Sprintf("Replace %s with this computer's number on the device, or switch the device to this host and run detect again.", channelPlaceholder))
+		note(&b, fmt.Sprintf("Replace %s with this computer's number on the device, or switch the device to this host and run detect again.", channelPlaceholder))
 	}
 	for _, d := range wiring.hids {
 		if d.watched && d.easySwitch {
 			b.WriteString("\n")
-			note(fmt.Sprintf("%sdetect could not read the Easy-Switch channel of %s: add host=N to its declaration (1-%d, as printed on the key) for this host to take it back.",
+			note(&b, fmt.Sprintf("%sdetect could not read the Easy-Switch channel of %s: add host=N to its declaration (1-%d, as printed on the key) for this host to take it back.",
 				warnSign, d.name, hidpp.MaxChannel))
 		}
 	}
 	switch names := wiring.twins(); {
 	case len(names) > 0:
 		b.WriteString("\n")
-		note(twinMark + "Device names must be the same on every host.")
-		note(fmt.Sprintf("Check that %s name the same devices on every host: detect numbers devices of one model by address, and another host may order them differently.",
+		note(&b, twinMark+"Device names must be the same on every host.")
+		note(&b, fmt.Sprintf("Check that %s name the same devices on every host: detect numbers devices of one model by address, and another host may order them differently.",
 			joinNames(names)))
-		for i, line := range wrapAt(warnSign+"A name that means a different device there makes take-hid move the wrong one.", 72) {
-			prefix := "# "
-			if i > 0 {
-				prefix = "#    "
-			}
-			fmt.Fprintf(&b, "%s%s\n", prefix, line)
-		}
+		comment(&b, "# ", "#    ", strings.Join(wrapAt(warnSign+"A name that means a different device there makes take-hid move the wrong one.", 72), "\n"))
 	case wiring.easySwitch():
 		b.WriteString("\n")
-		note("Device names must be the same on every host.")
+		note(&b, "Device names must be the same on every host.")
 	}
-	if _, err := io.WriteString(w, Dim(w, b.String())); err != nil {
-		return err
-	}
-	if r.Err == nil {
-		return nil
-	}
-	b.Reset()
-	prefix := "# " + warnSign
-	for line := range strings.Lines(r.Err.Error()) {
-		fmt.Fprintf(&b, "%s%s\n", prefix, strings.TrimRight(line, "\n"))
-		prefix = "#    "
+	if r.Err != nil {
+		comment(&b, "# "+warnSign, "#    ", r.Err.Error())
 	}
 	_, err := io.WriteString(w, Dim(w, b.String()))
 	return err
+}
+
+// comment writes text to b as #-comment lines, opening the first line with
+// first and any continuation lines with next.
+func comment(b *strings.Builder, first, next, text string) {
+	prefix := first
+	for line := range strings.Lines(text) {
+		b.WriteString(prefix)
+		b.WriteString(strings.TrimRight(line, "\r\n"))
+		b.WriteByte('\n')
+		prefix = next
+	}
+}
+
+// note wraps text to 72 columns and writes it to b as #-comment lines.
+func note(b *strings.Builder, text string) {
+	comment(b, "# ", "# ", strings.Join(wrapAt(text, 72), "\n"))
 }
 
 // joinNames lists names the way prose does: "a", "a and b", "a, b and c".

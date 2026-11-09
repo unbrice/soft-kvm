@@ -857,14 +857,17 @@ func TestRenderNotes(t *testing.T) {
 	t.Run("an unread port says why", func(t *testing.T) {
 		var buf bytes.Buffer
 		r := screen.Report{Backend: "ddcutil", Displays: []screen.Display{
-			{Mfg: "DEL", Model: "DELL U2720Q", InputErr: errors.New("i2c busy")},
+			{Mfg: "DEL", Model: "DELL U2720Q", InputErr: errors.New("i2c busy\r\nsecond line\nthird line")},
 		}}
 		if err := renderNotes(&buf, r, buildWiring(nil, r, nil)); err != nil {
 			t.Fatalf("renderNotes: %v", err)
 		}
-		if out := buf.String(); !strings.Contains(out, ", input unread: i2c busy.\n") {
-			t.Errorf("the read failure is not reported:\n%s", out)
+		out := buf.String()
+		want := ", input unread: i2c busy\n#   second line\n#   third line.\n"
+		if !strings.Contains(out, want) {
+			t.Errorf("the read failure is not reported as comments:\n%s", out)
 		}
+		assertTranscript(t, out)
 	})
 }
 

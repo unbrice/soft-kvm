@@ -271,12 +271,16 @@ func TestQuoteSystemdArg(t *testing.T) {
 		{name: "spaces wrapped", arg: "hello world", want: `"hello world"`},
 		{name: "double quote escaped", arg: `say "hi"`, want: `"say \"hi\""`},
 		{name: "backslash escaped when wrapped", arg: `a\b c`, want: `"a\\b c"`},
+		{name: "backslash without spaces wrapped", arg: `a\b`, want: `"a\\b"`},
+		{name: "trailing backslash wrapped", arg: `a\`, want: `"a\\"`},
+		{name: "empty token wrapped", arg: "", want: `""`},
 		{name: "single quote wrapped", arg: "it's", want: `"it's"`},
 		{name: "percent doubled", arg: "50%", want: "50%%"},
 		{name: "dollar doubled inside word", arg: "x${FOO}y", want: "x$${FOO}y"},
 		{name: "standalone semicolon escaped", arg: ";", want: `\;`},
 		{name: "embedded semicolon untouched", arg: "a;b", want: "a;b"},
 		{name: "newline refused", arg: "a\nb", wantErr: true},
+		{name: "carriage return refused", arg: "a\rb", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,6 +375,23 @@ func TestInstallGuidanceIsShellShaped(t *testing.T) {
 			}
 			prev = line
 		}
+	}
+
+	// A binary path with spaces or single quotes is shell-quoted, and a
+	// newline in the binary path or connect arguments is refused so nothing
+	// can inject a line into the transcript.
+	body, err := renderInstallGuidance("/tmp/it's here/soft-kvm", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `'/tmp/it'\''s here/soft-kvm' service install serve`) {
+		t.Errorf("binary path not shell-quoted in guidance:\n%s", body)
+	}
+	if _, err := renderInstallGuidance("/tmp/bad\nbin/soft-kvm", nil); err == nil {
+		t.Error("newline in binary path: got nil, want error")
+	}
+	if _, err := renderInstallGuidance("/usr/local/bin/soft-kvm", []string{"--trigger", "kbd", "--declare-hid", "kbd 046d:c52b", "-D", "notify-send\nevil"}); err == nil {
+		t.Error("newline in connect args: got nil, want error")
 	}
 }
 

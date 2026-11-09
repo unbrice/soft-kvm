@@ -135,21 +135,23 @@ func selfExecutable() (string, error) {
 }
 
 // quoteSystemdArg quotes one raw argument for a unit's ExecStart line:
-// plain tokens pass through; tokens containing whitespace or quotes are
-// wrapped in "..." with \ and " escaped; % is always doubled (specifier
-// expansion); $ is always doubled (${VAR} expands even inside quotes); a
-// standalone ; becomes \; (command separator). A newline has no unit-file
-// representation and is refused. The escaping applies to baked arguments
-// only — template specifiers such as %h pass through renderUnit untouched.
+// plain tokens pass through; empty tokens and tokens containing whitespace,
+// quotes or a backslash are wrapped in "..." with \ and " escaped; % is
+// always doubled (specifier expansion); $ is always doubled (${VAR} expands
+// even inside quotes); a standalone ; becomes \; (command separator). A
+// newline or carriage return has no unit-file representation and is refused.
+// The escaping applies to baked arguments only — template specifiers such as
+// %h pass through renderUnit untouched.
 func quoteSystemdArg(arg string) (string, error) {
-	if strings.Contains(arg, "\n") {
+	if strings.ContainsAny(arg, "\n\r") {
 		return "", fmt.Errorf("argument %q contains a newline, which cannot be represented in a systemd unit", arg)
 	}
-	arg = strings.NewReplacer("%", "%%", "$", "$$").Replace(arg)
+	arg = strings.ReplaceAll(arg, "%", "%%")
+	arg = strings.ReplaceAll(arg, "$", "$$")
 	if arg == ";" {
 		return `\;`, nil
 	}
-	if strings.ContainsAny(arg, " \t\r\v\f\"'") {
+	if arg == "" || strings.ContainsAny(arg, " \t\v\f\"'\\") {
 		arg = strings.ReplaceAll(arg, `\`, `\\`)
 		arg = strings.ReplaceAll(arg, `"`, `\"`)
 		return `"` + arg + `"`, nil
@@ -157,10 +159,14 @@ func quoteSystemdArg(arg string) (string, error) {
 	return arg, nil
 }
 
-// renderUnit substitutes __SOFTKVM_BIN__ and __ARGS__ (each raw argument
-// through quoteSystemdArg, space-joined). Anything else in the template —
-// including the %h specifier — passes through untouched.
+// renderUnit substitutes __SOFTKVM_BIN__ and __ARGS__ (the binary path and
+// each raw argument through quoteSystemdArg, space-joined). Anything else in
+// the template — including the %h specifier — passes through untouched.
 func renderUnit(tpl, bin string, args []string) (string, error) {
+	qbin, err := quoteSystemdArg(bin)
+	if err != nil {
+		return "", err
+	}
 	quoted := make([]string, len(args))
 	for i, a := range args {
 		q, err := quoteSystemdArg(a)
@@ -170,7 +176,7 @@ func renderUnit(tpl, bin string, args []string) (string, error) {
 		quoted[i] = q
 	}
 	return strings.NewReplacer(
-		"__SOFTKVM_BIN__", bin,
+		"__SOFTKVM_BIN__", qbin,
 		"__ARGS__", strings.Join(quoted, " "),
 	).Replace(tpl), nil
 }
@@ -186,6 +192,11 @@ func renderEnv(tpl, token string) string {
 // The raw tokens are what install bakes; this parse exists only so install
 // never accepts a syntax the runtime would reject.
 func validateServeArgs(args []string) error {
+	for _, a := range args {
+		if _, err := quoteSystemdArg(a); err != nil {
+			return err
+		}
+	}
 	fs, _, err := newServeFlagSet()
 	if err != nil {
 		return err
@@ -212,6 +223,11 @@ func validateServeArgs(args []string) error {
 // parsing: a non-empty parsed --trigger, its list, the declarations,
 // and the -A/-D commands with the built-in takes used consistently.
 func validateConnectArgs(args []string) error {
+	for _, a := range args {
+		if _, err := quoteSystemdArg(a); err != nil {
+			return err
+		}
+	}
 	fs, v := newConnectFlagSet()
 	if err := parseArgs(fs, args); err != nil {
 		return err
@@ -338,20 +354,29 @@ systemctl --user status soft-kvm
 
 var plainShellArg = regexp.MustCompile(`^[A-Za-z0-9_.,:/=-]+$`)
 
+func quoteShellArg(arg string) string {
+	if plainShellArg.MatchString(arg) {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+}
+
 func renderInstallGuidance(bin string, connectArgs []string) (string, error) {
+	if strings.ContainsAny(bin, "\n\r") {
+		return "", fmt.Errorf("binary path %q contains a newline", bin)
+	}
+	qbin := quoteShellArg(bin)
 	if connectArgs == nil {
-		return fmt.Sprintf(bareInstallGuidance, platform.ProgName, bin), nil
+		return fmt.Sprintf(bareInstallGuidance, platform.ProgName, qbin), nil
 	}
 	if err := validateConnectArgs(connectArgs); err != nil {
 		return "", err
 	}
-	quoted := slices.Clone(connectArgs)
-	for i, a := range quoted {
-		if !plainShellArg.MatchString(a) {
-			quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
-		}
+	quoted := make([]string, len(connectArgs))
+	for i, a := range connectArgs {
+		quoted[i] = quoteShellArg(a)
 	}
-	return fmt.Sprintf(filledInstallGuidance, bin, strings.Join(quoted, " ")), nil
+	return fmt.Sprintf(filledInstallGuidance, qbin, strings.Join(quoted, " ")), nil
 }
 
 func printInstallGuidance(connectArgs []string) error {
@@ -374,7 +399,7 @@ func installServe(ctx context.Context, rawArgs []string) error {
 		if selfErr != nil {
 			return err
 		}
-		return fmt.Errorf("%w\nhint: run `sudo --preserve-env=SOFTKVM_TOKEN %s service install serve ...` so the token reaches the install", err, self)
+		return fmt.Errorf("%w\nhint: run `sudo --preserve-env=SOFTKVM_TOKEN %s service install serve ...` so the token reaches the install", err, quoteShellArg(self))
 	}
 	if err := validateServeInstall(os.Geteuid(), token, rawArgs); err != nil {
 		return err
@@ -384,6 +409,19 @@ func installServe(ctx context.Context, rawArgs []string) error {
 	if err != nil {
 		return err
 	}
+	unitTpl, err := serviceFiles.ReadFile("units/soft-kvm-serve.service")
+	if err != nil {
+		return err
+	}
+	unit, err := renderUnit(string(unitTpl), serveBinPath, rawArgs)
+	if err != nil {
+		return err
+	}
+	envTpl, err := serviceFiles.ReadFile("deploy/env.serve.example")
+	if err != nil {
+		return err
+	}
+
 	if filepath.Clean(self) != serveBinPath {
 		if err := copyExecutable(self, serveBinPath); err != nil {
 			return fmt.Errorf("copying the binary to %s: %w", serveBinPath, err)
@@ -396,23 +434,11 @@ func installServe(ctx context.Context, rawArgs []string) error {
 	if err := os.MkdirAll(serveEnvDir, 0755); err != nil {
 		return err
 	}
-	envTpl, err := serviceFiles.ReadFile("deploy/env.serve.example")
-	if err != nil {
-		return err
-	}
 	if err := os.WriteFile(filepath.Join(serveEnvDir, "env"), []byte(renderEnv(string(envTpl), token)), 0600); err != nil {
 		return err
 	}
 	slog.Info("wrote env file", "path", filepath.Join(serveEnvDir, "env"), "mode", "0600", "note", "re-running install re-renders it from the template and discards hand edits (e.g. SOFTKVM_LOG)")
 
-	unitTpl, err := serviceFiles.ReadFile("units/soft-kvm-serve.service")
-	if err != nil {
-		return err
-	}
-	unit, err := renderUnit(string(unitTpl), serveBinPath, rawArgs)
-	if err != nil {
-		return err
-	}
 	if err := os.WriteFile(serveUnitPath, []byte(unit), 0644); err != nil {
 		return err
 	}
@@ -443,11 +469,19 @@ func installConnect(ctx context.Context, rawArgs []string) error {
 	if err != nil {
 		return err
 	}
-
+	unitTpl, err := serviceFiles.ReadFile("units/soft-kvm.service")
+	if err != nil {
+		return err
+	}
+	unit, err := renderUnit(string(unitTpl), self, rawArgs)
+	if err != nil {
+		return err
+	}
 	envTpl, err := serviceFiles.ReadFile("deploy/env.connect.example")
 	if err != nil {
 		return err
 	}
+
 	if err := os.MkdirAll(filepath.Join(home, connectEnvDir), 0755); err != nil {
 		return err
 	}
@@ -457,14 +491,6 @@ func installConnect(ctx context.Context, rawArgs []string) error {
 	}
 	slog.Info("wrote env file", "path", envPath, "mode", "0600")
 
-	unitTpl, err := serviceFiles.ReadFile("units/soft-kvm.service")
-	if err != nil {
-		return err
-	}
-	unit, err := renderUnit(string(unitTpl), self, rawArgs)
-	if err != nil {
-		return err
-	}
 	unitPath := filepath.Join(home, connectUnitPath)
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0755); err != nil {
 		return err
