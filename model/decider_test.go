@@ -206,16 +206,8 @@ func state_(s *state.ServerState) Observation { return Observation{State: s} }
 // ran is the result of a run of commands, one error per command.
 func ran(results ...error) *CommandsRun { return &CommandsRun{Results: results} }
 
-func okAll(keys ...state.AssignmentKey) *AssignmentsGivenAway {
-	results := map[state.AssignmentKey]error{}
-	for _, k := range keys {
-		results[k] = nil
-	}
-	return &AssignmentsGivenAway{Results: results}
-}
-
-func given(results map[state.AssignmentKey]error) *AssignmentsGivenAway {
-	return &AssignmentsGivenAway{Results: results}
+func gave(key state.AssignmentKey, err error) Observation {
+	return Observation{GaveAway: &AssignmentGivenAway{Key: key, Err: err}}
 }
 
 var errWrite = errors.New("ddcutil: no i2c-dev")
@@ -244,7 +236,7 @@ func TestFirstReconcileAdopts(t *testing.T) {
 	next := mk("mac", 4, screenAssignment("DELL", "mac", "", 5), screenAssignment("LG", "mac", "linux", 3), hidAssignment("mouse", "mac", "linux", 4, false))
 	ds = m.decide(at(2), state_(next))
 	want(t, ds, "give:screen/DELL")
-	want(t, m.decide(at(3), Observation{GaveAway: okAll(dell)}), "save")
+	want(t, m.decide(at(3), gave(dell, nil)), "save")
 	next = mk("mac", 4, screenAssignment("DELL", "mac", "", 5), screenAssignment("LG", "mac", "linux", 6), hidAssignment("mouse", "mac", "linux", 4, false))
 	ds = m.decide(at(10), state_(next))
 	want(t, ds, "give:screen/LG")
@@ -257,7 +249,7 @@ func TestRecordSurvivesARestart(t *testing.T) {
 	s := mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))
 	ds := m.decide(at(0), state_(s))
 	want(t, ds, "give:screen/LG")
-	ds = m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
+	ds = m.decide(at(1), gave(lgKey, nil))
 	want(t, ds, "save")
 
 	again := mustDecider(t, testConfig("linux"), saved(t, ds))
@@ -577,7 +569,7 @@ func TestHoldBackReasonsLogOnce(t *testing.T) {
 	// The assignee comes back once the unfulfilled claim hold expires: LG is
 	// given away, and the reason forgotten.
 	want(t, m.decide(at(34), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3)))), "give:screen/LG")
-	m.decide(at(35), Observation{GaveAway: okAll(lgKey)})
+	m.decide(at(35), gave(lgKey, nil))
 	// A newer take to a host that is not live is a new reason.
 	wantLog(t, m.decide(at(36), state_(notLive(mk("mac", 2, screenAssignment("LG", "mac", "linux", 4)), "mac"))), "is not live")
 }
@@ -591,7 +583,7 @@ func TestGiveAway(t *testing.T) {
 		if ds.d[0].GiveAway[0].Input != "F4:50=D1" {
 			t.Fatalf("give away = %+v", ds.d[0].GiveAway)
 		}
-		ds = m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
+		ds = m.decide(at(1), gave(lgKey, nil))
 		want(t, ds, "save")
 		if rec := saved(t, ds); rec.HandledSeqs["screen/LG"] != 3 {
 			t.Fatalf("record = %+v", rec)
@@ -609,7 +601,7 @@ func TestGiveAway(t *testing.T) {
 	t.Run("nothing to move here is done, silently", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
-		ds := m.decide(at(1), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: ErrNotHere})})
+		ds := m.decide(at(1), gave(lgKey, ErrNotHere))
 		want(t, ds, "save")
 		if strings.Contains(logs(ds), "failed") {
 			t.Fatalf("logs %q", logs(ds))
@@ -620,40 +612,70 @@ func TestGiveAway(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))
 		m.decide(at(0), state_(s))
-		ds := m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{
-			mouseKey: ErrNotHere, lgKey: errWrite,
-		})})
+		want(t, m.decide(at(0), gave(mouseKey, ErrNotHere)))
+		ds := m.decide(at(0), gave(lgKey, errWrite))
 		want(t, ds, "wake:1")
 		ds = m.decide(at(1), Observation{})
 		want(t, ds, "give:screen/LG")
 
 		// A slow failure retries at once.
-		ds = m.decide(at(5), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})})
+		ds = m.decide(at(5), gave(lgKey, errWrite))
 		want(t, ds, "give:screen/LG")
-		ds = m.decide(at(8), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: nil})})
+		ds = m.decide(at(8), gave(lgKey, nil))
 		want(t, ds, "save")
 	})
 
-	t.Run("an assignment that reports nothing counts as failed", func(t *testing.T) {
+	t.Run("a fast peripheral retries and awaits arrival while a slow screen write is still in flight", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
-		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
-		ds := m.decide(at(5), Observation{GaveAway: given(map[state.AssignmentKey]error{})})
-		want(t, ds, "give:screen/LG")
+		s := mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))
+		want(t, m.decide(at(0), state_(s)), "give:hid/mouse,screen/LG")
+
+		// Mouse fails at 0s while LG is still issued: schedules mouse retry at 1s.
+		want(t, m.decide(at(0), gave(mouseKey, errWrite)), "wake:1")
+		// At 1s, mouse retries on its own without re-issuing or waiting on LG.
+		want(t, m.decide(at(1), Observation{}), "give:hid/mouse")
+		// Mouse succeeds at 2s: starts its 10s arrival window (wake:12) while LG is still issued.
+		want(t, m.decide(at(2), gave(mouseKey, nil)), "wake:12")
+		// Mouse arrives at 3s while LG is still issued: job waits for LG before saving.
+		want(t, m.decide(at(3), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true), screenAssignment("LG", "mac", "linux", 3)))))
+		// LG finishes at 6s: now the whole job settles.
+		ds := m.decide(at(6), gave(lgKey, nil))
+		want(t, ds, "save")
+		if rec := saved(t, ds); rec.HandledSeqs["hid/mouse"] != 3 || rec.HandledSeqs["screen/LG"] != 3 {
+			t.Fatalf("record = %+v", rec)
+		}
+	})
+
+	t.Run("ownership flipping away drops a failed sibling immediately and waits only for the in-flight write", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		s := mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))
+		want(t, m.decide(at(0), state_(s)), "give:hid/mouse,screen/LG")
+		want(t, m.decide(at(0), gave(mouseKey, errWrite)), "wake:1")
+
+		// Ownership returns to linux while LG is still issued: mouse's pending retry
+		// is dropped at once (no wake at 1s), and activation waits for LG's write.
+		want(t, m.decide(at(0), state_(mk("linux", 3, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3)))))
+		want(t, m.decide(at(1), Observation{}))
+		ds := m.decide(at(5), gave(lgKey, errWrite))
+		want(t, ds, "save", "run:take-screen@3")
+		if rec := saved(t, ds); len(rec.HandledSeqs) != 0 {
+			t.Fatalf("record = %+v, want dropped assignments left pending", rec)
+		}
 	})
 
 	t.Run("failing after the last retry notifies the previous assignee", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		s := mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))
 		m.decide(at(0), state_(s))
-		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
+		fail := gave(lgKey, errWrite)
 		now := 0
 		for i := 0; i < 3; i++ {
 			now += 2
-			ds := m.decide(at(now), Observation{GaveAway: fail})
+			ds := m.decide(at(now), fail)
 			want(t, ds, "give:screen/LG")
 		}
 		now += 2
-		ds := m.decide(at(now), Observation{GaveAway: fail})
+		ds := m.decide(at(now), fail)
 		want(t, ds, "notify+save")
 		wantLog(t, ds, "failed after 4 attempts")
 		if rec := saved(t, ds); rec.HandledSeqs["screen/LG"] != 3 {
@@ -665,10 +687,10 @@ func TestGiveAway(t *testing.T) {
 	t.Run("a host that is not the previous assignee only logs", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "third", 3))))
-		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
+		fail := gave(lgKey, errWrite)
 		var ds outcome
 		for i := 1; i <= 4; i++ {
-			ds = m.decide(at(2*i), Observation{GaveAway: fail})
+			ds = m.decide(at(2*i), fail)
 		}
 		want(t, ds, "save")
 		wantLog(t, ds, "screen/LG failed after 4 attempts")
@@ -677,10 +699,10 @@ func TestGiveAway(t *testing.T) {
 	t.Run("a first assignment has no previous assignee and never notifies", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "", 3))))
-		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
+		fail := gave(lgKey, errWrite)
 		var ds outcome
 		for i := 1; i <= 4; i++ {
-			ds = m.decide(at(2*i), Observation{GaveAway: fail})
+			ds = m.decide(at(2*i), fail)
 		}
 		want(t, ds, "save")
 	})
@@ -688,10 +710,11 @@ func TestGiveAway(t *testing.T) {
 	t.Run("one failing assignment does not skip or fail the rest", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
-		m.decide(at(2), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite, lgKey: nil})})
-		m.decide(at(4), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})})
-		m.decide(at(6), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})})
-		ds := m.decide(at(8), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})})
+		m.decide(at(2), gave(mouseKey, errWrite))
+		m.decide(at(4), gave(mouseKey, errWrite))
+		m.decide(at(5), gave(lgKey, nil))
+		m.decide(at(6), gave(mouseKey, errWrite))
+		ds := m.decide(at(8), gave(mouseKey, errWrite))
 		want(t, ds, "notify+save")
 		rec := saved(t, ds)
 		if rec.HandledSeqs["screen/LG"] != 3 || rec.HandledSeqs["hid/mouse"] != 3 {
@@ -703,7 +726,7 @@ func TestGiveAway(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		want(t, m.decide(at(1), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3), hidAssignment("mouse", "mac", "linux", 4, false)))))
-		ds := m.decide(at(2), Observation{GaveAway: okAll(lgKey)})
+		ds := m.decide(at(2), gave(lgKey, nil))
 		want(t, ds, "save", "give:hid/mouse")
 	})
 
@@ -717,7 +740,7 @@ func TestGiveAway(t *testing.T) {
 		m.decide(at(0), state_(third("third", 2)))
 		m.decide(at(1), Observation{Ran: ran(nil)}) // the deactivation ends, the assignment is given away
 		want(t, m.decide(at(2), state_(third("linux", 3))))
-		ds := m.decide(at(3), Observation{GaveAway: okAll(lgKey)})
+		ds := m.decide(at(3), gave(lgKey, nil))
 		want(t, ds, "save", "run:take-screen@3")
 	})
 }
@@ -733,7 +756,7 @@ func TestArrival(t *testing.T) {
 	t.Run("a sent device waits for its arrival, then is done", func(t *testing.T) {
 		m := sent(t)
 		// Sent at 1 s: the window closes at 11 s.
-		ds := m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		ds := m.decide(at(1), gave(mouseKey, nil))
 		want(t, ds, "wake:11")
 		ds = m.decide(at(3), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true))))
 		want(t, ds, "save")
@@ -746,7 +769,7 @@ func TestArrival(t *testing.T) {
 
 	t.Run("the device is not done on the exit alone", func(t *testing.T) {
 		m := sent(t)
-		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(1), gave(mouseKey, nil))
 		// A state that does not show the arrival changes nothing.
 		want(t, m.decide(at(2), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false)))), "wake:11")
 	})
@@ -754,12 +777,12 @@ func TestArrival(t *testing.T) {
 	t.Run("an arrival already in the state at the exit is the receipt", func(t *testing.T) {
 		m := sent(t)
 		m.decide(at(1), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true))))
-		want(t, m.decide(at(2), Observation{GaveAway: okAll(mouseKey)}), "save")
+		want(t, m.decide(at(2), gave(mouseKey, nil)), "save")
 	})
 
 	t.Run("no arrival within the window re-sends, spaced and counted", func(t *testing.T) {
 		m := sent(t)
-		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(1), gave(mouseKey, nil))
 		ds := m.decide(at(11), Observation{})
 		want(t, ds, "give:hid/mouse")
 		wantLog(t, ds, "did not arrive")
@@ -768,12 +791,12 @@ func TestArrival(t *testing.T) {
 	t.Run("never arriving notifies the previous assignee after the last retry", func(t *testing.T) {
 		m := sent(t)
 		now := 1
-		m.decide(at(now), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(now), gave(mouseKey, nil))
 		for i := 0; i < 3; i++ {
 			now += 10
 			want(t, m.decide(at(now), Observation{}), "give:hid/mouse")
 			now++
-			want(t, m.decide(at(now), Observation{GaveAway: okAll(mouseKey)}), fmt.Sprintf("wake:%d", now+10))
+			want(t, m.decide(at(now), gave(mouseKey, nil)), fmt.Sprintf("wake:%d", now+10))
 		}
 		now += 10
 		ds := m.decide(at(now), Observation{})
@@ -783,7 +806,7 @@ func TestArrival(t *testing.T) {
 
 	t.Run("an assignment superseded while awaiting is dropped, and its successor is pending", func(t *testing.T) {
 		m := sent(t)
-		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(1), gave(mouseKey, nil))
 		// The successor appears while the mouse awaits: the old assignment is
 		// dropped and the batch ends at once, without marking the new seq seen.
 		ds := m.decide(at(2), state_(mk("mac", 2, hidAssignment("mouse", "linux", "mac", 4, false))))
@@ -798,7 +821,7 @@ func TestArrival(t *testing.T) {
 
 	t.Run("a superseding take by another host is given away after the cooldown", func(t *testing.T) {
 		m := sent(t)
-		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(1), gave(mouseKey, nil))
 		third := mk("third", 3, hidAssignment("mouse", "third", "mac", 4, false))
 		third.Live["third"] = true
 		// The batch ends at 2 s; the mouse cooled down for 5 s since.
@@ -812,7 +835,7 @@ func TestArrival(t *testing.T) {
 	t.Run("a failed assignment superseded before its retry is not retried", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false))))
-		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: errWrite})}), "wake:1")
+		want(t, m.decide(at(0), gave(mouseKey, errWrite)), "wake:1")
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "linux", "mac", 4, false))))
 		want(t, ds, "save")
 		want(t, m.decide(at(1), Observation{}))
@@ -820,18 +843,19 @@ func TestArrival(t *testing.T) {
 
 	t.Run("an assignment that vanished is superseded", func(t *testing.T) {
 		m := sent(t)
-		m.decide(at(1), Observation{GaveAway: okAll(mouseKey)})
+		m.decide(at(1), gave(mouseKey, nil))
 		want(t, m.decide(at(2), state_(mk("mac", 2))), "save")
 	})
 
 	t.Run("a screen failing while a device awaits retries without waiting for the window", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
-		ds := m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: nil, lgKey: errWrite})})
+		want(t, m.decide(at(0), gave(mouseKey, nil)), "wake:10")
+		ds := m.decide(at(0), gave(lgKey, errWrite))
 		want(t, ds, "wake:1")
 		ds = m.decide(at(1), Observation{})
 		want(t, ds, "give:screen/LG", "wake:10")
-		ds = m.decide(at(2), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: nil})})
+		ds = m.decide(at(2), gave(lgKey, nil))
 		want(t, ds, "wake:10")
 		want(t, m.decide(at(3), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true), screenAssignment("LG", "mac", "linux", 3)))), "save")
 	})
@@ -840,7 +864,7 @@ func TestArrival(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		lg := screenAssignment("LG", "mac", "linux", 3)
 		m.decide(at(0), state_(mk("mac", 2, lg)))
-		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:1")
+		want(t, m.decide(at(0), gave(lgKey, errWrite)), "wake:1")
 		ds := m.decide(at(0), state_(notLive(mk("mac", 2, lg), "mac")))
 		want(t, ds, "save")
 		wantLog(t, ds, `screen/LG dropped: assignee "mac" is not live`)
@@ -860,7 +884,7 @@ func TestArrival(t *testing.T) {
 		wantLog(t, ds, `assignee "mac" is not the owner ("third")`)
 		// Ownership returns to "mac": LG is given away.
 		want(t, m.decide(at(1), state_(mk("mac", 4, lg))), "give:screen/LG")
-		want(t, m.decide(at(1), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:2")
+		want(t, m.decide(at(1), gave(lgKey, errWrite)), "wake:2")
 		// Ownership moves away before retry: dropped and left out of HandledSeqs.
 		ds = m.decide(at(1), state_(mk("third", 5, lg)))
 		want(t, ds, "save")
@@ -874,7 +898,7 @@ func TestArrival(t *testing.T) {
 
 	t.Run("a device awaiting arrival is dropped when ownership leaves its assignee", func(t *testing.T) {
 		m := sent(t)
-		want(t, m.decide(at(1), Observation{GaveAway: okAll(mouseKey)}), "wake:11")
+		want(t, m.decide(at(1), gave(mouseKey, nil)), "wake:11")
 		// Ownership returns to "linux" while the mouse was awaiting arrival on "mac":
 		// dropped immediately without waiting out the 10s arrival window.
 		ds := m.decide(at(2), state_(mk("linux", 3, hidAssignment("mouse", "mac", "linux", 3, false))))
@@ -911,7 +935,7 @@ func TestArrival(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		lg := screenAssignment("LG", "mac", "linux", 3)
 		want(t, m.decide(at(0), state_(mk("mac", 2, lg))), "give:screen/LG")
-		want(t, m.decide(at(0), Observation{GaveAway: given(map[state.AssignmentKey]error{lgKey: errWrite})}), "wake:1")
+		want(t, m.decide(at(0), gave(lgKey, errWrite)), "wake:1")
 		// Attach arrives before the retry at 1 s: retry is held back while settling.
 		want(t, m.decide(at(0), Observation{Attach: true}), "wake:2")
 		want(t, m.decide(at(1), Observation{}), "wake:2")
@@ -930,7 +954,7 @@ func TestArrival(t *testing.T) {
 		ds := m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, true), screenAssignment("LG", "mac", "linux", 3))))
 		want(t, ds, "give:screen/LG")
 		wantLog(t, ds, "already arrived")
-		ds = m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
+		ds = m.decide(at(1), gave(lgKey, nil))
 		want(t, ds, "save")
 		if rec := saved(t, ds); rec.HandledSeqs["hid/mouse"] != 3 || rec.HandledSeqs["screen/LG"] != 3 {
 			t.Fatalf("record = %+v", rec)
@@ -946,11 +970,11 @@ func TestCooldownAndBreaker(t *testing.T) {
 	t.Run("cooldown is per name", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		handled(m, 0, screenAssignment("LG", "mac", "linux", 3))
-		m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
+		m.decide(at(1), gave(lgKey, nil))
 		// 2 s later: the screen cooled down until 6 s, the mouse did not.
 		ds := handled(m, 3, screenAssignment("LG", "mac", "linux", 4), hidAssignment("mouse", "mac", "linux", 4, false))
 		want(t, ds, "give:hid/mouse")
-		m.decide(at(4), Observation{GaveAway: given(map[state.AssignmentKey]error{mouseKey: ErrNotHere})})
+		m.decide(at(4), gave(mouseKey, ErrNotHere))
 		// The cooled screen runs when the cooldown ends.
 		want(t, m.decide(at(5), Observation{}), "wake:6")
 		want(t, m.decide(at(6), Observation{}), "give:screen/LG")
@@ -962,7 +986,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 		for i, sec := range []int{0, 6, 12} {
 			ds := handled(m, sec, screenAssignment("LG", "mac", "linux", seq+state.Seq(i)))
 			want(t, ds, "give:screen/LG")
-			m.decide(at(sec+1), Observation{GaveAway: okAll(lgKey)})
+			m.decide(at(sec+1), gave(lgKey, nil))
 		}
 		// The third ended at 13 s: the breaker is open until 73 s.
 		ds := handled(m, 20, hidAssignment("mouse", "mac", "linux", 9, false))
@@ -977,7 +1001,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 		for i, sec := range []int{0, 20, 40, 60, 80} {
 			ds := handled(m, sec, screenAssignment("LG", "mac", "linux", state.Seq(3+i)))
 			want(t, ds, "give:screen/LG")
-			m.decide(at(sec+1), Observation{GaveAway: okAll(lgKey)})
+			m.decide(at(sec+1), gave(lgKey, nil))
 		}
 	})
 
@@ -985,7 +1009,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		for i, sec := range []int{0, 6, 12} {
 			handled(m, sec, screenAssignment("LG", "mac", "linux", state.Seq(3+i)))
-			m.decide(at(sec+1), Observation{GaveAway: okAll(lgKey)})
+			m.decide(at(sec+1), gave(lgKey, nil))
 		}
 		want(t, m.decide(at(14), state_(mk("linux", 3))), "run:take-screen@3")
 	})
@@ -995,7 +1019,7 @@ func TestCooldownAndBreaker(t *testing.T) {
 // breaker: the peripheral that carried the gesture is ErrNotHere on every
 // handover, and neither is a write.
 func TestCooldownCountsOnlyAttempts(t *testing.T) {
-	notHere := given(map[state.AssignmentKey]error{lgKey: ErrNotHere})
+	notHere := gave(lgKey, ErrNotHere)
 	assignment := func(seq state.Seq) *state.ServerState {
 		return mk("mac", 2, screenAssignment("LG", "mac", "linux", seq))
 	}
@@ -1006,7 +1030,7 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 			// Each assignment follows the previous at once: no cooldown defers
 			// it.
 			want(t, m.decide(at(sec), state_(assignment(state.Seq(3+i)))), "give:screen/LG")
-			ds := m.decide(at(sec), Observation{GaveAway: notHere})
+			ds := m.decide(at(sec), notHere)
 			want(t, ds, "save")
 			if rec := saved(t, ds); rec.HandledSeqs["screen/LG"] != state.Seq(3+i) {
 				t.Fatalf("an ErrNotHere assignment must still be marked seen: %+v", rec)
@@ -1020,9 +1044,9 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 	t.Run("a failed write starts the cooldown and counts", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(assignment(3)))
-		fail := given(map[state.AssignmentKey]error{lgKey: errWrite})
+		fail := gave(lgKey, errWrite)
 		for _, sec := range []int{2, 4, 6, 8} {
-			m.decide(at(sec), Observation{GaveAway: fail})
+			m.decide(at(sec), fail)
 		}
 		if got := m.limiter.cooldownEnds(lgKey); !got.Equal(at(13)) {
 			t.Fatalf("cooldown until %v, want %v", got, at(13))
@@ -1033,22 +1057,11 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 		want(t, m.decide(at(9), state_(assignment(4))), "wake:13")
 	})
 
-	t.Run("an assignment missing from the result counts", func(t *testing.T) {
-		m := newDecider(t, "linux", agentAt("mac", 2, nil))
-		m.decide(at(0), state_(assignment(3)))
-		for _, sec := range []int{2, 4, 6, 8} {
-			m.decide(at(sec), Observation{GaveAway: given(map[state.AssignmentKey]error{})})
-		}
-		if len(m.limiter.recent[lgKey]) != 1 {
-			t.Fatalf("breaker count = %d, want 1", len(m.limiter.recent[lgKey]))
-		}
-	})
-
 	t.Run("superseded before any run reported it as attempted does not count", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(assignment(3)))
 		m.decide(at(1), state_(assignment(4))) // the job is still in flight
-		want(t, m.decide(at(2), Observation{GaveAway: notHere}), "save", "give:screen/LG")
+		want(t, m.decide(at(2), notHere), "save", "give:screen/LG")
 		if len(m.limiter.recent[lgKey]) != 0 || !m.limiter.cooldownEnds(lgKey).IsZero() {
 			t.Fatalf("cooldown %v, count %d; want neither", m.limiter.cooldownEnds(lgKey), len(m.limiter.recent[lgKey]))
 		}
@@ -1060,9 +1073,8 @@ func TestCooldownCountsOnlyAttempts(t *testing.T) {
 			return mk("mac", 2, hidAssignment("mouse", "mac", "linux", mouse, false), screenAssignment("LG", "mac", "linux", lg))
 		}
 		want(t, m.decide(at(0), state_(s(3, 3))), "give:hid/mouse,screen/LG")
-		want(t, m.decide(at(1), Observation{GaveAway: given(map[state.AssignmentKey]error{
-			mouseKey: ErrNotHere, lgKey: nil,
-		})}), "save")
+		want(t, m.decide(at(1), gave(mouseKey, ErrNotHere)))
+		want(t, m.decide(at(1), gave(lgKey, nil)), "save")
 		// Both are taken again at once: the screen cools down, the mouse does not.
 		ds := m.decide(at(2), state_(s(4, 4)))
 		want(t, ds, "give:hid/mouse")
@@ -1084,10 +1096,20 @@ func TestLateResults(t *testing.T) {
 	t.Run("a result after its batch ended is ignored", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("mac", 2, nil))
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
-		m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
-		ds := m.decide(at(2), Observation{GaveAway: okAll(lgKey)})
+		m.decide(at(1), gave(lgKey, nil))
+		ds := m.decide(at(2), gave(lgKey, nil))
 		want(t, ds)
 		wantLog(t, ds, "ignoring a late")
+	})
+
+	t.Run("a duplicate result for one assignment while a sibling is still in flight is ignored", func(t *testing.T) {
+		m := newDecider(t, "linux", agentAt("mac", 2, nil))
+		m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
+		want(t, m.decide(at(1), gave(mouseKey, ErrNotHere)))
+		ds := m.decide(at(1), gave(mouseKey, ErrNotHere))
+		want(t, ds)
+		wantLog(t, ds, "ignoring a late")
+		want(t, m.decide(at(2), gave(lgKey, nil)), "save")
 	})
 
 	t.Run("a command result during a batch of assignments is ignored", func(t *testing.T) {
@@ -1095,13 +1117,13 @@ func TestLateResults(t *testing.T) {
 		m.decide(at(0), state_(mk("mac", 2, screenAssignment("LG", "mac", "linux", 3))))
 		ds := m.decide(at(1), Observation{Ran: ran(nil)})
 		wantLog(t, ds, "ignoring a late")
-		want(t, m.decide(at(2), Observation{GaveAway: okAll(lgKey)}), "save")
+		want(t, m.decide(at(2), gave(lgKey, nil)), "save")
 	})
 
 	t.Run("a give-away result during a command is ignored", func(t *testing.T) {
 		m := newDecider(t, "linux", agentAt("linux", 1, nil))
 		m.decide(at(0), state_(mk("mac", 2)))
-		ds := m.decide(at(1), Observation{GaveAway: okAll(lgKey)})
+		ds := m.decide(at(1), gave(lgKey, nil))
 		wantLog(t, ds, "ignoring a late")
 		want(t, m.decide(at(2), Observation{Ran: ran(nil)}), "save")
 	})
@@ -1181,7 +1203,8 @@ func TestAttachSettle(t *testing.T) {
 func TestWakeAt(t *testing.T) {
 	m := newDecider(t, "linux", agentAt("mac", 2, nil))
 	m.decide(at(0), state_(mk("mac", 2, hidAssignment("mouse", "mac", "linux", 3, false), screenAssignment("LG", "mac", "linux", 3))))
-	m.decide(at(0), Observation{GaveAway: okAll(mouseKey, lgKey)})
+	m.decide(at(0), gave(mouseKey, nil))
+	m.decide(at(0), gave(lgKey, nil))
 	// The earliest deadline wins: the settle at 3 s, not the arrival window at
 	// 10 s; and when the settle expires at 3 s, the claim fires without waiting
 	// for the arrival window.

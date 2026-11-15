@@ -21,11 +21,11 @@ import (
 // Observation is what the agent saw, the decider's only input besides the
 // time. At most one field is set: none when only time passed (SPEC §11.3).
 type Observation struct {
-	Attach   bool                  // receiver attach edge from the Detector
-	Detach   bool                  // all watched receivers/slots are absent
-	State    *state.ServerState    // from /state or a /wait wake
-	Ran      *CommandsRun          // the commands in flight finished
-	GaveAway *AssignmentsGivenAway // the assignments in flight were given away
+	Attach   bool                 // receiver attach edge from the Detector
+	Detach   bool                 // all watched receivers/slots are absent
+	State    *state.ServerState   // from /state or a /wait wake
+	Ran      *CommandsRun         // the commands in flight finished
+	GaveAway *AssignmentGivenAway // one assignment in flight finished its give-away attempt
 }
 
 // CommandsRun ends a run of commands: one result per command, in the order
@@ -34,11 +34,13 @@ type CommandsRun struct {
 	Results []error
 }
 
-// AssignmentsGivenAway ends a batch of assignments given away: one result per
-// assignment, nil when its screen or device moved, ErrNotHere when there was
-// nothing to move.
-type AssignmentsGivenAway struct {
-	Results map[state.AssignmentKey]error
+// AssignmentGivenAway reports one assignment give-away attempt: nil when its
+// screen or device moved, ErrNotHere when there was nothing to move. Each
+// assignment reports as soon as its own write ends so a slow monitor never
+// holds back a peripheral's arrival window or retries.
+type AssignmentGivenAway struct {
+	Key state.AssignmentKey
+	Err error
 }
 
 // ErrNotHere is the result of giving away an assignment with nothing to move on
@@ -335,9 +337,9 @@ type assignmentTask struct {
 	taskHeader
 	assignment state.Assignment
 	// triedToMove is set once giving the assignment away reported anything but
-	// ErrNotHere, or nothing at all: only an attempt counts for the cooldown
-	// and the breaker. Nothing to move here is not a write, and the breaker
-	// exists to stop write loops.
+	// ErrNotHere: only an attempt counts for the cooldown and the breaker.
+	// Nothing to move here is not a write, and the breaker exists to stop write
+	// loops.
 	triedToMove bool
 	sentAt      time.Time // awaitingArrival: when the worker reported the device sent
 }
@@ -408,17 +410,6 @@ func (j *job) settled(maxAttempts int) bool {
 	return true
 }
 
-// busy reports whether an issue awaits its result: the worker is still on it,
-// even if every task in it has since been made obsolete.
-func (j *job) busy() bool {
-	for h := range j.headers() {
-		if h.status == issued {
-			return true
-		}
-	}
-	return false
-}
-
 // issue marks the tasks due at now issued and returns the Decision that
 // carries them out; ok is false when none is due. The tasks due go together:
 // the worker runs them in parallel. When holdUntil is non-zero, assignment
@@ -472,29 +463,25 @@ func (j *job) expire(now time.Time, window time.Duration) {
 	}
 }
 
-// deadlines lists when the job next needs attention: the arrival windows, and
-// — once no issue is outstanding — the retries.
+// deadlines lists when the job next needs attention: open arrival windows and
+// pending or retriable tasks.
 func (j *job) deadlines(maxAttempts int, spacing, window time.Duration, holdUntil time.Time) []time.Time {
 	var ds []time.Time
+	for _, t := range j.commands {
+		if t.retriable(maxAttempts) {
+			ds = append(ds, t.retryAt(spacing))
+		}
+	}
 	for _, t := range j.assignments {
 		if t.status == awaitingArrival {
 			ds = append(ds, t.arrivalDeadline(window))
 		}
-	}
-	if !j.busy() {
-		for _, t := range j.commands {
-			if t.retriable(maxAttempts) {
-				ds = append(ds, t.retryAt(spacing))
+		if t.status == pending || t.retriable(maxAttempts) {
+			d := t.retryAt(spacing)
+			if holdUntil.After(d) {
+				d = holdUntil
 			}
-		}
-		for _, t := range j.assignments {
-			if t.status == pending || t.retriable(maxAttempts) {
-				d := t.retryAt(spacing)
-				if holdUntil.After(d) {
-					d = holdUntil
-				}
-				ds = append(ds, d)
-			}
+			ds = append(ds, d)
 		}
 	}
 	return ds
@@ -520,23 +507,17 @@ func (j *job) reportRun(results []error) (ok bool) {
 	return ok
 }
 
-// reportGiveAway records the results of the assignments issued, reported at
-// now. An assignment with no result counts as failed: its batch never reported
-// it. A device sent away awaits its arrival. ok is false when no assignment is
-// issued: the result is late.
-func (j *job) reportGiveAway(now time.Time, results map[state.AssignmentKey]error) (ok bool) {
+// reportGiveAway records the result of one assignment give-away attempt,
+// reported at now. A device sent away awaits its arrival. ok is false when key
+// is not currently issued: the result is late.
+func (j *job) reportGiveAway(now time.Time, key state.AssignmentKey, err error) (ok bool) {
 	for _, t := range j.assignments {
-		if t.status != issued {
+		if t.status != issued || t.assignment.Key() != key {
 			continue
 		}
-		ok = true
-		key := t.assignment.Key()
-		err, reported := results[key]
 		notHere := errors.Is(err, ErrNotHere)
-		t.triedToMove = t.triedToMove || !reported || !notHere
+		t.triedToMove = t.triedToMove || !notHere
 		switch {
-		case !reported:
-			t.status, t.lastFailure = failed, "no result for it"
 		case notHere:
 			t.status = done
 		case err != nil:
@@ -551,8 +532,9 @@ func (j *job) reportGiveAway(now time.Time, results map[state.AssignmentKey]erro
 			// Not retried, and a device sent is not waited for.
 			t.status = dropped
 		}
+		return true
 	}
-	return ok
+	return false
 }
 
 // applyState brings the job up to date with the newest state s, as host me
@@ -828,10 +810,11 @@ func (m *Decider) handleRan(d *CommandsRun) []Decision {
 	return nil
 }
 
-// handleGaveAway records the results of the assignments in flight. A result is
-// accepted only while its issue is outstanding (SPEC §4.3).
-func (m *Decider) handleGaveAway(now time.Time, d *AssignmentsGivenAway) []Decision {
-	if m.job == nil || !m.job.reportGiveAway(now, d.Results) {
+// handleGaveAway records the result of one assignment give-away in flight. A
+// result is accepted only while that assignment's issue is outstanding
+// (SPEC §4.3).
+func (m *Decider) handleGaveAway(now time.Time, d *AssignmentGivenAway) []Decision {
+	if m.job == nil || !m.job.reportGiveAway(now, d.Key, d.Err) {
 		return []Decision{{Log: "ignoring a late give-away result"}}
 	}
 	return nil
@@ -1022,17 +1005,13 @@ func (m *Decider) advanceTime(now time.Time, ds *[]Decision) {
 }
 
 // advanceJob moves the job in flight on at now: it brings it up to date with
-// the latest state, expires closed arrival windows and, once no issue is
-// outstanding, issues the tasks due. Once every
-// task is settled, the job is over: what it handled is recorded and saved, the
-// names it tried to move count toward the rate limit, what failed is logged
-// and, when this host was the previous assignee, notified.
+// the latest state, expires closed arrival windows, and issues any tasks due.
+// Once every task is settled, the job is over: what it handled is recorded and
+// saved, the names it tried to move count toward the rate limit, what failed
+// is logged and, when this host was the previous assignee, notified.
 func (m *Decider) advanceJob(now time.Time, ds *[]Decision) {
 	m.job.applyState(m.latest, m.cfg.ID)
 	m.job.expire(now, m.cfg.ArrivalWindow)
-	if m.job.busy() {
-		return
-	}
 	if !m.job.settled(m.maxAttempts()) {
 		if d, ok := m.job.issue(now, m.maxAttempts(), m.cfg.RetrySpacing, m.holdUntil(now)); ok {
 			*ds = append(*ds, d)

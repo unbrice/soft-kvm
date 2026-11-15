@@ -252,20 +252,21 @@ as its writes added up, and a decider-side bound would retry while the worker is
 still busy, then take the late result for the retry's. A result is accepted only
 while its issue is outstanding — a late one is ignored and logged.
 
-1. Give away every pending assignment in parallel, so a hung monitor write does
-   not hold the mouse back. Writes through one piece of hardware keep the order
-   `/state` lists them in: devices behind one receiver share its node, and HID++
-   replies on it are matched to their request. One failing does not skip the
-   rest: they target independent devices.
+1. Give away every pending assignment in parallel, reporting each as soon as its
+   own write finishes so a slow or hung monitor write never holds a peripheral's
+   arrival window or retry back. Writes through one piece of hardware keep the
+   order `/state` lists them in: devices behind one receiver share its node, and
+   HID++ replies on it are matched to their request. One failing does not skip
+   the rest: they target independent devices.
 2. Screen written, device arrived, or nothing to move here ⇒ that assignment is
    done.
-3. A write that failed, died or never reported, or a device that did not arrive
-   within 10 s ⇒ retry **only those assignments**, up to `--switch-retries 3`,
-   each at least 1 s after its last attempt. An assignment superseded by a newer
-   take of the same name is dropped. One whose assignee is no longer the owner
-   or no longer live stops being retried (or waited on for arrival) and is not
-   recorded: it stays pending, as the ownership and liveness gates would have
-   held it at reconcile.
+3. A write that failed or died, or a device that did not arrive within 10 s ⇒
+   retry **only those assignments**, up to `--switch-retries 3`, each at least 1
+   s after its last attempt, without waiting on sibling writes still in flight.
+   An assignment superseded by a newer take of the same name is dropped. One
+   whose assignee is no longer the owner or no longer live stops being retried
+   (or waited on for arrival) and is not recorded: it stays pending, as the
+   ownership and liveness gates would have held it at reconcile.
 4. Still failing after the last retry ⇒ the previous assignee runs
    `--notify-cmd`; every other host logs and stops.
 
@@ -575,11 +576,15 @@ receiver's slot map is its local pairing table (HID++ 1.0 register `0x2B5`,
 sub-registers `0x20+slot-1` on Unifying, `0x50+slot` on Bolt): on-chip flash, no
 RF, so it is right whether a paired device is awake, asleep, off, or switched to
 the other host. A slot holds the link when a HID++ request addressed to it is
-answered; an unlinked slot refuses locally in about 2 ms (§6.1). **No reply to
-`setHost` is not a failure**: a device that switched drops the link to this host
-mid-ACK, which over Bluetooth surfaces as a read error (EIO on Linux hidraw),
-not a timeout; an explicit HID++ error reply is the failure, and the arrival is
-the receipt. On Linux the agent needs write access to the hidraw node (§6.1).
+answered; an unlinked slot refuses locally in about 2 ms (§6.1). Logical
+requests cycle software IDs in `0x08..0x0F` (keeping one software ID across the
+retry nudges of a single request) so neither Linux's kernel HID++ driver (`swID`
+`0x01`) nor a late duplicate wake reply from an earlier lookup can match a later
+request. **No reply to `setHost` is not a failure**: a device that switched
+drops the link to this host mid-ACK, which over Bluetooth surfaces as a read
+error (EIO on Linux hidraw), not a timeout; an explicit HID++ error reply is the
+failure, and the arrival is the receipt. On Linux the agent needs write access
+to the hidraw node (§6.1).
 
 ### 5.6 Screen declarations and `take-screen`
 
@@ -1205,17 +1210,18 @@ back as the `Observation` field of the same name in the past tense.
 type Observation struct {    // at most one field set: none when only time passed
     Attach   bool
     Detach   bool
-    State    *state.ServerState // from /state or a /wait wake
-    Ran      *CommandsRun          // the commands in flight finished
-    GaveAway *AssignmentsGivenAway // the assignments in flight were given away
+    State    *state.ServerState  // from /state or a /wait wake
+    Ran      *CommandsRun        // the commands in flight finished
+    GaveAway *AssignmentGivenAway // one assignment in flight finished its give-away attempt
 }
 
 type CommandsRun struct {
     Results []error // one per command, in the order they ran: nil when it exited 0
 }
 
-type AssignmentsGivenAway struct {
-    Results map[state.AssignmentKey]error // one per assignment: nil moved, ErrNotHere nothing to move
+type AssignmentGivenAway struct {
+    Key state.AssignmentKey
+    Err error // nil moved, ErrNotHere nothing to move
 }
 
 type Decision struct {
@@ -1246,13 +1252,14 @@ and recycles on `errGuardsDown`. The decision loop reads the clock when it
 processes each observation and passes it to `Decide`, rearms its timer for the
 wake `Decide` returns, hands each `Decision` with work in it to a run-level
 worker in `agent/worker.go`, and posts results back as ordinary observations.
-The worker runs commands, gives assignments away and notifies one decision at a
-time and posts each result to the loop. It keeps no progress of its own: a retry
-is a decision that names only the commands or assignments that failed. The
-arrival watcher (§5.4) is part of the agent as well: it polls and posts, and
-decides nothing. Channels are scoped by freshness — `attachCh` and `stateCh` are
-created per generation, while `results` and the worker are run-level. It
-contains no policy.
+The worker routes command batches, notifications, and per-queue assignment
+writes over channels to child goroutines in its own `errgroup`, posting each
+assignment's result as soon as its write finishes while serialising writes that
+share a receiver node. It keeps no retry state of its own: a retry is a decision
+that names only the commands or assignments that failed. The arrival watcher
+(§5.4) is part of the agent as well: it polls and posts, and decides nothing.
+Channels are scoped by freshness — `attachCh` and `stateCh` are created per
+generation, while `results` and the worker are run-level. It contains no policy.
 
 ### 11.4 Tests
 

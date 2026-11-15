@@ -680,12 +680,11 @@ func TestGiveAwayAssignmentTimesOut(t *testing.T) {
 	}
 }
 
-// A batch is given away in parallel: the devices do not wait behind a hung
-// monitor write, and two devices behind one receiver are sent one after the
-// other.
+// A batch is given away in parallel: the devices report their results without
+// waiting behind a hung monitor write, and two devices behind one receiver are
+// sent one after the other.
 func TestGiveAwayRunsInParallel(t *testing.T) {
 	release := make(chan struct{})
-	sent := make(chan string, 2)
 	var inFlight, overlapped atomic.Int32
 	a := &agent{
 		cfg: Config{
@@ -694,16 +693,17 @@ func TestGiveAwayRunsInParallel(t *testing.T) {
 				<-release
 				return nil
 			},
-			SendHID: func(_ context.Context, tg hidpp.Target, _ uint8) (bool, error) {
+			SendHID: func(_ context.Context, _ hidpp.Target, _ uint8) (bool, error) {
 				if inFlight.Add(1) > 1 {
 					overlapped.Store(1)
 				}
 				time.Sleep(10 * time.Millisecond)
 				inFlight.Add(-1)
-				sent <- tg.String()
 				return true, nil
 			},
 		},
+		decisions: make(chan model.Decision, 4),
+		results:   make(chan model.Observation, 1),
 		hids: map[string]hidpp.Declaration{
 			"keyboard": {Name: "keyboard", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 1}, Channel: 1},
 			"mouse":    {Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 2}, Channel: 1},
@@ -714,24 +714,123 @@ func TestGiveAwayRunsInParallel(t *testing.T) {
 		{Kind: state.KindHID, Name: "keyboard", Assignee: "mac", Seq: 3, Channel: 2},
 		{Kind: state.KindHID, Name: "mouse", Assignee: "mac", Seq: 3, Channel: 2},
 	}
-	done := make(chan map[state.AssignmentKey]error)
-	go func() { done <- a.giveAwayAll(context.Background(), batch) }()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		_ = a.workerLoop(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	a.decisions <- model.Decision{GiveAway: batch}
+
+	// Both devices report to a.results in queue order before the monitor write
+	// unblocks.
+	var gotKeys []state.AssignmentKey
 	for range 2 {
 		select {
-		case <-sent:
+		case obs := <-a.results:
+			if obs.GaveAway == nil || obs.GaveAway.Err != nil {
+				t.Fatalf("observation = %+v, want nil error", obs.GaveAway)
+			}
+			gotKeys = append(gotKeys, obs.GaveAway.Key)
 		case <-time.After(5 * time.Second):
 			t.Fatal("the devices waited behind the monitor write")
 		}
 	}
-	close(release)
-	for key, err := range <-done {
-		if err != nil {
-			t.Errorf("%s: %v", key, err)
-		}
+	wantDevices := []state.AssignmentKey{
+		{Kind: state.KindHID, Name: "keyboard"},
+		{Kind: state.KindHID, Name: "mouse"},
+	}
+	if !slices.Equal(gotKeys, wantDevices) {
+		t.Errorf("device results = %v, want %v", gotKeys, wantDevices)
 	}
 	if overlapped.Load() != 0 {
 		t.Fatal("two sends overlapped on one receiver")
 	}
+
+	close(release)
+	select {
+	case obs := <-a.results:
+		if obs.GaveAway == nil || obs.GaveAway.Err != nil || obs.GaveAway.Key != (state.AssignmentKey{Kind: state.KindScreen, Name: "LG"}) {
+			t.Fatalf("screen observation = %+v", obs.GaveAway)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("screen write never reported")
+	}
+}
+
+// A peripheral that fails its first send retries on its own RetrySpacing even
+// while a slow monitor write is still running in parallel.
+func TestAgentPeripheralRetriesDuringSlowScreen(t *testing.T) {
+	s, srv := newAgentTestServer(t)
+	defer srv.Close()
+	base := agentTestBase(t, srv.URL)
+	cl := newTestClient(t, testToken)
+	dir := t.TempDir()
+	linuxState := filepath.Join(dir, "linux.json")
+	if err := state.Save(linuxState, state.AgentState{HandledOwner: "mac", HandledActivation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.Claim(t.Context(), base, "mac", true, false); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if err := cl.Take(t.Context(), base, "mac", 1, []state.Take{
+		{Kind: state.KindScreen, Name: "LG", Input: "F4:50=D1"},
+		{Kind: state.KindHID, Name: "mouse", Channel: 3, Arrived: false},
+	}); err != nil {
+		t.Fatalf("seed take: %v", err)
+	}
+
+	releaseScreen := make(chan struct{})
+	var screenStarted atomic.Bool
+	var sendAttempts atomic.Int32
+
+	cfg := agentTestConfig(t, base, linuxState, s, newFakeDetector(), &fakeGuard{ok: true}, (&recordingRunner{}).run)
+	cfg.Decider.RetrySpacing = 20 * time.Millisecond
+	cfg.HIDs = []hidpp.Declaration{{Name: "mouse", Target: hidpp.Target{VID: 0x046d, PID: 0xc548, Slot: 5}, Channel: 1}}
+	cfg.WriteScreen = func(ctx context.Context, _ screen.Write, _ string) error {
+		screenStarted.Store(true)
+		select {
+		case <-releaseScreen:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	cfg.SendHID = func(_ context.Context, _ hidpp.Target, _ uint8) (bool, error) {
+		if sendAttempts.Add(1) == 1 {
+			return false, errors.New("transient RF wake error")
+		}
+		return true, nil
+	}
+
+	// Keep "mac" live via a background /wait loop so Linux's liveness gate passes.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			_, _ = cl.Wait(ctx, base, s.CurrentState().Epoch, "mac")
+		}
+	}()
+	waitForLive(t, s, "mac")
+
+	runAgent(ctx, t, cfg)
+	waitFor(t, "screen write starts", screenStarted.Load)
+	waitFor(t, "mouse retries and succeeds while screen write is still blocked", func() bool {
+		return sendAttempts.Load() >= 2
+	})
+
+	if err := cl.Arrived(ctx, base, "mac", state.Arrival{Kind: state.KindHID, Name: "mouse", Seq: 2}); err != nil {
+		t.Fatalf("arrived: %v", err)
+	}
+	close(releaseScreen)
+	waitForRecord(t, linuxState, func(as state.AgentState) bool {
+		return as.HandledSeqs["screen/LG"] == 2 && as.HandledSeqs["hid/mouse"] == 2
+	})
 }
 
 // The whole handover, with two real agents on a real server: the Mac claims,

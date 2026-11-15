@@ -19,6 +19,7 @@ import (
 	"github.com/unbrice/soft-kvm/model"
 	"github.com/unbrice/soft-kvm/screen"
 	"github.com/unbrice/soft-kvm/state"
+	"golang.org/x/sync/errgroup"
 )
 
 // errSwitchTimeout names the class of failure where --switch-timeout kills a
@@ -32,31 +33,72 @@ func hasWork(d model.Decision) bool {
 	return len(d.Run) > 0 || len(d.GiveAway) > 0 || d.Notify
 }
 
-// workerLoop carries out one decision at a time, in order, until ctx is
-// cancelled. Serial execution is safe because the Decider has one issue
-// outstanding at a time: it never issues more work before the result of the
-// last has been processed.
+// maxQueuedWrites bounds one hardware queue's channel: the server caps takes
+// at 16 and the decider has at most one issue per assignment key in flight,
+// so routing an assignment to its queue never blocks workerLoop.
+const maxQueuedWrites = 16
+
+// workerLoop routes decisions to channel-fed workers — one for command batches,
+// one for notifications, and one per hardware write queue — so independent
+// writes run and report in parallel while writes sharing a receiver run in
+// order. Every child goroutine belongs to workerLoop's own errgroup.
 func (a *agent) workerLoop(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	cmdsCh := make(chan []model.Command, 1)
+	notifyCh := make(chan struct{}, 1)
+	queues := make(map[string]chan state.Assignment)
+
+	g.Go(func() error {
+		for cmds := range cmdsCh {
+			if ctx.Err() != nil {
+				return nil
+			}
+			a.runCommands(ctx, cmds)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		for range notifyCh {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err := a.cfg.Runner(ctx, a.cfg.NotifyArgv); err != nil {
+				slog.Error("notify command failed", "error", err)
+			}
+		}
+		return nil
+	})
+
+	defer func() {
+		close(cmdsCh)
+		close(notifyCh)
+		for _, ch := range queues {
+			close(ch)
+		}
+		_ = g.Wait()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case d := <-a.decisions:
-			a.carryOut(ctx, d)
-		}
-	}
-}
-
-func (a *agent) carryOut(ctx context.Context, d model.Decision) {
-	if len(d.Run) > 0 {
-		a.runCommands(ctx, d.Run)
-	}
-	if len(d.GiveAway) > 0 {
-		a.giveAway(ctx, d.GiveAway)
-	}
-	if d.Notify {
-		if err := a.cfg.Runner(ctx, a.cfg.NotifyArgv); err != nil {
-			slog.Error("notify command failed", "error", err)
+			if len(d.Run) > 0 {
+				select {
+				case cmdsCh <- d.Run:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			for _, h := range d.GiveAway {
+				a.enqueueGiveAway(ctx, g, queues, h)
+			}
+			if d.Notify {
+				select {
+				case notifyCh <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -213,36 +255,29 @@ func (a *agent) eachServer(ctx context.Context, fn func(ctx context.Context, bas
 	return last
 }
 
-// giveAway gives away a batch of assignments and reports the results.
-func (a *agent) giveAway(ctx context.Context, assignments []state.Assignment) {
-	a.post(ctx, model.Observation{GaveAway: &model.AssignmentsGivenAway{Results: a.giveAwayAll(ctx, assignments)}})
-}
-
-// giveAwayAll gives away a batch of assignments in parallel, each write bounded
-// by --switch-timeout, so a hung monitor write does not hold the mouse back.
-// Writes in one queue run in order, as given (see writeQueue). One failing does
-// not skip the rest: they target independent devices.
-func (a *agent) giveAwayAll(ctx context.Context, assignments []state.Assignment) map[state.AssignmentKey]error {
-	queues := make(map[string][]state.Assignment)
-	for _, h := range assignments {
-		q := a.writeQueue(h)
-		queues[q] = append(queues[q], h)
-	}
-	results := make(map[state.AssignmentKey]error, len(assignments))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, q := range queues {
-		wg.Go(func() {
-			for _, h := range q {
+func (a *agent) enqueueGiveAway(ctx context.Context, g *errgroup.Group, queues map[string]chan state.Assignment, h state.Assignment) {
+	q := a.writeQueue(h)
+	ch, ok := queues[q]
+	if !ok {
+		ch = make(chan state.Assignment, maxQueuedWrites)
+		queues[q] = ch
+		g.Go(func() error {
+			for h := range ch {
+				if ctx.Err() != nil {
+					return nil
+				}
 				err := a.giveAwayAssignment(ctx, h)
-				mu.Lock()
-				results[h.Key()] = err
-				mu.Unlock()
+				a.post(ctx, model.Observation{
+					GaveAway: &model.AssignmentGivenAway{Key: h.Key(), Err: err},
+				})
 			}
+			return nil
 		})
 	}
-	wg.Wait()
-	return results
+	select {
+	case ch <- h:
+	case <-ctx.Done():
+	}
 }
 
 // writeQueue names the hardware an assignment's write goes through. Devices

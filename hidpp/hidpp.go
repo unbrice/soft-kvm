@@ -62,7 +62,20 @@ const (
 	fnSetHost       = 1
 	fnGetDeviceType = 2
 
-	swID = 0x1 // software id nibble, matched against replies
+	// HID++ 2.0 packs a 4-bit caller tag ("software ID", 0x0..0xF) into the
+	// low nibble of byte 3; the device ignores its value and echoes it back in
+	// the reply so the caller can match replies to requests.
+	//
+	// We cycle through 0x08..0x0F (conn.nextSwID) for two reasons:
+	//   1. Linux hidraw delivers every incoming report to every open fd, so
+	//      staying in 0x08..0x0F avoids device events (0x00), the kernel's
+	//      hid-logitech-hidpp driver (0x01), and Solaar (0x02).
+	//   2. Back-to-back IRoot.getFeature queries share feature 0x00 and fn 0,
+	//      and the reply does not echo which feature ID was asked about —
+	//      advancing the tag per request ensures a late duplicate wake reply to
+	//      an earlier query is never mistaken for the answer to the next one.
+	swIDMin   = 0x08
+	swIDCount = 8
 
 	// subDeviceConnection is the HID++ 1.0 device-connection notification a
 	// receiver sends, unprompted, whenever a paired device's radio link comes
@@ -379,9 +392,17 @@ func isReportNotFound(err error) bool {
 
 // conn is an open HID++ interface. long is set once the interface has shown
 // it declares no short report: every short request then goes out long (send).
+// seq advances the software-ID nibble on each logical request.
 type conn struct {
 	dev  deviceConn
 	long bool
+	seq  uint8
+}
+
+func (c *conn) nextSwID() uint8 {
+	sw := swIDMin + c.seq%swIDCount
+	c.seq++
+	return sw
 }
 
 // openInterface returns an HID++-answering interface of VID:PID. Vendor-defined
@@ -467,24 +488,17 @@ func isReportRejected(err error) bool {
 // 0xFF, answered locally from their own flash — no RF, sub-millisecond — and
 // even an error reply (wrong layout, empty slot) proves Logitech framing.
 func (c *conn) speaksHIDPP(ctx context.Context) error {
-	var err error
-	for i := 0; i < probeAttempts; i++ {
-		rctx, cancel := context.WithTimeout(ctx, probeTimeout)
-		_, err = c.getFeature(rctx, DeviceIndexDirect, featFeatureSet)
-		cancel()
-		var herr *Error
-		if err == nil || errors.As(err, &herr) {
-			return nil
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			return err // write errors and the like are not sleep — don't retry
-		}
-		slog.Debug("hidpp: handshake unanswered, nudging again", "attempt", i+1)
+	_, err := c.getFeatureNudged(ctx, DeviceIndexDirect, featFeatureSet)
+	var herr *Error
+	if err == nil || errors.As(err, &herr) {
+		return nil
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err // write errors and the like are not sleep — don't retry
 	}
 	rctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	_, rerr := c.readRegister(rctx, DeviceIndexDirect, regReceiverInfo, subPairingUnifying)
 	cancel()
-	var herr *Error
 	if rerr == nil || errors.As(rerr, &herr) {
 		slog.Debug("hidpp: interface answered a HID++ 1.0 register read — a receiver")
 		return nil
@@ -499,7 +513,15 @@ func (c *conn) speaksHIDPP(ctx context.Context) error {
 // IRoot. Index 0 means the device does not support the feature. The caller's
 // ctx deadline bounds the exchange.
 func (c *conn) getFeature(ctx context.Context, devIdx uint8, feature uint16) (uint8, error) {
-	reply, err := c.request(ctx, devIdx, 0, fnGetFeature, byte(feature>>8), byte(feature))
+	return featureIndex(c.request(ctx, devIdx, 0, fnGetFeature, byte(feature>>8), byte(feature)))
+}
+
+// getFeatureNudged is getFeature repeated on silence via requestNudged.
+func (c *conn) getFeatureNudged(ctx context.Context, devIdx uint8, feature uint16) (uint8, error) {
+	return featureIndex(c.requestNudged(ctx, devIdx, 0, fnGetFeature, byte(feature>>8), byte(feature)))
+}
+
+func featureIndex(reply []byte, err error) (uint8, error) {
 	if err != nil {
 		return 0, err
 	}
@@ -507,25 +529,6 @@ func (c *conn) getFeature(ctx context.Context, devIdx uint8, feature uint16) (ui
 		return 0, errors.New("empty getFeature reply")
 	}
 	return reply[0], nil
-}
-
-// getFeatureNudged retries getFeature on silence: a dozing wireless device
-// wakes on the first request (RF cold wake is ~700ms, past one probeTimeout)
-// and answers a later one. Only deadline misses retry — an error reply or a
-// write failure is an answer, not sleep.
-func (c *conn) getFeatureNudged(ctx context.Context, devIdx uint8, feature uint16) (uint8, error) {
-	var err error
-	for i := 0; i < probeAttempts; i++ {
-		rctx, cancel := context.WithTimeout(ctx, probeTimeout)
-		var feat uint8
-		feat, err = c.getFeature(rctx, devIdx, feature)
-		cancel()
-		if !errors.Is(err, context.DeadlineExceeded) {
-			return feat, err
-		}
-		slog.Debug("hidpp: no answer, nudging again", "deviceIndex", devIdx, "attempt", i+1)
-	}
-	return 0, err
 }
 
 // getKind reads the device type byte (feature 0x0005, fn 2).
@@ -577,8 +580,33 @@ func (c *conn) setHost(ctx context.Context, featIdx, devIdx, host uint8) error {
 // request sends one HID++ 2.0 request and waits for its reply. An error
 // reply comes back as *Error. The caller's ctx deadline bounds the exchange.
 func (c *conn) request(ctx context.Context, devIdx, featIdx, fn uint8, params ...byte) ([]byte, error) {
-	return c.exchange(ctx, buildReport(devIdx, featIdx, fn, params),
-		func(r []byte) ([]byte, error) { return matchReply(r, devIdx, featIdx, fn) })
+	sw := c.nextSwID()
+	return c.exchange(ctx, buildReport(devIdx, featIdx, fn, sw, params),
+		func(r []byte) ([]byte, error) { return matchReply(r, devIdx, featIdx, fn, sw) })
+}
+
+// requestNudged repeats one HID++ 2.0 request up to probeAttempts times on
+// silence: a dozing wireless device wakes on the first request (RF cold wake
+// is ~700ms, past one probeTimeout) and answers a later one. All nudges of one
+// request share a software ID so a wake reply to an earlier nudge still
+// matches; the next request gets a new one. Only deadline misses retry — an
+// error reply or a write failure is an answer, not sleep.
+func (c *conn) requestNudged(ctx context.Context, devIdx, featIdx, fn uint8, params ...byte) ([]byte, error) {
+	sw := c.nextSwID()
+	report := buildReport(devIdx, featIdx, fn, sw, params)
+	match := func(r []byte) ([]byte, error) { return matchReply(r, devIdx, featIdx, fn, sw) }
+	var err error
+	for i := range probeAttempts {
+		rctx, cancel := context.WithTimeout(ctx, probeTimeout)
+		var reply []byte
+		reply, err = c.exchange(rctx, report, match)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return reply, err
+		}
+		slog.Debug("hidpp: no answer, nudging again", "deviceIndex", devIdx, "attempt", i+1)
+	}
+	return nil, err
 }
 
 // exchange writes one report, then reads until match accepts a reply,
@@ -640,17 +668,17 @@ func (c *conn) send(ctx context.Context, report []byte) error {
 }
 
 // buildReport frames a HID++ 2.0 request in the short report: report ID,
-// device index, feature index, function<<4|swID, then the parameters.
+// device index, feature index, function<<4|sw, then the parameters.
 // Receivers and most devices carry the 7-byte short report and our requests
 // never exceed its 3 parameter bytes; Logitech receivers STALL the 20-byte
 // SET_REPORT on their control pipe. An interface without the short report
 // gets each request resent long (send).
-func buildReport(devIdx, featIdx, fn uint8, params []byte) []byte {
+func buildReport(devIdx, featIdx, fn, sw uint8, params []byte) []byte {
 	r := make([]byte, 7)
 	r[0] = reportShort
 	r[1] = devIdx
 	r[2] = featIdx
-	r[3] = fn<<4 | swID
+	r[3] = fn<<4 | sw
 	copy(r[4:], params)
 	return r
 }
@@ -669,9 +697,9 @@ func toLongReport(short []byte) []byte {
 // returns (params, nil) for a matching data reply, (nil, *Error) for a
 // matching error reply, and (nil, nil) for anything else.
 //
-// Data reply:  reportID, devIdx, featIdx, fn|swID, params...
-// Error reply: reportID, devIdx, errSubShort|errSubLong, featIdx, fn|swID, code
-func matchReply(report []byte, devIdx, featIdx, fn uint8) ([]byte, error) {
+// Data reply:  reportID, devIdx, featIdx, fn|sw, params...
+// Error reply: reportID, devIdx, errSubShort|errSubLong, featIdx, fn|sw, code
+func matchReply(report []byte, devIdx, featIdx, fn, sw uint8) ([]byte, error) {
 	if len(report) < 5 || report[1] != devIdx {
 		return nil, nil
 	}
@@ -680,7 +708,7 @@ func matchReply(report []byte, devIdx, featIdx, fn uint8) ([]byte, error) {
 	default:
 		return nil, nil
 	}
-	fnSw := fn<<4 | swID
+	fnSw := fn<<4 | sw
 	if report[2] == featIdx && report[3] == fnSw {
 		return report[4:], nil
 	}
